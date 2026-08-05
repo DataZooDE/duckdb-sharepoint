@@ -98,10 +98,19 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
    direct-cloned into place first), and `MainDistributionPipeline.yml` is
    aligned to the same pins (`duckdb_version: v1.4.5`, the reusable workflow ref
    and `ci_tools_version` both the v1.4-andium commit `1f04702`).
-2. **Resumable upload session** (`PutContent`, large-file branch). The
-   `createUploadSession` call is written; the chunked `PUT` loop against the
-   returned absolute `uploadUrl` (own httplib client, no auth header,
-   320-KiB-multiple chunks, resume-on-5xx via `expectedRanges`) is a TODO.
+2. ~~**Resumable upload session** (`PutContent`, large-file branch).~~
+   **Implemented (2026-08-05), pending live verification.** After
+   `createUploadSession`, the `uploadUrl` is split into origin + path
+   (`SplitAbsoluteUrl`) and driven by its own httplib client with **no** auth
+   header. Chunks are `NormalizeUploadChunkSize`d down to a 320-KiB multiple,
+   each PUT carries a `Content-Range` (`UploadContentRange`); 202 advances,
+   200/201 on the final chunk returns the driveItem, and a transport/5xx/429
+   failure resumes from the session's `nextExpectedRanges` (`ParseRangeStart`,
+   `QueryUploadResumeOffset`) for up to `kMaxUploadChunkRetries` attempts. The
+   four pure helpers live in `sharepoint_upload.*` and are Catch2-tested; the
+   PUT loop is in `sharepoint_client.cpp`. **Live proof still owed:** the §7.5
+   harness must upload a file **larger than one chunk** to exercise this branch
+   end to end — nothing here has run against a tenant.
 3. **Block cache** for reads (`sharepoint_block_size_bytes`), single-flight per
    block, identity-keyed — port from gdrive's `GDriveBlockCache`.
 4. **Recursive `**` glob** across folders (currently one folder level).

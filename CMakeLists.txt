@@ -48,6 +48,7 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_uri.cpp
     src/sharepoint_errors.cpp
     src/sharepoint_glob.cpp
+    src/sharepoint_upload.cpp
 )
 
 # ---------------------------------------------------------------------------

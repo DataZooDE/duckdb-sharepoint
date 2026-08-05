@@ -2,10 +2,12 @@
 // runnable by anyone who can build. `make unit_test`.
 #include "sharepoint_errors.hpp"
 #include "sharepoint_glob.hpp"
+#include "sharepoint_upload.hpp"
 #include "sharepoint_uri.hpp"
 #include "sharepoint_version.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <cstdint>
 
 using namespace duckdb::sharepoint;
 
@@ -85,6 +87,52 @@ TEST_CASE("glob matches within a segment", "[glob]") {
 	REQUIRE_FALSE(MatchGlob("file-??.txt", "file-7.txt"));
 	REQUIRE(HasGlobMeta("*.parquet"));
 	REQUIRE_FALSE(HasGlobMeta("actuals.parquet"));
+}
+
+TEST_CASE("upload chunk size rounds down to a 320 KiB multiple", "[upload]") {
+	// A default that is already a multiple is unchanged.
+	REQUIRE(NormalizeUploadChunkSize(10ull * 1024 * 1024) == 10ull * 1024 * 1024);
+	REQUIRE(NormalizeUploadChunkSize(kGraphUploadChunkMultiple) == kGraphUploadChunkMultiple);
+	// A non-multiple rounds DOWN (the last chunk carries the remainder).
+	REQUIRE(NormalizeUploadChunkSize(kGraphUploadChunkMultiple * 3 + 5) == kGraphUploadChunkMultiple * 3);
+	// Below one multiple clamps up, never to zero -- the loop must progress.
+	REQUIRE(NormalizeUploadChunkSize(1) == kGraphUploadChunkMultiple);
+	REQUIRE(NormalizeUploadChunkSize(0) == kGraphUploadChunkMultiple);
+}
+
+TEST_CASE("content-range header is byte-inclusive", "[upload]") {
+	REQUIRE(UploadContentRange(0, kGraphUploadChunkMultiple, 1000000) == "bytes 0-327679/1000000");
+	// A final, ragged chunk: start 655360, length 344640 -> last byte 999999.
+	REQUIRE(UploadContentRange(655360, 344640, 1000000) == "bytes 655360-999999/1000000");
+}
+
+TEST_CASE("absolute upload URL splits into origin and path", "[upload]") {
+	std::string origin, rest;
+	REQUIRE(SplitAbsoluteUrl("https://host.sharepoint.com/_api/v2.0/drive/items/x/upload?guid=abc", origin, rest));
+	REQUIRE(origin == "https://host.sharepoint.com");
+	REQUIRE(rest == "/_api/v2.0/drive/items/x/upload?guid=abc");
+
+	REQUIRE(SplitAbsoluteUrl("https://host:8443/p", origin, rest));
+	REQUIRE(origin == "https://host:8443");
+	REQUIRE(rest == "/p");
+
+	// No path -> the remainder defaults to "/".
+	REQUIRE(SplitAbsoluteUrl("https://host.example.com", origin, rest));
+	REQUIRE(origin == "https://host.example.com");
+	REQUIRE(rest == "/");
+
+	// A bare path is not an absolute URL.
+	REQUIRE_FALSE(SplitAbsoluteUrl("/just/a/path", origin, rest));
+}
+
+TEST_CASE("nextExpectedRanges start offset parses", "[upload]") {
+	std::uint64_t s = 999;
+	REQUIRE(ParseRangeStart("512-1023", s));
+	REQUIRE(s == 512);
+	REQUIRE(ParseRangeStart("655360-", s));
+	REQUIRE(s == 655360);
+	REQUIRE_FALSE(ParseRangeStart("-1", s));
+	REQUIRE_FALSE(ParseRangeStart("", s));
 }
 
 TEST_CASE("graph errors classify by status and code", "[errors]") {
