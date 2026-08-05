@@ -125,8 +125,23 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
    the §7.5 harness. Note: `GlobFiles` is deliberately called qualified —
    `FileSystem` has a same-named member that would otherwise shadow it.
 5. **Live SQL suite** (`test/sql/live/`, `make test_live`) against a real
-   tenant + a Python e2e harness (fixtures, API-call-count assertions), as
-   gdrive has. This is the merge gate — no mocks.
+   tenant. **SQL layer scaffolded (2026-08-05); a Python e2e harness (fixtures,
+   API-call-count assertions) is still owed.** `test/sql/sharepoint.live.template`
+   (committed, placeholders only) exercises the full surface end to end: the
+   write/read/size round trip, idempotent `remove_file`, `COPY`→`read_parquet`,
+   the **>1-chunk resumable upload** (§7.2, forced by `SET
+   sharepoint_upload_chunk_bytes=327680` + a 900 KB blob), the **nested `**`
+   glob** (§7.4), and `move_file`. `scripts/run_live_tests.sh` substitutes the
+   run's real ids into the git-ignored `test/sql/live/` (scrubbed on exit) and
+   runs it through `build/release/test/unittest`. Verified end to end with dummy
+   credentials: it materialises, loads, parses, and **fails loudly** at the first
+   Graph call — a real tenant is all that is missing.
+   - **Gotcha worth keeping:** DuckDB's sqllogictest runner defaults to
+     `ignore_error_messages = {"HTTP", "Unable to connect"}` and *skips* any test
+     whose error contains them. Our Graph errors read `HTTP <status>`, so without
+     intervention every real failure would be a false green. The template resets
+     the list to a never-matching sentinel (`set ignore_error_messages
+     __sharepoint_never_ignore__`) so failures fail.
 6. **`authorization_code` / `device_code`** delegated providers via the
    `datazoo-oauth2` submodule.
 7. **CI**: wire `MainDistributionPipeline.yml` to the DuckDB extension-ci-tools
