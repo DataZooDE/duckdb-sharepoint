@@ -1,0 +1,33 @@
+build
+.cache/
+.idea
+cmake-build-debug
+duckdb_unittest_tempdir/
+.DS_Store
+testext
+compile_commands.json
+scripts/__pycache__/
+
+# ---------------------------------------------------------------------------
+# Credentials. No credential is ever committed. An Azure AD app client secret,
+# a pasted Graph access/refresh token, or a certificate .pem must never land
+# in git. .gitignore only helps people who have not already run `git add -f` --
+# scripts/check_no_credentials.sh enforces the same patterns in CI.
+# ---------------------------------------------------------------------------
+.env.sharepoint
+.env.sharepoint.local
+# Azure AD app manifest / client-secret dumps.
+*.client_secret.json
+azure-app-*.json
+# Certificate material for certificate-based client credentials.
+*.pem
+*.pfx
+
+# Materialised live SQL tests carry REAL tokens substituted at run time.
+test/sql/live/
+
+# E2E harness (Python + uv)
+e2e/.venv/
+e2e/.pytest_cache/
+e2e/**/__pycache__/
+e2e/.uv-cache/

@@ -1,0 +1,100 @@
+// Catch2 pure-logic tests. No DuckDB linkage, no network, no credentials --
+// runnable by anyone who can build. `make unit_test`.
+#include "sharepoint_errors.hpp"
+#include "sharepoint_glob.hpp"
+#include "sharepoint_uri.hpp"
+#include "sharepoint_version.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+using namespace duckdb::sharepoint;
+
+TEST_CASE("version is CalVer", "[version]") {
+	auto v = SharepointVersion();
+	REQUIRE(v.size() == std::string("2026.08.05").size());
+	REQUIRE(v[4] == '.');
+}
+
+TEST_CASE("path URIs parse into segments", "[uri]") {
+	auto r = ParseSharepointUri("sharepoint://Finance/2026/actuals.parquet");
+	REQUIRE(r.ok);
+	REQUIRE(r.uri.kind == SharepointUriKind::PATH);
+	REQUIRE(r.uri.segments.size() == 3);
+	REQUIRE(r.uri.FileName() == "actuals.parquet");
+	REQUIRE(r.uri.RootRelativePath() == "Finance/2026/actuals.parquet");
+	REQUIRE(r.uri.ParentPath() == "sharepoint://Finance/2026");
+}
+
+TEST_CASE("repeated and trailing slashes collapse", "[uri]") {
+	auto r = ParseSharepointUri("sharepoint://a//b/c/");
+	REQUIRE(r.ok);
+	REQUIRE(r.uri.segments.size() == 3);
+	REQUIRE(r.uri.RootRelativePath() == "a/b/c");
+}
+
+TEST_CASE("empty path is the drive root", "[uri]") {
+	auto r = ParseSharepointUri("sharepoint://");
+	REQUIRE(r.ok);
+	REQUIRE(r.uri.segments.empty());
+	REQUIRE(r.uri.FileName().empty());
+}
+
+TEST_CASE("dot and dotdot segments are rejected", "[uri]") {
+	REQUIRE_FALSE(ParseSharepointUri("sharepoint://a/../b").ok);
+	REQUIRE_FALSE(ParseSharepointUri("sharepoint://./b").ok);
+}
+
+TEST_CASE("id: form parses and forbids trailing segments", "[uri]") {
+	auto ok = ParseSharepointUri("sharepoint://id:01ABCDEF");
+	REQUIRE(ok.ok);
+	REQUIRE(ok.uri.kind == SharepointUriKind::FILE_ID);
+	REQUIRE(ok.uri.item_id == "01ABCDEF");
+	REQUIRE(ok.uri.ToString() == "sharepoint://id:01ABCDEF");
+
+	REQUIRE(ParseSharepointUri("sharepoint://id:01ABCDEF/").ok); // trailing slash tolerated
+	REQUIRE_FALSE(ParseSharepointUri("sharepoint://id:").ok);
+	REQUIRE_FALSE(ParseSharepointUri("sharepoint://id:abc/oops").ok); // a real typo still rejects
+}
+
+TEST_CASE("non-sharepoint URIs are rejected", "[uri]") {
+	REQUIRE_FALSE(IsSharepointUri("s3://bucket/x"));
+	REQUIRE_FALSE(ParseSharepointUri("gdrive://a/b").ok);
+}
+
+TEST_CASE("core's fallback-glob probe on an id: URI is recognised", "[uri]") {
+	// The synthesized shape must be recognised so Glob returns empty ...
+	REQUIRE(IsFileIdFallbackGlobProbe("sharepoint://id:01ABC/**/*.parquet"));
+	// ... but a genuine user typo must NOT be, so it keeps surfacing the error.
+	REQUIRE_FALSE(IsFileIdFallbackGlobProbe("sharepoint://id:01ABC/oops"));
+	REQUIRE_FALSE(IsFileIdFallbackGlobProbe("sharepoint://Finance/**/*.parquet"));
+}
+
+TEST_CASE("immutable-prefix matching is per-segment", "[uri]") {
+	REQUIRE(PathMatchesAnyPrefix("sharepoint://lake/data/x.parquet", "sharepoint://lake"));
+	REQUIRE(PathMatchesAnyPrefix("sharepoint://lake", "sharepoint://lake"));
+	REQUIRE_FALSE(PathMatchesAnyPrefix("sharepoint://lakehouse/x", "sharepoint://lake"));
+	REQUIRE(PathMatchesAnyPrefix("sharepoint://b/x", " a/ , sharepoint://b "));
+	REQUIRE_FALSE(PathMatchesAnyPrefix("sharepoint://a/x", ""));
+}
+
+TEST_CASE("glob matches within a segment", "[glob]") {
+	REQUIRE(MatchGlob("*.parquet", "actuals.parquet"));
+	REQUIRE(MatchGlob("part-*.csv", "part-0001.csv"));
+	REQUIRE(MatchGlob("file-??.txt", "file-07.txt"));
+	REQUIRE_FALSE(MatchGlob("*.parquet", "actuals.csv"));
+	REQUIRE_FALSE(MatchGlob("file-??.txt", "file-7.txt"));
+	REQUIRE(HasGlobMeta("*.parquet"));
+	REQUIRE_FALSE(HasGlobMeta("actuals.parquet"));
+}
+
+TEST_CASE("graph errors classify by status and code", "[errors]") {
+	REQUIRE(ClassifyGraphError(404, "itemNotFound") == GraphErrorKind::NOT_FOUND);
+	REQUIRE(ClassifyGraphError(401, "") == GraphErrorKind::UNAUTHENTICATED);
+	REQUIRE(ClassifyGraphError(429, "") == GraphErrorKind::THROTTLED);
+	REQUIRE(ClassifyGraphError(503, "") == GraphErrorKind::THROTTLED);
+	// A 400 that is really throttling, per the code.
+	REQUIRE(ClassifyGraphError(400, "activityLimitReached") == GraphErrorKind::THROTTLED);
+	REQUIRE(ClassifyGraphError(200, "") == GraphErrorKind::OK);
+	REQUIRE(IsRetryable(GraphErrorKind::THROTTLED));
+	REQUIRE_FALSE(IsRetryable(GraphErrorKind::UNAUTHENTICATED));
+}

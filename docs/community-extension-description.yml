@@ -1,0 +1,70 @@
+# Staged submission for duckdb/community-extensions.
+#
+# NOT yet submitted -- this extension is a scaffold. `ref` must point at a
+# tagged commit whose live suite has passed against a real Microsoft Graph
+# tenant before submission (the community build runs no live tests of ours).
+# Validate the substituted ref is 40 hex characters, not just that the
+# placeholder is gone.
+
+extension:
+  name: sharepoint
+  description: Query files in SharePoint / OneDrive directly with a sharepoint:// filesystem
+  language: C++
+  build: cmake
+  license: MIT
+  # wasm: HTTPS calls to Microsoft Graph plus (future) a loopback redirect
+  # server for interactive OAuth -- neither works in a browser sandbox, and a
+  # wasm side-module defers symbol resolution to load time, so it would build
+  # green and then fail to LOAD.
+  # mingw: vcpkg's OpenSSL port is fragile there; sibling extensions skip it.
+  excluded_platforms: "windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
+  maintainers:
+    - jrosskopf
+
+repo:
+  github: DataZooDE/duckdb-sharepoint
+  ref: PLACEHOLDER_SET_AT_RELEASE
+
+docs:
+  hello_world: |
+    -- App-only auth: an Entra ID app registration with the Sites.ReadWrite.All
+    -- APPLICATION permission and admin consent. Bind it to a document library
+    -- by DRIVE_ID (a Graph drive id) or SITE_ID.
+    CREATE SECRET sp (
+        TYPE sharepoint,
+        PROVIDER client_credentials,
+        TENANT_ID '00000000-0000-0000-0000-000000000000',
+        CLIENT_ID '11111111-1111-1111-1111-111111111111',
+        CLIENT_SECRET '...',
+        DRIVE_ID 'b!AbCdEf...'
+    );
+
+    -- Read a file by path -- one Graph call, no per-segment walk.
+    SELECT count(*) FROM 'sharepoint://Finance/2026/actuals.parquet';
+
+    -- Address by driveItem id instead -- stable across a rename.
+    SELECT * FROM read_csv('sharepoint://id:01ABCDEF23456789');
+
+    -- Glob a folder.
+    SELECT * FROM read_parquet('sharepoint://exports/parts/*.parquet');
+
+    -- Write a whole file. Sequential only; Graph replaces whole files.
+    COPY (SELECT * FROM t) TO 'sharepoint://reports/out.parquet' (FORMAT parquet);
+
+  extended_description: |
+    Registers a `sharepoint://` filesystem backed by Microsoft Graph, so any
+    DuckDB path expression can address a file in a SharePoint document library
+    or OneDrive with no download step. Because DuckDB dispatches file access
+    through its virtual filesystem, `read_parquet`, `read_csv`, `COPY`, `glob`
+    and DuckLake all inherit the scheme.
+
+    Unlike Google Drive, Graph addresses items by path, so there is no
+    path-resolution cache and no duplicate-name ambiguity. Reads are ranged;
+    writes upload the whole file on close (Graph cannot write at a byte offset,
+    so positional writes raise rather than corrupt). Also registers the
+    scheme-generic `write_blob`, `remove_file`, `move_file` and `file_size` SQL
+    functions, which work for any filesystem DuckDB can reach.
+
+    This is **SharePoint / OneDrive via Microsoft Graph**, not Azure Blob
+    Storage — a different product with a different API. For `az://`/`abfss://`
+    containers use the `azure` extension.

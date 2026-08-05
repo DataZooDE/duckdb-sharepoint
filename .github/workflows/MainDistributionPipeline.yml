@@ -1,0 +1,27 @@
+# Build + distribute the sharepoint extension across DuckDB's platform matrix
+# via the extension-ci-tools reusable workflow, exactly as the sibling
+# duckdb-gdrive does.
+name: Main Distribution Pipeline
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}
+  cancel-in-progress: true
+
+jobs:
+  duckdb-stable-build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      extension_name: sharepoint
+      duckdb_version: main
+      ci_tools_version: main
+      # OpenSSL is fragile on mingw and Graph HTTPS has no meaning in wasm.
+      exclude_archs: "windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
+      vcpkg_commit: a1a1cbc975abf909a6c8985a6a2b8fe20bbd9bd6

@@ -1,0 +1,35 @@
+# Fast per-PR checks that need no DuckDB platform matrix: credential hygiene
+# and (once the duckdb submodule is pinned) the Catch2 pure-logic tests.
+name: Checks
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  hygiene:
+    name: Credential hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No credentials committed
+        run: ./scripts/check_no_credentials.sh
+
+  unit-tests:
+    name: Catch2 pure-logic tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build + run unit tests
+        run: |
+          # Requires the duckdb + extension-ci-tools submodules to be present.
+          # Until they are pinned this job is expected to be a no-op guard.
+          if [ -f duckdb/CMakeLists.txt ]; then
+            make unit_test
+          else
+            echo "duckdb submodule not checked out yet — skipping (see docs/hld.md §7.1)"
+          fi
