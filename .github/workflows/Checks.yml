@@ -21,19 +21,13 @@ jobs:
     name: Catch2 pure-logic tests
     runs-on: ubuntu-latest
     steps:
-      # No submodules: the pure layer builds standalone (test/cpp/CMakeLists.txt),
-      # needing only Catch2 -- no DuckDB, no OpenSSL. That keeps this a
-      # seconds-long gate instead of a full platform-matrix build.
+      # No submodules and nothing to install: the pure layer builds standalone
+      # (test/cpp/CMakeLists.txt) needing only Catch2 -- no DuckDB, no OpenSSL,
+      # no vcpkg. Catch2 comes from the system if present, else FetchContent, so
+      # this stays a seconds-long gate instead of a full platform-matrix build.
       - uses: actions/checkout@v4
-      - name: Install Ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
-      - name: Set up vcpkg (for Catch2)
-        uses: lukka/run-vcpkg@v11
-        with:
-          vcpkgGitCommitId: ce613c41372b23b1f51333815feb3edd87ef8a8b
       - name: Build + run the pure-logic tests
         run: |
-          cmake -S test/cpp -B build/unit -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-          cmake --build build/unit
+          cmake -S test/cpp -B build/unit
+          cmake --build build/unit -j
           ./build/unit/sharepoint_unit_tests --reporter console::out=-
