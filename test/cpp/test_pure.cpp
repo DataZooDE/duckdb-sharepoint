@@ -1,5 +1,6 @@
 // Catch2 pure-logic tests. No DuckDB linkage, no network, no credentials --
 // runnable by anyone who can build. `make unit_test`.
+#include "sharepoint_blockcache.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_glob.hpp"
 #include "sharepoint_upload.hpp"
@@ -186,6 +187,83 @@ TEST_CASE("nextExpectedRanges start offset parses", "[upload]") {
 	REQUIRE(s == 655360);
 	REQUIRE_FALSE(ParseRangeStart("-1", s));
 	REQUIRE_FALSE(ParseRangeStart("", s));
+}
+
+TEST_CASE("block plan splits a read across block boundaries", "[blockcache]") {
+	// A 25-byte file in blocks of 10: [0,10) [10,20) [20,25).
+	auto p = PlanBlockCopies(8, 7, 10, 25); // 8..14 -> 2 bytes from block0, 5 from block1
+	REQUIRE(p.size() == 2);
+	REQUIRE(p[0].block_index == 0);
+	REQUIRE(p[0].block_offset == 0);
+	REQUIRE(p[0].block_length == 10);
+	REQUIRE(p[0].src_in_block == 8);
+	REQUIRE(p[0].dest_offset == 0);
+	REQUIRE(p[0].length == 2);
+	REQUIRE(p[1].block_index == 1);
+	REQUIRE(p[1].block_offset == 10);
+	REQUIRE(p[1].src_in_block == 0);
+	REQUIRE(p[1].dest_offset == 2);
+	REQUIRE(p[1].length == 5);
+
+	// A read wholly inside the short final block.
+	auto q = PlanBlockCopies(22, 3, 10, 25);
+	REQUIRE(q.size() == 1);
+	REQUIRE(q[0].block_index == 2);
+	REQUIRE(q[0].block_offset == 20);
+	REQUIRE(q[0].block_length == 5); // clamped to file
+	REQUIRE(q[0].src_in_block == 2);
+	REQUIRE(q[0].length == 3);
+}
+
+TEST_CASE("block cache fetches each block once and serves hits", "[blockcache]") {
+	const std::string file = "0123456789abcdefghijklmno"; // 25 bytes
+	int fetches = 0;
+	auto fetch = [&](std::uint64_t off, std::uint64_t len) {
+		fetches++;
+		return file.substr(off, len);
+	};
+	SharepointBlockCache cache(1024);
+	auto read = [&](std::uint64_t off, std::uint64_t len) {
+		std::string out(len, '\0');
+		cache.Read("id|ctag", 10, file.size(), off, len, &out[0], fetch);
+		return out;
+	};
+
+	REQUIRE(read(0, 5) == "01234"); // block 0 fetched
+	REQUIRE(fetches == 1);
+	REQUIRE(read(5, 5) == "56789"); // block 0 hit
+	REQUIRE(fetches == 1);
+	REQUIRE(read(8, 7) == "89abcde"); // block 0 hit + block 1 fetch
+	REQUIRE(fetches == 2);
+	REQUIRE(read(20, 5) == "klmno"); // short block 2 fetch
+	REQUIRE(fetches == 3);
+	REQUIRE(read(0, 25) == file); // fully cached now
+	REQUIRE(fetches == 3);
+}
+
+TEST_CASE("block cache evicts LRU when over budget", "[blockcache]") {
+	const std::string file(300, 'z'); // 3 blocks of 100
+	int fetches = 0;
+	auto fetch = [&](std::uint64_t off, std::uint64_t len) {
+		fetches++;
+		return file.substr(off, len);
+	};
+	// Budget holds only two 100-byte blocks.
+	SharepointBlockCache cache(200);
+	auto touch = [&](std::uint64_t block) {
+		std::string out(100, '\0');
+		cache.Read("k", 100, file.size(), block * 100, 100, &out[0], fetch);
+	};
+
+	touch(0);
+	touch(1);
+	REQUIRE(fetches == 2);
+	REQUIRE(cache.ResidentBytes() == 200);
+	touch(2); // evicts block 0 (LRU)
+	REQUIRE(fetches == 3);
+	REQUIRE(cache.ResidentBytes() == 200);
+	touch(0); // block 0 was evicted -> refetched
+	REQUIRE(fetches == 4);
 }
 
 TEST_CASE("graph errors classify by status and code", "[errors]") {

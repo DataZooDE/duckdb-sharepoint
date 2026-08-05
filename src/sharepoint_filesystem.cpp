@@ -43,6 +43,14 @@ idx_t UploadChunkBytes(ClientContext &context) {
 	return 10ULL * 1024 * 1024;
 }
 
+idx_t BlockSizeBytes(ClientContext &context) {
+	Value v;
+	if (context.TryGetCurrentSetting("sharepoint_block_size_bytes", v) && !v.IsNull()) {
+		return v.GetValue<idx_t>();
+	}
+	return 8ULL * 1024 * 1024;
+}
+
 bool PermanentDelete(ClientContext &context) {
 	Value v;
 	if (context.TryGetCurrentSetting("sharepoint_permanent_delete", v) && !v.IsNull()) {
@@ -103,6 +111,7 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 	}
 	auto handle = make_uniq<SharepointFileHandle>(*this, path, flags, std::move(auth));
 	handle->meta = std::move(meta);
+	handle->block_size_bytes = BlockSizeBytes(context);
 	return std::move(handle);
 }
 
@@ -111,14 +120,41 @@ void SharepointFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_byt
 	if (nr_bytes <= 0) {
 		return;
 	}
-	GraphClient client(h.auth);
-	string chunk;
-	client.ReadRange(h.meta.id, static_cast<int64_t>(location), nr_bytes, chunk);
-	if (static_cast<int64_t>(chunk.size()) < nr_bytes) {
-		throw IOException("sharepoint: short read of '%s' (wanted %lld, got %llu)", handle.path.c_str(),
-		                  (long long)nr_bytes, (unsigned long long)chunk.size());
+
+	// Cache disabled (block size 0) or an out-of-bounds read: go straight to a
+	// ranged GET, which also raises the exact short-read error DuckDB expects.
+	const idx_t end = location + static_cast<idx_t>(nr_bytes);
+	if (h.block_size_bytes == 0 || end > static_cast<idx_t>(h.meta.size)) {
+		GraphClient client(h.auth);
+		string chunk;
+		client.ReadRange(h.meta.id, static_cast<int64_t>(location), nr_bytes, chunk);
+		if (static_cast<int64_t>(chunk.size()) < nr_bytes) {
+			throw IOException("sharepoint: short read of '%s' (wanted %lld, got %llu)", handle.path.c_str(),
+			                  (long long)nr_bytes, (unsigned long long)chunk.size());
+		}
+		std::memcpy(buffer, chunk.data(), nr_bytes);
+		return;
 	}
-	std::memcpy(buffer, chunk.data(), nr_bytes);
+
+	// Cached path: block key carries identity + item + cTag so it is never a
+	// cross-tenant or stale-version hit. Missing blocks come from a ranged GET.
+	const string key = h.auth.identity + "|" + h.meta.id + "|" + h.meta.ctag;
+	const AuthContext auth = h.auth;
+	const string item = h.meta.id;
+	block_cache.Read(
+	    key, static_cast<uint64_t>(h.block_size_bytes), static_cast<uint64_t>(h.meta.size),
+	    static_cast<uint64_t>(location), static_cast<uint64_t>(nr_bytes), static_cast<char *>(buffer),
+	    [&auth, &item](uint64_t block_offset, uint64_t block_length) {
+		    string chunk;
+		    GraphClient(auth).ReadRange(item, static_cast<int64_t>(block_offset),
+		                                static_cast<int64_t>(block_length), chunk);
+		    if (chunk.size() < block_length) {
+			    throw IOException("sharepoint: short read of block at %llu (wanted %llu, got %llu)",
+			                      (unsigned long long)block_offset, (unsigned long long)block_length,
+			                      (unsigned long long)chunk.size());
+		    }
+		    return chunk;
+	    });
 }
 
 int64_t SharepointFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {

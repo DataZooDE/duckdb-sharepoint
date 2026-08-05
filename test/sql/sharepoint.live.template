@@ -136,6 +136,19 @@ SELECT octet_length(content) FROM read_blob('sharepoint://_duckdb_sharepoint_liv
 statement ok
 RESET sharepoint_upload_chunk_bytes;
 
+# Read cache (§7.3): a small block size turns the 900 KB read into ~4 cached
+# blocks, exercising the multi-block assembly path (not just a single block).
+statement ok
+SET sharepoint_block_size_bytes = 262144;
+
+query I
+SELECT octet_length(content) FROM read_blob('sharepoint://_duckdb_sharepoint_live/big.bin');
+----
+900000
+
+statement ok
+RESET sharepoint_block_size_bytes;
+
 # ---------------------------------------------------------------------------
 # 5. Recursive ** glob across folders (§7.4). Three parquet files at three
 #    depths; `**/*.parquet` finds all of them and read_parquet unions them.

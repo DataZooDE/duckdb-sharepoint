@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sharepoint_blockcache.hpp"
 #include "sharepoint_client.hpp"
 
 #include "duckdb/common/file_system.hpp"
@@ -39,6 +40,9 @@ public:
 	DriveItemMeta meta;
 	//! Sequential read/write cursor.
 	idx_t position = 0;
+	//! Block size for cached reads, captured at OpenFile from
+	//! sharepoint_block_size_bytes. 0 disables the cache (exact ranges).
+	idx_t block_size_bytes = 8ULL * 1024 * 1024;
 
 	//! Write path: bytes accumulate locally and nothing reaches Graph until
 	//! Close() (Graph has no append/positional write). `write_root_relative`
@@ -99,6 +103,12 @@ public:
 	//! Graph cannot write at an offset or trim in place; both throw.
 	void Truncate(FileHandle &handle, int64_t new_size) override;
 	bool Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) override;
+
+private:
+	//! Process-wide read cache: this FileSystem is one object for the whole
+	//! DatabaseInstance, so the cache spans every ClientContext. Keys carry the
+	//! caller identity + cTag so it is never a cross-tenant or cross-version leak.
+	SharepointBlockCache block_cache;
 };
 
 } // namespace sharepoint

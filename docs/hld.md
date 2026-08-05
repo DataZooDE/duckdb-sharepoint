@@ -111,8 +111,21 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
    PUT loop is in `sharepoint_client.cpp`. **Live proof still owed:** the §7.5
    harness must upload a file **larger than one chunk** to exercise this branch
    end to end — nothing here has run against a tenant.
-3. **Block cache** for reads (`sharepoint_block_size_bytes`), single-flight per
-   block, identity-keyed — port from gdrive's `GDriveBlockCache`.
+3. ~~**Block cache** for reads (`sharepoint_block_size_bytes`), single-flight per
+   block, identity-keyed.~~ **Implemented (2026-08-05), pending live verification.**
+   `SharepointBlockCache` (`sharepoint_blockcache.*`, pure — the byte fetch is
+   injected) serves reads from fixed-size blocks: a ranged GET pays a round trip
+   regardless of size, so a Parquet scan's many small adjacent reads collapse
+   onto a few cached blocks. Single-flight per block (a per-block load mutex, so
+   concurrent readers of one block share one fetch), byte-bounded LRU eviction,
+   and process-wide (the FileSystem is one object for the DatabaseInstance). Keys
+   are `identity | item-id | cTag`, so it is never a cross-tenant or stale-version
+   hit. `FileSystem::Read` routes through it, supplying a fetch backed by
+   `GraphClient::ReadRange`; `sharepoint_block_size_bytes = 0`, or an
+   out-of-bounds read, falls back to the exact-range path. The block math and the
+   cache (fetch-count, hit, and LRU-eviction behaviour) are Catch2-tested with a
+   synthetic fetcher; the concurrency is single-flight by construction but only
+   single-thread-tested here, and no cache has run against a live tenant.
 4. ~~**Recursive `**` glob** across folders (currently one folder level).~~
    **Implemented (2026-08-05), pending live verification.** `Glob()` now walks
    the folder tree: `*`/`?` match within a segment, `**` matches zero or more
