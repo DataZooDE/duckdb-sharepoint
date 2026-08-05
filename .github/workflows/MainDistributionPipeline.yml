@@ -28,4 +28,8 @@ jobs:
       ci_tools_version: 1f04702aae6f4e7ab45f38689fd79e765221b19e
       # OpenSSL is fragile on mingw and Graph HTTPS has no meaning in wasm.
       exclude_archs: "windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
-      vcpkg_commit: a1a1cbc975abf909a6c8985a6a2b8fe20bbd9bd6
+      # The 1.4 LTS build image ships CMake 4, which refuses to bootstrap an old
+      # vcpkg from source (its bundled vcpkg-tool has cmake_minimum_required below
+      # 3.5). Pin the newer vcpkg the sibling DataZoo extensions build the LTS
+      # line with -- it bootstraps clean under CMake 4.
+      vcpkg_commit: ce613c41372b23b1f51333815feb3edd87ef8a8b
