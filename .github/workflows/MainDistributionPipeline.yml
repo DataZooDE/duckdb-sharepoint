@@ -17,11 +17,15 @@ concurrency:
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    # Pinned to the 1.4 LTS line, matching the duckdb (v1.4.5) and
+    # extension-ci-tools (v1.4-andium) submodules this repo builds against. The
+    # reusable-workflow ref and ci_tools_version are the SAME commit, per the
+    # sibling DataZoo house style. Bump together with scripts/check_duckdb_pin.sh.
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@1f04702aae6f4e7ab45f38689fd79e765221b19e
     with:
       extension_name: sharepoint
-      duckdb_version: main
-      ci_tools_version: main
+      duckdb_version: v1.4.5
+      ci_tools_version: 1f04702aae6f4e7ab45f38689fd79e765221b19e
       # OpenSSL is fragile on mingw and Graph HTTPS has no meaning in wasm.
       exclude_archs: "windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
       vcpkg_commit: a1a1cbc975abf909a6c8985a6a2b8fe20bbd9bd6

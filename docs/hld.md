@@ -78,10 +78,26 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
 
 ## 7. Remaining work (the honest TODO list)
 
-1. **Compile against a pinned DuckDB submodule.** No `duckdb/` submodule is
-   checked out; nothing here has been through a compiler. Expect to reconcile
-   the exact `FileSystem` / `SecretManager` / `FileOpener` signatures against
-   the pinned DuckDB version (the sibling gdrive pins one — match it).
+1. ~~**Compile against a pinned DuckDB submodule.**~~ **Done (2026-08-05).**
+   Pinned **duckdb `v1.4.5`** (latest 1.4 LTS — the line `extension_config.cmake`
+   is written for) and **extension-ci-tools `v1.4-andium`**; vcpkg at the
+   `MainDistributionPipeline.yml` commit. The scaffold compiles clean and both
+   test layers pass (pure Catch2 green; live SQL skips via `require-env`).
+   `scripts/check_duckdb_pin.sh` now asserts the tag. The `FileSystem` /
+   `SecretManager` / `FileOpener` signatures all matched the scaffold as
+   written; only two build wiring fixes were needed, both worth remembering:
+   - **picojson** — the vcpkg port (≥1.3.0) installs the header at
+     `include/picojson/picojson.h`, but the sources spell it `<picojson.h>`
+     (as gdrive does). `CMakeLists.txt` now `find_path`s the subdir and adds it
+     to the include path, rather than rewriting every `#include`.
+   - **`FileOpener`** — `file_system.hpp` only forward-declares it, so calling
+     `FileOpener::TryGetClientContext` needs an explicit
+     `#include "duckdb/common/file_opener.hpp"` (added to `sharepoint_filesystem.cpp`).
+
+   The submodule **gitlinks** are recorded in the pin commit (they were
+   direct-cloned into place first), and `MainDistributionPipeline.yml` is
+   aligned to the same pins (`duckdb_version: v1.4.5`, the reusable workflow ref
+   and `ci_tools_version` both the v1.4-andium commit `1f04702`).
 2. **Resumable upload session** (`PutContent`, large-file branch). The
    `createUploadSession` call is written; the chunked `PUT` loop against the
    returned absolute `uploadUrl` (own httplib client, no auth header,

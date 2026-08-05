@@ -8,6 +8,7 @@
 #include "sharepoint_glob.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/client_context.hpp"
 
