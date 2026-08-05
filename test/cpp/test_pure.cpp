@@ -7,7 +7,10 @@
 #include "sharepoint_version.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
 #include <cstdint>
+#include <map>
+#include <vector>
 
 using namespace duckdb::sharepoint;
 
@@ -87,6 +90,56 @@ TEST_CASE("glob matches within a segment", "[glob]") {
 	REQUIRE_FALSE(MatchGlob("file-??.txt", "file-7.txt"));
 	REQUIRE(HasGlobMeta("*.parquet"));
 	REQUIRE_FALSE(HasGlobMeta("actuals.parquet"));
+}
+
+// A synthetic drive tree for the recursive-glob tests. No Graph, no I/O: the
+// lister just reads this map, so GlobFiles is exercised end to end in the pure
+// binary. Keys are root-relative folder paths ("" == the drive root).
+static GlobLister TreeLister(const std::map<std::string, std::vector<GlobEntry>> &tree) {
+	return [tree](const std::string &folder) -> std::vector<GlobEntry> {
+		auto it = tree.find(folder);
+		return it == tree.end() ? std::vector<GlobEntry> {} : it->second;
+	};
+}
+
+static std::vector<std::string> Sorted(std::vector<std::string> v) {
+	std::sort(v.begin(), v.end());
+	return v;
+}
+
+TEST_CASE("recursive ** glob walks folders", "[glob]") {
+	// ""              -> Finance/, readme.md
+	// Finance         -> 2025/, 2026/, summary.parquet
+	// Finance/2025    -> q1.parquet, q2.csv
+	// Finance/2026    -> q1.parquet
+	const std::map<std::string, std::vector<GlobEntry>> tree = {
+	    {"", {{"Finance", true}, {"readme.md", false}}},
+	    {"Finance", {{"2025", true}, {"2026", true}, {"summary.parquet", false}}},
+	    {"Finance/2025", {{"q1.parquet", false}, {"q2.csv", false}}},
+	    {"Finance/2026", {{"q1.parquet", false}}},
+	};
+	auto list = TreeLister(tree);
+
+	// ** matches any depth (including zero: summary.parquet sits directly in Finance).
+	REQUIRE(Sorted(GlobFiles({"Finance", "**", "*.parquet"}, list)) ==
+	        std::vector<std::string> {"Finance/2025/q1.parquet", "Finance/2026/q1.parquet",
+	                                  "Finance/summary.parquet"});
+
+	// A single * is exactly one folder level -- summary.parquet (depth 0) is excluded.
+	REQUIRE(Sorted(GlobFiles({"Finance", "*", "*.parquet"}, list)) ==
+	        std::vector<std::string> {"Finance/2025/q1.parquet", "Finance/2026/q1.parquet"});
+
+	// ** from the root, matching by extension across the whole tree.
+	REQUIRE(Sorted(GlobFiles({"**", "*.csv"}, list)) == std::vector<std::string> {"Finance/2025/q2.csv"});
+
+	// A trailing ** is every file beneath the folder (folders themselves excluded).
+	REQUIRE(Sorted(GlobFiles({"Finance", "**"}, list)) ==
+	        std::vector<std::string> {"Finance/2025/q1.parquet", "Finance/2025/q2.csv", "Finance/2026/q1.parquet",
+	                                  "Finance/summary.parquet"});
+
+	// No match -> empty, and each file is emitted exactly once (no ** double-count).
+	REQUIRE(GlobFiles({"Finance", "**", "*.orc"}, list).empty());
+	REQUIRE(GlobFiles({"**", "q1.parquet"}, list).size() == 2);
 }
 
 TEST_CASE("upload chunk size rounds down to a 320 KiB multiple", "[upload]") {

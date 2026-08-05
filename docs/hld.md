@@ -113,7 +113,17 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
    end to end — nothing here has run against a tenant.
 3. **Block cache** for reads (`sharepoint_block_size_bytes`), single-flight per
    block, identity-keyed — port from gdrive's `GDriveBlockCache`.
-4. **Recursive `**` glob** across folders (currently one folder level).
+4. ~~**Recursive `**` glob** across folders (currently one folder level).~~
+   **Implemented (2026-08-05), pending live verification.** `Glob()` now walks
+   the folder tree: `*`/`?` match within a segment, `**` matches zero or more
+   whole levels, and only files are emitted (a trailing `**` yields every file
+   beneath the folder). A fully literal path keeps its one-`Stat` fast path. The
+   walk itself is a pure matcher (`GlobFiles` in `sharepoint_glob.*`, driven by
+   an injected lister and unit-tested over a synthetic tree, each folder listed
+   at most once); `FileSystem::Glob` only adapts the lister to
+   `GraphClient::ListChildren`. Live proof (a real nested library) is owed to
+   the §7.5 harness. Note: `GlobFiles` is deliberately called qualified —
+   `FileSystem` has a same-named member that would otherwise shadow it.
 5. **Live SQL suite** (`test/sql/live/`, `make test_live`) against a real
    tenant + a Python e2e harness (fixtures, API-call-count assertions), as
    gdrive has. This is the merge gate — no mocks.

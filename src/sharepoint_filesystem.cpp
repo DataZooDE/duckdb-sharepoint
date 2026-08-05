@@ -273,23 +273,22 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 	auto &context = RequireContext(opener, "glob");
 	auto auth = GetAuthContext(context, path);
 
-	// Split into the longest literal parent prefix and a trailing segment. This
-	// scaffold globs ONE folder level (a wildcard in the final segment);
-	// recursive `**` across folders is a documented follow-up (docs/hld.md).
 	auto &segs = uri.segments;
 	if (segs.empty()) {
 		return result;
 	}
-	const string &last = segs.back();
-	string parent;
-	for (size_t i = 0; i + 1 < segs.size(); i++) {
-		if (i) {
-			parent += '/';
+
+	// A fully literal path is one Stat, not a tree walk -- and it is the only
+	// case where a matching item may be a folder (DuckDB globs a bare path
+	// before opening it).
+	bool has_meta = false;
+	for (auto &s : segs) {
+		if (HasGlobMeta(s)) {
+			has_meta = true;
+			break;
 		}
-		parent += segs[i];
 	}
-	if (!HasGlobMeta(last)) {
-		// A literal path: return it iff it exists.
+	if (!has_meta) {
 		GraphClient client(auth);
 		auto meta = client.StatByPath(uri.RootRelativePath());
 		if (meta.found) {
@@ -297,15 +296,22 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 		}
 		return result;
 	}
-	auto children = GraphClient(auth).ListChildren(parent);
-	for (auto &c : children) {
-		if (c.is_folder) {
-			continue;
+
+	// Wildcard pattern: walk folders through GraphClient::ListChildren. `**`
+	// recurses across levels; `*`/`?` stay within a segment. The matcher itself
+	// is pure (sharepoint_glob.*) and unit-tested; here we only adapt the lister.
+	GraphClient client(auth);
+	auto lister = [&client](const string &folder) -> vector<GlobEntry> {
+		vector<GlobEntry> entries;
+		for (auto &c : client.ListChildren(folder)) {
+			entries.push_back(GlobEntry {c.name, c.is_folder});
 		}
-		if (MatchGlob(last, c.name)) {
-			string full = string(SHAREPOINT_SCHEME) + (parent.empty() ? c.name : parent + "/" + c.name);
-			result.emplace_back(full);
-		}
+		return entries;
+	};
+	// Qualify: FileSystem also declares a GlobFiles member, which unqualified
+	// would shadow our pure matcher here inside a FileSystem subclass.
+	for (auto &rel : sharepoint::GlobFiles(segs, lister)) {
+		result.emplace_back(string(SHAREPOINT_SCHEME) + rel);
 	}
 	return result;
 }
