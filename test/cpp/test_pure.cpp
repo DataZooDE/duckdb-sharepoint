@@ -1,11 +1,17 @@
 // Catch2 pure-logic tests. No DuckDB linkage, no network, no credentials --
 // runnable by anyone who can build. `make unit_test`.
+#include "sharepoint_blockcache.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_glob.hpp"
+#include "sharepoint_upload.hpp"
 #include "sharepoint_uri.hpp"
 #include "sharepoint_version.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
+#include <cstdint>
+#include <map>
+#include <vector>
 
 using namespace duckdb::sharepoint;
 
@@ -85,6 +91,179 @@ TEST_CASE("glob matches within a segment", "[glob]") {
 	REQUIRE_FALSE(MatchGlob("file-??.txt", "file-7.txt"));
 	REQUIRE(HasGlobMeta("*.parquet"));
 	REQUIRE_FALSE(HasGlobMeta("actuals.parquet"));
+}
+
+// A synthetic drive tree for the recursive-glob tests. No Graph, no I/O: the
+// lister just reads this map, so GlobFiles is exercised end to end in the pure
+// binary. Keys are root-relative folder paths ("" == the drive root).
+static GlobLister TreeLister(const std::map<std::string, std::vector<GlobEntry>> &tree) {
+	return [tree](const std::string &folder) -> std::vector<GlobEntry> {
+		auto it = tree.find(folder);
+		return it == tree.end() ? std::vector<GlobEntry> {} : it->second;
+	};
+}
+
+static std::vector<std::string> Sorted(std::vector<std::string> v) {
+	std::sort(v.begin(), v.end());
+	return v;
+}
+
+TEST_CASE("recursive ** glob walks folders", "[glob]") {
+	// ""              -> Finance/, readme.md
+	// Finance         -> 2025/, 2026/, summary.parquet
+	// Finance/2025    -> q1.parquet, q2.csv
+	// Finance/2026    -> q1.parquet
+	const std::map<std::string, std::vector<GlobEntry>> tree = {
+	    {"", {{"Finance", true}, {"readme.md", false}}},
+	    {"Finance", {{"2025", true}, {"2026", true}, {"summary.parquet", false}}},
+	    {"Finance/2025", {{"q1.parquet", false}, {"q2.csv", false}}},
+	    {"Finance/2026", {{"q1.parquet", false}}},
+	};
+	auto list = TreeLister(tree);
+
+	// ** matches any depth (including zero: summary.parquet sits directly in Finance).
+	REQUIRE(Sorted(GlobFiles({"Finance", "**", "*.parquet"}, list)) ==
+	        std::vector<std::string> {"Finance/2025/q1.parquet", "Finance/2026/q1.parquet",
+	                                  "Finance/summary.parquet"});
+
+	// A single * is exactly one folder level -- summary.parquet (depth 0) is excluded.
+	REQUIRE(Sorted(GlobFiles({"Finance", "*", "*.parquet"}, list)) ==
+	        std::vector<std::string> {"Finance/2025/q1.parquet", "Finance/2026/q1.parquet"});
+
+	// ** from the root, matching by extension across the whole tree.
+	REQUIRE(Sorted(GlobFiles({"**", "*.csv"}, list)) == std::vector<std::string> {"Finance/2025/q2.csv"});
+
+	// A trailing ** is every file beneath the folder (folders themselves excluded).
+	REQUIRE(Sorted(GlobFiles({"Finance", "**"}, list)) ==
+	        std::vector<std::string> {"Finance/2025/q1.parquet", "Finance/2025/q2.csv", "Finance/2026/q1.parquet",
+	                                  "Finance/summary.parquet"});
+
+	// No match -> empty, and each file is emitted exactly once (no ** double-count).
+	REQUIRE(GlobFiles({"Finance", "**", "*.orc"}, list).empty());
+	REQUIRE(GlobFiles({"**", "q1.parquet"}, list).size() == 2);
+}
+
+TEST_CASE("upload chunk size rounds down to a 320 KiB multiple", "[upload]") {
+	// A default that is already a multiple is unchanged.
+	REQUIRE(NormalizeUploadChunkSize(10ull * 1024 * 1024) == 10ull * 1024 * 1024);
+	REQUIRE(NormalizeUploadChunkSize(kGraphUploadChunkMultiple) == kGraphUploadChunkMultiple);
+	// A non-multiple rounds DOWN (the last chunk carries the remainder).
+	REQUIRE(NormalizeUploadChunkSize(kGraphUploadChunkMultiple * 3 + 5) == kGraphUploadChunkMultiple * 3);
+	// Below one multiple clamps up, never to zero -- the loop must progress.
+	REQUIRE(NormalizeUploadChunkSize(1) == kGraphUploadChunkMultiple);
+	REQUIRE(NormalizeUploadChunkSize(0) == kGraphUploadChunkMultiple);
+}
+
+TEST_CASE("content-range header is byte-inclusive", "[upload]") {
+	REQUIRE(UploadContentRange(0, kGraphUploadChunkMultiple, 1000000) == "bytes 0-327679/1000000");
+	// A final, ragged chunk: start 655360, length 344640 -> last byte 999999.
+	REQUIRE(UploadContentRange(655360, 344640, 1000000) == "bytes 655360-999999/1000000");
+}
+
+TEST_CASE("absolute upload URL splits into origin and path", "[upload]") {
+	std::string origin, rest;
+	REQUIRE(SplitAbsoluteUrl("https://host.sharepoint.com/_api/v2.0/drive/items/x/upload?guid=abc", origin, rest));
+	REQUIRE(origin == "https://host.sharepoint.com");
+	REQUIRE(rest == "/_api/v2.0/drive/items/x/upload?guid=abc");
+
+	REQUIRE(SplitAbsoluteUrl("https://host:8443/p", origin, rest));
+	REQUIRE(origin == "https://host:8443");
+	REQUIRE(rest == "/p");
+
+	// No path -> the remainder defaults to "/".
+	REQUIRE(SplitAbsoluteUrl("https://host.example.com", origin, rest));
+	REQUIRE(origin == "https://host.example.com");
+	REQUIRE(rest == "/");
+
+	// A bare path is not an absolute URL.
+	REQUIRE_FALSE(SplitAbsoluteUrl("/just/a/path", origin, rest));
+}
+
+TEST_CASE("nextExpectedRanges start offset parses", "[upload]") {
+	std::uint64_t s = 999;
+	REQUIRE(ParseRangeStart("512-1023", s));
+	REQUIRE(s == 512);
+	REQUIRE(ParseRangeStart("655360-", s));
+	REQUIRE(s == 655360);
+	REQUIRE_FALSE(ParseRangeStart("-1", s));
+	REQUIRE_FALSE(ParseRangeStart("", s));
+}
+
+TEST_CASE("block plan splits a read across block boundaries", "[blockcache]") {
+	// A 25-byte file in blocks of 10: [0,10) [10,20) [20,25).
+	auto p = PlanBlockCopies(8, 7, 10, 25); // 8..14 -> 2 bytes from block0, 5 from block1
+	REQUIRE(p.size() == 2);
+	REQUIRE(p[0].block_index == 0);
+	REQUIRE(p[0].block_offset == 0);
+	REQUIRE(p[0].block_length == 10);
+	REQUIRE(p[0].src_in_block == 8);
+	REQUIRE(p[0].dest_offset == 0);
+	REQUIRE(p[0].length == 2);
+	REQUIRE(p[1].block_index == 1);
+	REQUIRE(p[1].block_offset == 10);
+	REQUIRE(p[1].src_in_block == 0);
+	REQUIRE(p[1].dest_offset == 2);
+	REQUIRE(p[1].length == 5);
+
+	// A read wholly inside the short final block.
+	auto q = PlanBlockCopies(22, 3, 10, 25);
+	REQUIRE(q.size() == 1);
+	REQUIRE(q[0].block_index == 2);
+	REQUIRE(q[0].block_offset == 20);
+	REQUIRE(q[0].block_length == 5); // clamped to file
+	REQUIRE(q[0].src_in_block == 2);
+	REQUIRE(q[0].length == 3);
+}
+
+TEST_CASE("block cache fetches each block once and serves hits", "[blockcache]") {
+	const std::string file = "0123456789abcdefghijklmno"; // 25 bytes
+	int fetches = 0;
+	auto fetch = [&](std::uint64_t off, std::uint64_t len) {
+		fetches++;
+		return file.substr(off, len);
+	};
+	SharepointBlockCache cache(1024);
+	auto read = [&](std::uint64_t off, std::uint64_t len) {
+		std::string out(len, '\0');
+		cache.Read("id|ctag", 10, file.size(), off, len, &out[0], fetch);
+		return out;
+	};
+
+	REQUIRE(read(0, 5) == "01234"); // block 0 fetched
+	REQUIRE(fetches == 1);
+	REQUIRE(read(5, 5) == "56789"); // block 0 hit
+	REQUIRE(fetches == 1);
+	REQUIRE(read(8, 7) == "89abcde"); // block 0 hit + block 1 fetch
+	REQUIRE(fetches == 2);
+	REQUIRE(read(20, 5) == "klmno"); // short block 2 fetch
+	REQUIRE(fetches == 3);
+	REQUIRE(read(0, 25) == file); // fully cached now
+	REQUIRE(fetches == 3);
+}
+
+TEST_CASE("block cache evicts LRU when over budget", "[blockcache]") {
+	const std::string file(300, 'z'); // 3 blocks of 100
+	int fetches = 0;
+	auto fetch = [&](std::uint64_t off, std::uint64_t len) {
+		fetches++;
+		return file.substr(off, len);
+	};
+	// Budget holds only two 100-byte blocks.
+	SharepointBlockCache cache(200);
+	auto touch = [&](std::uint64_t block) {
+		std::string out(100, '\0');
+		cache.Read("k", 100, file.size(), block * 100, 100, &out[0], fetch);
+	};
+
+	touch(0);
+	touch(1);
+	REQUIRE(fetches == 2);
+	REQUIRE(cache.ResidentBytes() == 200);
+	touch(2); // evicts block 0 (LRU)
+	REQUIRE(fetches == 3);
+	REQUIRE(cache.ResidentBytes() == 200);
+	touch(0); // block 0 was evicted -> refetched
+	REQUIRE(fetches == 4);
 }
 
 TEST_CASE("graph errors classify by status and code", "[errors]") {

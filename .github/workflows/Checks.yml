@@ -21,15 +21,13 @@ jobs:
     name: Catch2 pure-logic tests
     runs-on: ubuntu-latest
     steps:
+      # No submodules and nothing to install: the pure layer builds standalone
+      # (test/cpp/CMakeLists.txt) needing only Catch2 -- no DuckDB, no OpenSSL,
+      # no vcpkg. Catch2 comes from the system if present, else FetchContent, so
+      # this stays a seconds-long gate instead of a full platform-matrix build.
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Build + run unit tests
+      - name: Build + run the pure-logic tests
         run: |
-          # Requires the duckdb + extension-ci-tools submodules to be present.
-          # Until they are pinned this job is expected to be a no-op guard.
-          if [ -f duckdb/CMakeLists.txt ]; then
-            make unit_test
-          else
-            echo "duckdb submodule not checked out yet — skipping (see docs/hld.md §7.1)"
-          fi
+          cmake -S test/cpp -B build/unit
+          cmake --build build/unit -j
+          ./build/unit/sharepoint_unit_tests --reporter console::out=-

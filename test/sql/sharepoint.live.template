@@ -1,0 +1,218 @@
+# name: test/sql/sharepoint.live.template
+# description: Live round trip against a REAL Microsoft Graph tenant. NOT run
+#              directly -- scripts/run_live_tests.sh materialises it into the
+#              git-ignored test/sql/live/ with the run's real ids substituted
+#              for the @...@ placeholders, then runs that copy. `make test_live`.
+# group: [sharepoint]
+#
+# The placeholders below are the ONLY thing that ever differs between this
+# committed template and the materialised copy -- no real credential is stored
+# here. See docs/hld.md §7.5.
+
+require sharepoint
+
+require parquet
+
+# Present in the materialised copy's environment (run_live_tests.sh exports
+# them); a bare run without them skips rather than fails.
+require-env SHAREPOINT_TENANT_ID
+
+# DuckDB's runner skips any test whose error message contains "HTTP" or "Unable
+# to connect" by default (an httpfs-flakiness convenience). For this merge gate
+# that would turn a real Graph failure -- our errors read "HTTP <status>" -- into
+# a false green. Replace the ignore list with a sentinel that never appears in a
+# Graph error, so every failure here fails loudly. (The directive clears the
+# defaults; it needs at least one token, hence the sentinel rather than empty.)
+set ignore_error_messages __sharepoint_never_ignore__
+
+statement ok
+CREATE OR REPLACE SECRET sp_live (
+    TYPE sharepoint,
+    PROVIDER client_credentials,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_CLIENT_ID@',
+    CLIENT_SECRET '@SHAREPOINT_CLIENT_SECRET@',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@'
+);
+
+# ---------------------------------------------------------------------------
+# All fixtures live under one root so a run is self-contained and re-runnable
+# (every write below replaces in place). Best-effort cleanup of the leaf files
+# from a prior run first; remove_file returns false for an absent file, which is
+# still `statement ok`.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/hello.txt');
+
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/big.bin');
+
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/final.txt');
+
+# Pre-create the folder chains. write_blob creates every missing parent
+# directory (EnsureParentDirectories); a subsequent COPY into the folder then
+# does not depend on Graph's implicit-parent behaviour.
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/data/.keep', ''::BLOB);
+
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/tree/sub/deep/.keep', ''::BLOB);
+
+# ---------------------------------------------------------------------------
+# 1. write_blob / read_blob / file_size round trip.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/hello.txt', 'hello graph'::BLOB);
+
+query I
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/hello.txt');
+----
+11
+
+query I
+SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live/hello.txt');
+----
+hello graph
+
+# file_size of an absent file is NULL, not an error.
+query I
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/nope.txt') IS NULL;
+----
+true
+
+# ---------------------------------------------------------------------------
+# 2. remove_file is idempotent: true when it existed, false the second time.
+# ---------------------------------------------------------------------------
+query I
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/hello.txt');
+----
+true
+
+query I
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/hello.txt');
+----
+false
+
+# ---------------------------------------------------------------------------
+# 3. COPY ... TO (FORMAT parquet) then read_parquet -- the parquet path DuckLake
+#    and read_parquet rely on.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT i AS id, i * 2 AS v FROM range(1000) t(i))
+     TO 'sharepoint://_duckdb_sharepoint_live/data/nums.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM read_parquet('sharepoint://_duckdb_sharepoint_live/data/nums.parquet');
+----
+1000
+
+query I
+SELECT sum(v) FROM read_parquet('sharepoint://_duckdb_sharepoint_live/data/nums.parquet');
+----
+999000
+
+# ---------------------------------------------------------------------------
+# 4. Resumable upload session (§7.2). Force the chunk size down to the 320-KiB
+#    minimum and write ~900 KB, so the upload takes the multi-chunk session path
+#    (3 chunks) rather than a single PUT.
+# ---------------------------------------------------------------------------
+statement ok
+SET sharepoint_upload_chunk_bytes = 327680;
+
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/big.bin', repeat('x', 900000)::BLOB);
+
+query I
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/big.bin');
+----
+900000
+
+query I
+SELECT octet_length(content) FROM read_blob('sharepoint://_duckdb_sharepoint_live/big.bin');
+----
+900000
+
+statement ok
+RESET sharepoint_upload_chunk_bytes;
+
+# Read cache (§7.3): a small block size turns the 900 KB read into ~4 cached
+# blocks, exercising the multi-block assembly path (not just a single block).
+statement ok
+SET sharepoint_block_size_bytes = 262144;
+
+query I
+SELECT octet_length(content) FROM read_blob('sharepoint://_duckdb_sharepoint_live/big.bin');
+----
+900000
+
+statement ok
+RESET sharepoint_block_size_bytes;
+
+# ---------------------------------------------------------------------------
+# 5. Recursive ** glob across folders (§7.4). Three parquet files at three
+#    depths; `**/*.parquet` finds all of them and read_parquet unions them.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT 1 AS a) TO 'sharepoint://_duckdb_sharepoint_live/tree/x.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT 2 AS a) TO 'sharepoint://_duckdb_sharepoint_live/tree/sub/y.parquet' (FORMAT parquet);
+
+statement ok
+COPY (SELECT 3 AS a) TO 'sharepoint://_duckdb_sharepoint_live/tree/sub/deep/z.parquet' (FORMAT parquet);
+
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree/**/*.parquet');
+----
+3
+
+query I
+SELECT sum(a) FROM read_parquet('sharepoint://_duckdb_sharepoint_live/tree/**/*.parquet');
+----
+6
+
+# A single * is one level only: just tree/x.parquet.
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree/*.parquet');
+----
+1
+
+# ---------------------------------------------------------------------------
+# 6. move_file: write a staging file, publish it under its final name.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/staging.tmp', 'movable'::BLOB);
+
+query I
+SELECT move_file('sharepoint://_duckdb_sharepoint_live/staging.tmp',
+                 'sharepoint://_duckdb_sharepoint_live/final.txt');
+----
+true
+
+query I
+SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live/final.txt');
+----
+movable
+
+# The source no longer exists after the move.
+query I
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/staging.tmp') IS NULL;
+----
+true
+
+# ---------------------------------------------------------------------------
+# Best-effort teardown of the leaf files. Empty fixture folders may remain; the
+# next run replaces every file in place, so a lingering tree is harmless.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/big.bin');
+
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/final.txt');
+
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/data/nums.parquet');
+
+statement ok
+DROP SECRET sp_live;

@@ -21,6 +21,17 @@ include_directories(src/include)
 # then silently reintroduce the double/int split.
 add_compile_definitions(PICOJSON_USE_INT64)
 
+# The vcpkg picojson port (>=1.3.0) installs the header at
+# include/picojson/picojson.h, but the sources -- like the sibling gdrive --
+# spell it `#include <picojson.h>`. Add the subdirectory to the include path so
+# the bare form resolves regardless of the vcpkg layout, rather than rewriting
+# every #include.
+find_path(PICOJSON_INCLUDE_DIR NAMES picojson.h PATH_SUFFIXES picojson)
+if(NOT PICOJSON_INCLUDE_DIR)
+  message(FATAL_ERROR "picojson.h not found -- is the picojson vcpkg dependency installed?")
+endif()
+include_directories(${PICOJSON_INCLUDE_DIR})
+
 # DuckDB ships cpp-httplib (namespace duckdb_httplib_openssl) under its
 # third_party tree. Use it directly rather than adding a separate vcpkg dep,
 # matching the sibling ../duckdb-gdrive. Pure-logic targets (the Catch2 binary)
@@ -37,6 +48,8 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_uri.cpp
     src/sharepoint_errors.cpp
     src/sharepoint_glob.cpp
+    src/sharepoint_upload.cpp
+    src/sharepoint_blockcache.cpp
 )
 
 # ---------------------------------------------------------------------------

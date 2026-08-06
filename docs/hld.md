@@ -78,24 +78,96 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
 
 ## 7. Remaining work (the honest TODO list)
 
-1. **Compile against a pinned DuckDB submodule.** No `duckdb/` submodule is
-   checked out; nothing here has been through a compiler. Expect to reconcile
-   the exact `FileSystem` / `SecretManager` / `FileOpener` signatures against
-   the pinned DuckDB version (the sibling gdrive pins one — match it).
-2. **Resumable upload session** (`PutContent`, large-file branch). The
-   `createUploadSession` call is written; the chunked `PUT` loop against the
-   returned absolute `uploadUrl` (own httplib client, no auth header,
-   320-KiB-multiple chunks, resume-on-5xx via `expectedRanges`) is a TODO.
-3. **Block cache** for reads (`sharepoint_block_size_bytes`), single-flight per
-   block, identity-keyed — port from gdrive's `GDriveBlockCache`.
-4. **Recursive `**` glob** across folders (currently one folder level).
+1. ~~**Compile against a pinned DuckDB submodule.**~~ **Done (2026-08-05).**
+   Pinned **duckdb `v1.4.5`** (latest 1.4 LTS — the line `extension_config.cmake`
+   is written for) and **extension-ci-tools `v1.4-andium`**; vcpkg at the
+   `MainDistributionPipeline.yml` commit. The scaffold compiles clean and both
+   test layers pass (pure Catch2 green; live SQL skips via `require-env`).
+   `scripts/check_duckdb_pin.sh` now asserts the tag. The `FileSystem` /
+   `SecretManager` / `FileOpener` signatures all matched the scaffold as
+   written; only two build wiring fixes were needed, both worth remembering:
+   - **picojson** — the vcpkg port (≥1.3.0) installs the header at
+     `include/picojson/picojson.h`, but the sources spell it `<picojson.h>`
+     (as gdrive does). `CMakeLists.txt` now `find_path`s the subdir and adds it
+     to the include path, rather than rewriting every `#include`.
+   - **`FileOpener`** — `file_system.hpp` only forward-declares it, so calling
+     `FileOpener::TryGetClientContext` needs an explicit
+     `#include "duckdb/common/file_opener.hpp"` (added to `sharepoint_filesystem.cpp`).
+
+   The submodule **gitlinks** are recorded in the pin commit (they were
+   direct-cloned into place first), and `MainDistributionPipeline.yml` is
+   aligned to the same pins (`duckdb_version: v1.4.5`, the reusable workflow ref
+   and `ci_tools_version` both the v1.4-andium commit `1f04702`).
+2. ~~**Resumable upload session** (`PutContent`, large-file branch).~~
+   **Implemented (2026-08-05), pending live verification.** After
+   `createUploadSession`, the `uploadUrl` is split into origin + path
+   (`SplitAbsoluteUrl`) and driven by its own httplib client with **no** auth
+   header. Chunks are `NormalizeUploadChunkSize`d down to a 320-KiB multiple,
+   each PUT carries a `Content-Range` (`UploadContentRange`); 202 advances,
+   200/201 on the final chunk returns the driveItem, and a transport/5xx/429
+   failure resumes from the session's `nextExpectedRanges` (`ParseRangeStart`,
+   `QueryUploadResumeOffset`) for up to `kMaxUploadChunkRetries` attempts. The
+   four pure helpers live in `sharepoint_upload.*` and are Catch2-tested; the
+   PUT loop is in `sharepoint_client.cpp`. **Live proof still owed:** the §7.5
+   harness must upload a file **larger than one chunk** to exercise this branch
+   end to end — nothing here has run against a tenant.
+3. ~~**Block cache** for reads (`sharepoint_block_size_bytes`), single-flight per
+   block, identity-keyed.~~ **Implemented (2026-08-05), pending live verification.**
+   `SharepointBlockCache` (`sharepoint_blockcache.*`, pure — the byte fetch is
+   injected) serves reads from fixed-size blocks: a ranged GET pays a round trip
+   regardless of size, so a Parquet scan's many small adjacent reads collapse
+   onto a few cached blocks. Single-flight per block (a per-block load mutex, so
+   concurrent readers of one block share one fetch), byte-bounded LRU eviction,
+   and process-wide (the FileSystem is one object for the DatabaseInstance). Keys
+   are `identity | item-id | cTag`, so it is never a cross-tenant or stale-version
+   hit. `FileSystem::Read` routes through it, supplying a fetch backed by
+   `GraphClient::ReadRange`; `sharepoint_block_size_bytes = 0`, or an
+   out-of-bounds read, falls back to the exact-range path. The block math and the
+   cache (fetch-count, hit, and LRU-eviction behaviour) are Catch2-tested with a
+   synthetic fetcher; the concurrency is single-flight by construction but only
+   single-thread-tested here, and no cache has run against a live tenant.
+4. ~~**Recursive `**` glob** across folders (currently one folder level).~~
+   **Implemented (2026-08-05), pending live verification.** `Glob()` now walks
+   the folder tree: `*`/`?` match within a segment, `**` matches zero or more
+   whole levels, and only files are emitted (a trailing `**` yields every file
+   beneath the folder). A fully literal path keeps its one-`Stat` fast path. The
+   walk itself is a pure matcher (`GlobFiles` in `sharepoint_glob.*`, driven by
+   an injected lister and unit-tested over a synthetic tree, each folder listed
+   at most once); `FileSystem::Glob` only adapts the lister to
+   `GraphClient::ListChildren`. Live proof (a real nested library) is owed to
+   the §7.5 harness. Note: `GlobFiles` is deliberately called qualified —
+   `FileSystem` has a same-named member that would otherwise shadow it.
 5. **Live SQL suite** (`test/sql/live/`, `make test_live`) against a real
-   tenant + a Python e2e harness (fixtures, API-call-count assertions), as
-   gdrive has. This is the merge gate — no mocks.
+   tenant. **SQL layer scaffolded (2026-08-05); a Python e2e harness (fixtures,
+   API-call-count assertions) is still owed.** `test/sql/sharepoint.live.template`
+   (committed, placeholders only) exercises the full surface end to end: the
+   write/read/size round trip, idempotent `remove_file`, `COPY`→`read_parquet`,
+   the **>1-chunk resumable upload** (§7.2, forced by `SET
+   sharepoint_upload_chunk_bytes=327680` + a 900 KB blob), the **nested `**`
+   glob** (§7.4), and `move_file`. `scripts/run_live_tests.sh` substitutes the
+   run's real ids into the git-ignored `test/sql/live/` (scrubbed on exit) and
+   runs it through `build/release/test/unittest`. Verified end to end with dummy
+   credentials: it materialises, loads, parses, and **fails loudly** at the first
+   Graph call — a real tenant is all that is missing.
+   - **Gotcha worth keeping:** DuckDB's sqllogictest runner defaults to
+     `ignore_error_messages = {"HTTP", "Unable to connect"}` and *skips* any test
+     whose error contains them. Our Graph errors read `HTTP <status>`, so without
+     intervention every real failure would be a false green. The template resets
+     the list to a never-matching sentinel (`set ignore_error_messages
+     __sharepoint_never_ignore__`) so failures fail.
 6. **`authorization_code` / `device_code`** delegated providers via the
    `datazoo-oauth2` submodule.
-7. **CI**: wire `MainDistributionPipeline.yml` to the DuckDB extension-ci-tools
-   reusable workflow and add the community-extensions submission.
+7. **CI**: ~~wire `MainDistributionPipeline.yml` to the DuckDB extension-ci-tools
+   reusable workflow~~ **done**, plus **erpl.io deployment wired (2026-08-06)** —
+   `_extension_deploy.yml` + `scripts/extension-upload.sh` ported from the
+   sibling anofox-statistics, with a `duckdb-lts-deploy` job (gated to
+   `main`/`v*` tags so PRs never need OIDC) publishing to the erpl.io bucket, so
+   users can `INSTALL sharepoint FROM 'http://get.erpl.io'` (DuckDB `-unsigned`).
+   Two org-side prerequisites must be granted for the deploy to succeed: the
+   repo variable `DEPLOY_S3_BUCKET`, and adding `DataZooDE/duckdb-sharepoint` to
+   the trust policy of the `ErplGithubOicdRole` IAM role. Still open: the
+   community-extensions submission, and a signing key (`DUCKDB_EXTENSION_SIGNING_PK`)
+   if a signed build is ever wanted.
 
 ## 8. Two-actor note
 

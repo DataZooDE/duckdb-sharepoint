@@ -8,6 +8,7 @@
 #include "sharepoint_glob.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/client_context.hpp"
 
@@ -40,6 +41,14 @@ idx_t UploadChunkBytes(ClientContext &context) {
 		return v.GetValue<idx_t>();
 	}
 	return 10ULL * 1024 * 1024;
+}
+
+idx_t BlockSizeBytes(ClientContext &context) {
+	Value v;
+	if (context.TryGetCurrentSetting("sharepoint_block_size_bytes", v) && !v.IsNull()) {
+		return v.GetValue<idx_t>();
+	}
+	return 8ULL * 1024 * 1024;
 }
 
 bool PermanentDelete(ClientContext &context) {
@@ -102,6 +111,7 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 	}
 	auto handle = make_uniq<SharepointFileHandle>(*this, path, flags, std::move(auth));
 	handle->meta = std::move(meta);
+	handle->block_size_bytes = BlockSizeBytes(context);
 	return std::move(handle);
 }
 
@@ -110,14 +120,41 @@ void SharepointFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_byt
 	if (nr_bytes <= 0) {
 		return;
 	}
-	GraphClient client(h.auth);
-	string chunk;
-	client.ReadRange(h.meta.id, static_cast<int64_t>(location), nr_bytes, chunk);
-	if (static_cast<int64_t>(chunk.size()) < nr_bytes) {
-		throw IOException("sharepoint: short read of '%s' (wanted %lld, got %llu)", handle.path.c_str(),
-		                  (long long)nr_bytes, (unsigned long long)chunk.size());
+
+	// Cache disabled (block size 0) or an out-of-bounds read: go straight to a
+	// ranged GET, which also raises the exact short-read error DuckDB expects.
+	const idx_t end = location + static_cast<idx_t>(nr_bytes);
+	if (h.block_size_bytes == 0 || end > static_cast<idx_t>(h.meta.size)) {
+		GraphClient client(h.auth);
+		string chunk;
+		client.ReadRange(h.meta.id, static_cast<int64_t>(location), nr_bytes, chunk);
+		if (static_cast<int64_t>(chunk.size()) < nr_bytes) {
+			throw IOException("sharepoint: short read of '%s' (wanted %lld, got %llu)", handle.path.c_str(),
+			                  (long long)nr_bytes, (unsigned long long)chunk.size());
+		}
+		std::memcpy(buffer, chunk.data(), nr_bytes);
+		return;
 	}
-	std::memcpy(buffer, chunk.data(), nr_bytes);
+
+	// Cached path: block key carries identity + item + cTag so it is never a
+	// cross-tenant or stale-version hit. Missing blocks come from a ranged GET.
+	const string key = h.auth.identity + "|" + h.meta.id + "|" + h.meta.ctag;
+	const AuthContext auth = h.auth;
+	const string item = h.meta.id;
+	block_cache.Read(
+	    key, static_cast<uint64_t>(h.block_size_bytes), static_cast<uint64_t>(h.meta.size),
+	    static_cast<uint64_t>(location), static_cast<uint64_t>(nr_bytes), static_cast<char *>(buffer),
+	    [&auth, &item](uint64_t block_offset, uint64_t block_length) {
+		    string chunk;
+		    GraphClient(auth).ReadRange(item, static_cast<int64_t>(block_offset),
+		                                static_cast<int64_t>(block_length), chunk);
+		    if (chunk.size() < block_length) {
+			    throw IOException("sharepoint: short read of block at %llu (wanted %llu, got %llu)",
+			                      (unsigned long long)block_offset, (unsigned long long)block_length,
+			                      (unsigned long long)chunk.size());
+		    }
+		    return chunk;
+	    });
 }
 
 int64_t SharepointFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
@@ -272,23 +309,22 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 	auto &context = RequireContext(opener, "glob");
 	auto auth = GetAuthContext(context, path);
 
-	// Split into the longest literal parent prefix and a trailing segment. This
-	// scaffold globs ONE folder level (a wildcard in the final segment);
-	// recursive `**` across folders is a documented follow-up (docs/hld.md).
 	auto &segs = uri.segments;
 	if (segs.empty()) {
 		return result;
 	}
-	const string &last = segs.back();
-	string parent;
-	for (size_t i = 0; i + 1 < segs.size(); i++) {
-		if (i) {
-			parent += '/';
+
+	// A fully literal path is one Stat, not a tree walk -- and it is the only
+	// case where a matching item may be a folder (DuckDB globs a bare path
+	// before opening it).
+	bool has_meta = false;
+	for (auto &s : segs) {
+		if (HasGlobMeta(s)) {
+			has_meta = true;
+			break;
 		}
-		parent += segs[i];
 	}
-	if (!HasGlobMeta(last)) {
-		// A literal path: return it iff it exists.
+	if (!has_meta) {
 		GraphClient client(auth);
 		auto meta = client.StatByPath(uri.RootRelativePath());
 		if (meta.found) {
@@ -296,15 +332,22 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 		}
 		return result;
 	}
-	auto children = GraphClient(auth).ListChildren(parent);
-	for (auto &c : children) {
-		if (c.is_folder) {
-			continue;
+
+	// Wildcard pattern: walk folders through GraphClient::ListChildren. `**`
+	// recurses across levels; `*`/`?` stay within a segment. The matcher itself
+	// is pure (sharepoint_glob.*) and unit-tested; here we only adapt the lister.
+	GraphClient client(auth);
+	auto lister = [&client](const string &folder) -> vector<GlobEntry> {
+		vector<GlobEntry> entries;
+		for (auto &c : client.ListChildren(folder)) {
+			entries.push_back(GlobEntry {c.name, c.is_folder});
 		}
-		if (MatchGlob(last, c.name)) {
-			string full = string(SHAREPOINT_SCHEME) + (parent.empty() ? c.name : parent + "/" + c.name);
-			result.emplace_back(full);
-		}
+		return entries;
+	};
+	// Qualify: FileSystem also declares a GlobFiles member, which unqualified
+	// would shadow our pure matcher here inside a FileSystem subclass.
+	for (auto &rel : sharepoint::GlobFiles(segs, lister)) {
+		result.emplace_back(string(SHAREPOINT_SCHEME) + rel);
 	}
 	return result;
 }

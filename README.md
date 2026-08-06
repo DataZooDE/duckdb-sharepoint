@@ -38,10 +38,30 @@ So this extension needs **no path cache**, and because SharePoint forbids two
 items of the same name in one folder, it needs none of gdrive's
 duplicate-sibling-name (`R-4`) disambiguation either.
 
+## Installation
+
+### From erpl.io (recommended)
+
+Published to the erpl.io distribution bucket on every release. The binary is
+**unsigned**, so start DuckDB with the `-unsigned` flag (or set
+`allow_unsigned_extensions`):
+
+```sql
+-- duckdb -unsigned
+INSTALL 'sharepoint' FROM 'http://get.erpl.io';
+LOAD sharepoint;
+```
+
+### From the DuckDB community registry
+
+```sql
+INSTALL sharepoint FROM community;   -- once the community-extensions submission lands
+LOAD sharepoint;
+```
+
 ## Quick start
 
 ```sql
-INSTALL sharepoint FROM community;   -- once published; until then LOAD a local build
 LOAD sharepoint;
 
 -- Unattended app-only auth (the default). Register an app in Entra ID, grant it
