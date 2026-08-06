@@ -14,6 +14,11 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}
   cancel-in-progress: true
 
+# The deploy job assumes an AWS role via OIDC to publish to the erpl.io bucket.
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
   duckdb-stable-build:
     name: Build extension binaries
@@ -33,3 +38,26 @@ jobs:
       # 3.5). Pin the newer vcpkg the sibling DataZoo extensions build the LTS
       # line with -- it bootstraps clean under CMake 4.
       vcpkg_commit: ce613c41372b23b1f51333815feb3edd87ef8a8b
+
+  # Publish the built binaries to the erpl.io distribution bucket, so users can
+  # `INSTALL sharepoint FROM 'http://get.erpl.io'` (DuckDB started with
+  # -unsigned, as the binary is unsigned). Mirrors the sibling anofox-statistics.
+  # Gated to main / version tags: PRs build and test but never deploy, so the
+  # deploy never needs OIDC credentials on a pull request. deploy_latest and
+  # deploy_versioned resolve the same way, publishing both the rolling "latest"
+  # path and an immutable versioned path on every main push and release tag.
+  duckdb-lts-deploy:
+    name: Deploy extension binaries (v1.4.5 LTS)
+    needs: duckdb-stable-build
+    # Run even if a non-essential matrix arch failed; the deploy fans out per
+    # arch and only uploads the artifacts that actually exist.
+    if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    uses: ./.github/workflows/_extension_deploy.yml
+    secrets: inherit
+    with:
+      extension_name: sharepoint
+      duckdb_version: v1.4.5
+      ci_tools_version: 1f04702aae6f4e7ab45f38689fd79e765221b19e
+      exclude_archs: "windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
+      deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+      deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}

@@ -157,8 +157,17 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
      __sharepoint_never_ignore__`) so failures fail.
 6. **`authorization_code` / `device_code`** delegated providers via the
    `datazoo-oauth2` submodule.
-7. **CI**: wire `MainDistributionPipeline.yml` to the DuckDB extension-ci-tools
-   reusable workflow and add the community-extensions submission.
+7. **CI**: ~~wire `MainDistributionPipeline.yml` to the DuckDB extension-ci-tools
+   reusable workflow~~ **done**, plus **erpl.io deployment wired (2026-08-06)** —
+   `_extension_deploy.yml` + `scripts/extension-upload.sh` ported from the
+   sibling anofox-statistics, with a `duckdb-lts-deploy` job (gated to
+   `main`/`v*` tags so PRs never need OIDC) publishing to the erpl.io bucket, so
+   users can `INSTALL sharepoint FROM 'http://get.erpl.io'` (DuckDB `-unsigned`).
+   Two org-side prerequisites must be granted for the deploy to succeed: the
+   repo variable `DEPLOY_S3_BUCKET`, and adding `DataZooDE/duckdb-sharepoint` to
+   the trust policy of the `ErplGithubOicdRole` IAM role. Still open: the
+   community-extensions submission, and a signing key (`DUCKDB_EXTENSION_SIGNING_PK`)
+   if a signed build is ever wanted.
 
 ## 8. Two-actor note
 
