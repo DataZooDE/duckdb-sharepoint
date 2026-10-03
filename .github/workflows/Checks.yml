@@ -8,9 +8,14 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   hygiene:
     name: Credential hygiene
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,6 +24,7 @@ jobs:
 
   unit-tests:
     name: Catch2 pure-logic tests
+    timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
       # No submodules and nothing to install: the pure layer builds standalone
