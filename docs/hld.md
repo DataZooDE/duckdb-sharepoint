@@ -98,6 +98,10 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
    direct-cloned into place first), and `MainDistributionPipeline.yml` is
    aligned to the same pins (`duckdb_version: v1.4.5`, the reusable workflow ref
    and `ci_tools_version` both the v1.4-andium commit `1f04702`).
+   **Update (2026-10-09):** the local submodule pin moved to **duckdb `v1.5.6`**
+   / **extension-ci-tools `v1.5-variegata`** (`scripts/check_duckdb_pin.sh`
+   asserts it). CI builds and deploys BOTH lines, as duckdb-gdrive does: stable
+   v1.5.6 and the v1.4.5 LTS (the `1f04702` pins above, kept for that job).
 2. ~~**Resumable upload session** (`PutContent`, large-file branch).~~
    **Implemented (2026-08-05), pending live verification.** After
    `createUploadSession`, the `uploadUrl` is split into origin + path

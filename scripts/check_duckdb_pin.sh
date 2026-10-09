@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # The duckdb submodule must sit on the tag we ship against. A drifted submodule
-# makes every local green meaningless. We pin to the 1.4 LTS line: the
-# extension_config.cmake special-casing (_HAS_STD_BYTE=0, the sqlite3 wrapper
-# note) is written for it, and it is the current DuckDB long-term-support
-# release (see docs/hld.md §7.1).
+# makes every local green meaningless. Locally we pin to the current stable
+# line (1.5.x); CI additionally builds the 1.4 LTS line (v1.4.5, see
+# MainDistributionPipeline.yml and docs/hld.md §7.1).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # The exact tag this repo builds and ships against. Bump deliberately, together
-# with the matching extension-ci-tools branch (v1.4-andium) and a rebuild.
-PINNED_DUCKDB_TAG="v1.4.5"
+# with the matching extension-ci-tools branch (v1.5-variegata) and a rebuild.
+PINNED_DUCKDB_TAG="v1.5.6"
 
 if [ ! -f duckdb/CMakeLists.txt ]; then
 	echo "check_duckdb_pin: duckdb submodule not checked out yet — nothing to verify."
