@@ -122,10 +122,19 @@ void SharepointFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_byt
 		return;
 	}
 
-	// Cache disabled (block size 0) or an out-of-bounds read: go straight to a
-	// ranged GET, which also raises the exact short-read error DuckDB expects.
-	const idx_t end = location + static_cast<idx_t>(nr_bytes);
-	if (h.block_size_bytes == 0 || end > static_cast<idx_t>(h.meta.size)) {
+	// Out of bounds: answer locally with the short-read error DuckDB expects,
+	// instead of a ranged GET that Graph rejects with 416. Written so that
+	// location + nr_bytes cannot wrap.
+	const idx_t size = static_cast<idx_t>(h.meta.size);
+	if (location > size || static_cast<idx_t>(nr_bytes) > size - location) {
+		throw IOException("sharepoint: short read of '%s' (wanted %lld bytes at %llu, file has %llu)",
+		                  handle.path.c_str(), (long long)nr_bytes, (unsigned long long)location,
+		                  (unsigned long long)size);
+	}
+
+	// Cache disabled (block size 0), or no cTag to version the blocks by (a
+	// rewrite would then hit stale blocks): go straight to a ranged GET.
+	if (h.block_size_bytes == 0 || h.meta.ctag.empty()) {
 		GraphClient client(h.auth);
 		string chunk;
 		client.ReadRange(h.meta.id, static_cast<int64_t>(location), nr_bytes, chunk);
@@ -138,7 +147,8 @@ void SharepointFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_byt
 	}
 
 	// Cached path: block key carries identity + item + cTag so it is never a
-	// cross-tenant or stale-version hit. Missing blocks come from a ranged GET.
+	// cross-tenant or stale-version hit (the cache adds the block size).
+	// Missing blocks come from a ranged GET.
 	const string key = h.auth.identity + "|" + h.meta.id + "|" + h.meta.ctag;
 	const AuthContext auth = h.auth;
 	const string item = h.meta.id;

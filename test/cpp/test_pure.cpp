@@ -179,6 +179,35 @@ TEST_CASE("absolute upload URL splits into origin and path", "[upload]") {
 	REQUIRE_FALSE(SplitAbsoluteUrl("/just/a/path", origin, rest));
 }
 
+TEST_CASE("only https URLs are followed or uploaded to", "[upload]") {
+	// A redirect target / uploadUrl is itself a credential (tempauth), so a
+	// downgrade to plain http must never be followed.
+	REQUIRE(IsHttpsUrl("https://tenant.sharepoint.com/_layouts/15/download.aspx?tempauth=x"));
+	REQUIRE(IsHttpsUrl("HTTPS://tenant.sharepoint.com/"));
+	REQUIRE_FALSE(IsHttpsUrl("http://tenant.sharepoint.com/"));
+	REQUIRE_FALSE(IsHttpsUrl("/relative/path"));
+	REQUIRE_FALSE(IsHttpsUrl("https:/missing-slash"));
+	REQUIRE_FALSE(IsHttpsUrl(""));
+}
+
+TEST_CASE("a 200 full-body reply is sliced to the requested range", "[upload]") {
+	// A server that ignores Range returns 200 with the WHOLE file; returning it
+	// as-is would hand a Parquet footer read the file's header bytes.
+	std::string body = "0123456789";
+	REQUIRE(SliceRangeFromFullBody(body, 3, 4));
+	REQUIRE(body == "3456");
+
+	body = "0123456789";
+	REQUIRE(SliceRangeFromFullBody(body, 0, 10));
+	REQUIRE(body == "0123456789");
+
+	// Too short to contain the range: refuse rather than return short bytes.
+	body = "0123";
+	REQUIRE_FALSE(SliceRangeFromFullBody(body, 2, 5));
+	body = "0123";
+	REQUIRE_FALSE(SliceRangeFromFullBody(body, 10, 1));
+}
+
 TEST_CASE("nextExpectedRanges start offset parses", "[upload]") {
 	std::uint64_t s = 999;
 	REQUIRE(ParseRangeStart("512-1023", s));
@@ -239,6 +268,53 @@ TEST_CASE("block cache fetches each block once and serves hits", "[blockcache]")
 	REQUIRE(fetches == 3);
 	REQUIRE(read(0, 25) == file); // fully cached now
 	REQUIRE(fetches == 3);
+}
+
+TEST_CASE("block cache never serves a block cut for another block size", "[blockcache]") {
+	// Two sessions with different sharepoint_block_size_bytes read the same
+	// file. Block 0 at size 4 must not be served for block 0 at size 10 -- the
+	// copy would run past the end of the 4-byte block.
+	const std::string file = "0123456789abcdefghij"; // 20 bytes
+	int fetches = 0;
+	auto fetch = [&](std::uint64_t off, std::uint64_t len) {
+		fetches++;
+		return file.substr(off, len);
+	};
+	SharepointBlockCache cache(1024);
+	std::string small(4, '\0'), big(10, '\0');
+	cache.Read("id|ctag", 4, file.size(), 0, 4, &small[0], fetch);
+	cache.Read("id|ctag", 10, file.size(), 0, 10, &big[0], fetch);
+	REQUIRE(small == "0123");
+	REQUIRE(big == "0123456789");
+	REQUIRE(fetches == 2);
+}
+
+TEST_CASE("a failed block fetch is not cached and does not wedge eviction", "[blockcache]") {
+	const std::string file(300, 'q'); // 3 blocks of 100
+	bool fail = true;
+	int fetches = 0;
+	auto fetch = [&](std::uint64_t off, std::uint64_t len) -> std::string {
+		fetches++;
+		if (fail) {
+			throw std::runtime_error("HTTP 503");
+		}
+		return file.substr(off, len);
+	};
+	SharepointBlockCache cache(150); // room for one block
+	std::string out(100, '\0');
+	REQUIRE_THROWS(cache.Read("f", 100, 300, 200, 100, &out[0], fetch));
+	REQUIRE(cache.ResidentBytes() == 0);
+
+	// The failure left nothing behind: later loads still evict down to budget
+	// (an unloaded block at the LRU tail must not block eviction forever)...
+	fail = false;
+	cache.Read("f", 100, 300, 0, 100, &out[0], fetch);
+	cache.Read("f", 100, 300, 100, 100, &out[0], fetch);
+	REQUIRE(cache.ResidentBytes() <= 150);
+	// ...and a retry of the failed block fetches it afresh.
+	cache.Read("f", 100, 300, 200, 100, &out[0], fetch);
+	REQUIRE(fetches == 4);
+	REQUIRE(cache.ResidentBytes() <= 150);
 }
 
 TEST_CASE("block cache evicts LRU when over budget", "[blockcache]") {

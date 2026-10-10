@@ -61,6 +61,8 @@ public:
 	//! `out` (which must have room for `len` bytes). Blocks not resident are
 	//! fetched exactly once, even if several threads request the same block at
 	//! once (single-flight per block). `fetch` only ever sees whole-block ranges.
+	//! A fetch that throws (or returns the wrong length) caches nothing and
+	//! propagates. The block size is folded into the key internally.
 	void Read(const std::string &key_prefix, uint64_t block_size, uint64_t file_size, uint64_t offset,
 	          uint64_t len, char *out, const Fetch &fetch);
 
@@ -77,7 +79,9 @@ private:
 	};
 
 	std::shared_ptr<Block> AcquireBlock(const std::string &key);
-	void AccountAndEvict(const std::string &just_loaded_key, uint64_t added_bytes);
+	void AccountAndEvict(const std::string &just_loaded_key, const std::shared_ptr<Block> &blk);
+	//! Drop `key` if it still maps to `blk` (a fetch for it failed).
+	void Forget(const std::string &key, const std::shared_ptr<Block> &blk);
 
 	std::mutex mtx; // guards blocks, lru, lru_pos, resident_bytes
 	std::unordered_map<std::string, std::shared_ptr<Block>> blocks;

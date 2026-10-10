@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace duckdb {
 namespace sharepoint {
@@ -44,29 +45,43 @@ std::shared_ptr<SharepointBlockCache::Block> SharepointBlockCache::AcquireBlock(
 	return blk;
 }
 
-void SharepointBlockCache::AccountAndEvict(const std::string &just_loaded_key, uint64_t added_bytes) {
+void SharepointBlockCache::AccountAndEvict(const std::string &just_loaded_key, const std::shared_ptr<Block> &blk) {
 	std::lock_guard<std::mutex> g(mtx);
-	resident_bytes += added_bytes;
-	// Evict least-recently-used LOADED blocks until back within budget. An
-	// in-flight (not-yet-loaded) block at the tail stops eviction rather than
-	// being dropped mid-load -- its bytes are not yet counted, so leaving it is
-	// safe and avoids a use-after-evict accounting leak.
-	while (resident_bytes > max_bytes && !lru.empty()) {
-		const std::string victim = lru.back();
+	// A block a failed fetch already Forget()-ed is no longer in the map: it
+	// serves only the read that loaded it and must not be counted.
+	auto cur = blocks.find(just_loaded_key);
+	if (cur == blocks.end() || cur->second != blk) {
+		return;
+	}
+	resident_bytes += blk->data.size();
+	// Evict least-recently-used LOADED blocks until back within budget. A block
+	// still loading is skipped, not waited on: its bytes are not yet counted,
+	// so leaving it resident is safe, and stopping at it would let one slow or
+	// failing fetch at the LRU tail wedge eviction for the whole process.
+	auto it = lru.end();
+	while (resident_bytes > max_bytes && it != lru.begin()) {
+		--it;
+		const std::string victim = *it;
 		auto vit = blocks.find(victim);
-		if (vit == blocks.end()) {
-			lru.pop_back();
-			lru_pos.erase(victim);
+		if (vit == blocks.end() || !vit->second->loaded || victim == just_loaded_key) {
 			continue;
-		}
-		if (!vit->second->loaded || victim == just_loaded_key) {
-			break;
 		}
 		resident_bytes -= vit->second->data.size();
 		blocks.erase(vit);
 		lru_pos.erase(victim);
-		lru.pop_back();
+		it = lru.erase(it);
 	}
+}
+
+void SharepointBlockCache::Forget(const std::string &key, const std::shared_ptr<Block> &blk) {
+	std::lock_guard<std::mutex> g(mtx);
+	auto it = blocks.find(key);
+	if (it == blocks.end() || it->second != blk) {
+		return;
+	}
+	blocks.erase(it);
+	lru.erase(lru_pos[key]);
+	lru_pos.erase(key);
 }
 
 void SharepointBlockCache::Read(const std::string &key_prefix, uint64_t block_size, uint64_t file_size,
@@ -75,16 +90,30 @@ void SharepointBlockCache::Read(const std::string &key_prefix, uint64_t block_si
 		return;
 	}
 	for (const auto &bc : PlanBlockCopies(offset, len, block_size, file_size)) {
-		const std::string key = key_prefix + "@" + std::to_string(bc.block_index);
+		// The block size is part of the key: block N means a different byte span
+		// at a different size, and two sessions may use different sizes.
+		const std::string key = key_prefix + "#" + std::to_string(block_size) + "@" + std::to_string(bc.block_index);
 		auto blk = AcquireBlock(key);
 		{
 			// Single-flight: only the first arrival fetches; the rest wait here
 			// and then find loaded == true.
 			std::lock_guard<std::mutex> lg(blk->load_mtx);
 			if (!blk->loaded) {
-				blk->data = fetch(bc.block_offset, bc.block_length);
+				try {
+					blk->data = fetch(bc.block_offset, bc.block_length);
+				} catch (...) {
+					// Leave nothing behind: a waiter on this block retries the fetch
+					// itself, and the next reader starts clean.
+					Forget(key, blk);
+					throw;
+				}
+				if (blk->data.size() != bc.block_length) {
+					Forget(key, blk);
+					throw std::runtime_error("sharepoint: block fetch returned " + std::to_string(blk->data.size()) +
+					                         " bytes, expected " + std::to_string(bc.block_length));
+				}
 				blk->loaded = true;
-				AccountAndEvict(key, blk->data.size());
+				AccountAndEvict(key, blk);
 			}
 		}
 		std::copy(blk->data.begin() + static_cast<std::ptrdiff_t>(bc.src_in_block),

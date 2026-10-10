@@ -32,6 +32,32 @@ bool SplitAbsoluteUrl(const std::string &url, std::string &origin, std::string &
 	return true;
 }
 
+bool IsHttpsUrl(const std::string &url) {
+	static const char kScheme[] = "https://";
+	const std::size_t n = sizeof(kScheme) - 1;
+	if (url.size() <= n) {
+		return false;
+	}
+	for (std::size_t i = 0; i < n; i++) {
+		char c = url[i];
+		if (c >= 'A' && c <= 'Z') {
+			c = static_cast<char>(c - 'A' + 'a');
+		}
+		if (c != kScheme[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool SliceRangeFromFullBody(std::string &body, std::uint64_t offset, std::uint64_t length) {
+	if (offset > body.size() || length > body.size() - offset) {
+		return false;
+	}
+	body = body.substr(offset, length);
+	return true;
+}
+
 bool ParseRangeStart(const std::string &range, std::uint64_t &start) {
 	std::size_t i = 0;
 	while (i < range.size() && range[i] >= '0' && range[i] <= '9') {

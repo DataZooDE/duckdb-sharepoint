@@ -44,7 +44,11 @@ string EncodePath(const string &path) {
 
 duckdb_httplib_openssl::Client MakeClient(const string &base_url) {
 	duckdb_httplib_openssl::Client cli(base_url.c_str());
-	cli.set_follow_location(true);
+	// Redirects are handled explicitly where Graph issues them (the /content
+	// download): the target is a pre-authenticated URL that must be https and
+	// must not receive the bearer token. Blind following lost the request on
+	// the first live run (401 from the download host).
+	cli.set_follow_location(false);
 	cli.set_connection_timeout(30);
 	cli.set_read_timeout(300);
 	return cli;
@@ -175,6 +179,10 @@ DriveItemMeta GraphClient::StatById(const string &item_id) {
 }
 
 void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t length, string &out) {
+	out.clear();
+	if (length <= 0) {
+		return; // "bytes=o-(o-1)" is not a valid range; nothing to fetch.
+	}
 	auto cli = MakeClient(auth.graph_endpoint);
 	string range = "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + length - 1);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}, {"Range", range}};
@@ -183,11 +191,40 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 	if (!res) {
 		throw IOException("sharepoint: ranged read of id '%s' failed at the transport layer", item_id.c_str());
 	}
-	// 206 Partial Content on a satisfied Range; 200 if the server ignored it.
-	if (res->status != 200 && res->status != 206) {
-		ThrowGraph("read id '" + item_id + "'", res->status, res->body);
+	// Graph answers /content with a 302 to a short-lived pre-authenticated
+	// download URL on the tenant's SharePoint host. Follow it ourselves: over
+	// https only, carrying the Range but NOT the bearer token (the URL's
+	// tempauth query is the credential).
+	if (res->status >= 300 && res->status < 400) {
+		const string location = res->get_header_value("Location");
+		string origin, download_path;
+		if (!IsHttpsUrl(location) || !SplitAbsoluteUrl(location, origin, download_path)) {
+			throw IOException("sharepoint: read id '%s' redirected to a non-https location; refusing to follow",
+			                  item_id.c_str());
+		}
+		auto dl = MakeClient(origin);
+		res = dl.Get(download_path.c_str(), duckdb_httplib_openssl::Headers {{"Range", range}});
+		if (!res) {
+			throw IOException("sharepoint: ranged read of id '%s' failed at the transport layer (download host)",
+			                  item_id.c_str());
+		}
 	}
-	out = std::move(res->body);
+	if (res->status == 206) {
+		out = std::move(res->body);
+		return;
+	}
+	// 200: the server ignored Range and sent the whole file. Slice it, or the
+	// caller would get bytes from offset 0 (a Parquet footer read would see the
+	// file header).
+	if (res->status == 200) {
+		out = std::move(res->body);
+		if (!SliceRangeFromFullBody(out, static_cast<uint64_t>(offset), static_cast<uint64_t>(length))) {
+			throw IOException("sharepoint: short read of id '%s' (wanted %lld bytes at %lld, file has %llu)",
+			                  item_id.c_str(), (long long)length, (long long)offset, (unsigned long long)out.size());
+		}
+		return;
+	}
+	ThrowGraph("read id '" + item_id + "'", res->status, res->body);
 }
 
 DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const string &bytes, idx_t chunk_bytes) {
@@ -246,8 +283,8 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 	// DIFFERENT host than graph_endpoint. It needs its own client, and carries
 	// NO Authorization header -- the URL itself is the credential.
 	string origin, put_path;
-	if (!SplitAbsoluteUrl(upload_url, origin, put_path)) {
-		throw IOException("sharepoint: createUploadSession returned an unparseable uploadUrl");
+	if (!IsHttpsUrl(upload_url) || !SplitAbsoluteUrl(upload_url, origin, put_path)) {
+		throw IOException("sharepoint: createUploadSession returned a non-https or unparseable uploadUrl");
 	}
 	auto up = MakeClient(origin);
 

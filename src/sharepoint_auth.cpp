@@ -54,7 +54,8 @@ string SecretField(const KeyValueSecret &secret, const char *key) {
 // scheme+host; the path is passed per-request.
 duckdb_httplib_openssl::Client MakeClient(const string &base_url) {
 	duckdb_httplib_openssl::Client cli(base_url.c_str());
-	cli.set_follow_location(true);
+	// The token endpoint never redirects; never re-send client_secret elsewhere.
+	cli.set_follow_location(false);
 	cli.set_connection_timeout(30);
 	cli.set_read_timeout(120);
 	return cli;
@@ -89,7 +90,14 @@ picojson::object PostToken(const string &login_endpoint, const string &tenant,
 }
 
 // The `sharepoint` secret in scope for `path`, or throw a teaching error.
-const KeyValueSecret &LookupSecret(ClientContext &context, const string &path, string &out_secret_name) {
+//
+// Returns the SecretMatch BY VALUE and the caller must keep it alive while it
+// reads the secret: the match owns a deep clone of the SecretEntry (a
+// unique_ptr), so a reference into it dangles the moment the match is
+// destroyed. Returning `const KeyValueSecret &` here was a use-after-free that
+// surfaced on the first live run as "the secret gives neither DRIVE_ID nor
+// SITE_ID" for a secret that plainly had one.
+SecretMatch LookupSecret(ClientContext &context, const string &path) {
 	auto &secret_manager = SecretManager::Get(context);
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 	auto match = secret_manager.LookupSecret(transaction, path, kSecretTypeName);
@@ -99,9 +107,7 @@ const KeyValueSecret &LookupSecret(ClientContext &context, const string &path, s
 		    "  CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,\n"
 		    "                    TENANT_ID '...', CLIENT_ID '...', CLIENT_SECRET '...', DRIVE_ID 'b!...');");
 	}
-	const auto &base = match.GetSecret();
-	out_secret_name = base.GetName();
-	return dynamic_cast<const KeyValueSecret &>(base);
+	return match;
 }
 
 // Resolve the drive the paths hang off. Prefer an explicit DRIVE_ID; else
@@ -154,8 +160,9 @@ void InvalidateAuthCache(const string &secret_name) {
 }
 
 AuthContext GetAuthContext(ClientContext &context, const string &path) {
-	string secret_name;
-	const auto &secret = LookupSecret(context, path, secret_name);
+	const auto match = LookupSecret(context, path);
+	const auto &secret = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
+	const string secret_name = secret.GetName();
 
 	string login_endpoint = "https://login.microsoftonline.com";
 	string graph_endpoint = "https://graph.microsoft.com";
