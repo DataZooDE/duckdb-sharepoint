@@ -1,6 +1,7 @@
 #pragma once
 
 #include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/shared_ptr.hpp"
 #include "duckdb/common/string.hpp"
 
 namespace duckdb {
@@ -10,13 +11,30 @@ class FileOpener;
 namespace sharepoint {
 
 // ---------------------------------------------------------------------------
+// Where a bearer token comes from. A file handle can outlive the token it was
+// opened with (a long scan, an ATTACHed database kept open for hours), so
+// handles hold a SOURCE, not a token: every request asks it for a token that
+// is valid now, and it re-mints shortly before expiry.
+// ---------------------------------------------------------------------------
+class TokenSource {
+public:
+	virtual ~TokenSource() = default;
+	//! A token valid for at least the next minute (served from the shared
+	//! token cache; minted when absent or about to expire).
+	virtual string Token() = 0;
+	//! Discard the cached token and mint a new one -- after a 401, when the
+	//! token was revoked or expired early. Returns the new token.
+	virtual string Refresh() = 0;
+};
+
+// ---------------------------------------------------------------------------
 // Everything a Graph call needs to identify itself and locate its data,
-// resolved from the active `sharepoint` secret. Cheap value type: built per
-// query, holds the bearer token to send and the drive it addresses.
+// resolved from the active `sharepoint` secret. Cheap to copy: built per
+// open, holds the token source and the drive it addresses.
 // ---------------------------------------------------------------------------
 struct AuthContext {
-	//! Bearer token to send as `Authorization: Bearer <access_token>`.
-	string access_token;
+	//! Supplies `Authorization: Bearer <token>` for each request.
+	shared_ptr<TokenSource> tokens;
 	//! The Graph drive id (`b!...`) every path hangs off. Resolved from the
 	//! secret's DRIVE_ID, or derived from SITE_ID (the site's default document
 	//! library) when only a site was given.

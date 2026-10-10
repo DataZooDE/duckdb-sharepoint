@@ -122,6 +122,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "whole path segments. Empty (the default) disables it.",
 	    LogicalType::VARCHAR, Value(""));
 
+	// Testing aid: cap how long a minted token is trusted, so token expiry
+	// mid-handle can be exercised in seconds instead of an hour. 0 = Entra
+	// ID's own lifetime. Not for production use.
+	loader.GetDatabaseInstance().config.AddExtensionOption(
+	    "sharepoint_debug_token_max_age_seconds",
+	    "TESTING ONLY: treat access tokens as expiring after at most this many seconds (0 = their real "
+	    "lifetime).",
+	    LogicalType::BIGINT, Value::BIGINT(0));
+
 	sharepoint::RegisterSharepointSecrets(loader);
 
 	// write_blob()/remove_file()/move_file()/file_size(): the FileSystem
