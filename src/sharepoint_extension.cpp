@@ -1,15 +1,26 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "sharepoint_extension.hpp"
+#include "sharepoint_banner.hpp"
 #include "sharepoint_filesystem.hpp"
 #include "sharepoint_stats.hpp"
 #include "sharepoint_version.hpp"
 #include "sharepoint_vfs_functions.hpp"
 
+#ifndef EMSCRIPTEN
+#include "telemetry.hpp"
+#endif
+
 #include "duckdb/main/config.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/function/scalar_function.hpp"
+
+// The version comes from SharepointVersionCString(), not a literal: a copied
+// literal is what left the sibling gdrive's banner announcing "0.1.0".
+const datazoo::BannerInfo SHAREPOINT_BANNER {"sharepoint", duckdb::sharepoint::SharepointVersionCString(),
+                                             "https://github.com/DataZooDE/duckdb-sharepoint"};
 
 namespace duckdb {
 
@@ -25,8 +36,31 @@ static void SharepointVersionScalar(DataChunk &args, ExpressionState &state, Vec
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	ScalarFunction version_fn("sharepoint_version", {}, LogicalType::VARCHAR, SharepointVersionScalar);
-	loader.RegisterFunction(version_fn);
+#ifndef EMSCRIPTEN
+	// Anonymous usage telemetry, as in the sibling DataZoo extensions. Opt out
+	// with `SET sharepoint_telemetry_enabled = false` or the environment
+	// variable DATAZOO_DISABLE_TELEMETRY.
+	PostHogTelemetry::Instance().SetAPIKey("phc_t3wwRLtpyEmLHYaZCSszG0MqVr74J6wnCrj9D41zk2t");
+	PostHogTelemetry::Instance().SetProduct("sharepoint", sharepoint::SharepointVersion(), "oss");
+	PostHogTelemetry::Instance().AssociateGroup("deployment", PostHogTelemetry::GetDistinctId());
+	PostHogTelemetry::Instance().CaptureExtensionLoad("sharepoint", sharepoint::SharepointVersion());
+	loader.GetDatabaseInstance().config.AddExtensionOption(
+	    "sharepoint_telemetry_enabled", "Enable or disable anonymous usage telemetry for the sharepoint extension.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true), [](ClientContext &, SetScope, Value &parameter) {
+		    PostHogTelemetry::Instance().SetEnabled(BooleanValue::Get(parameter));
+	    });
+#endif
+
+	{
+		CreateScalarFunctionInfo info(
+		    ScalarFunction("sharepoint_version", {}, LogicalType::VARCHAR, SharepointVersionScalar));
+		FunctionDescription d;
+		d.description = "Returns the version of the loaded sharepoint extension.";
+		d.examples = {"SELECT sharepoint_version()"};
+		d.categories = {"sharepoint", "meta"};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// The extension point: everything layered on DuckDB's virtual filesystem
 	// -- read_parquet, read_csv, COPY, glob, ATTACH of a DuckLake DATA_PATH --
@@ -98,6 +132,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// process, since both register the same four names.
 	sharepoint::RegisterVfsFunctions(loader);
 	sharepoint::RegisterSharepointStats(loader);
+
+	datazoo::RegisterBannerOption(loader);
+	// Last, so a load that fails earlier never advertises itself. Silent unless
+	// stderr is a terminal and the once-a-day stamp has expired.
+	datazoo::ShowBanner(SHAREPOINT_BANNER);
 }
 
 void SharepointExtension::Load(ExtensionLoader &loader) {
