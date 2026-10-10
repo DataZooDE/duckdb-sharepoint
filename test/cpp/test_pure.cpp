@@ -397,6 +397,58 @@ TEST_CASE("graph errors classify by status and code", "[errors]") {
 	REQUIRE_FALSE(IsRetryable(GraphErrorKind::UNAUTHENTICATED));
 }
 
+TEST_CASE("a plain 400 is the caller's bad request, not 'error'", "[errors]") {
+	REQUIRE(ClassifyGraphError(400, "invalidRequest") == GraphErrorKind::BAD_REQUEST);
+	REQUIRE(ClassifyGraphError(400, "") == GraphErrorKind::BAD_REQUEST);
+	REQUIRE_FALSE(IsRetryable(GraphErrorKind::BAD_REQUEST));
+	REQUIRE(ClassifyGraphError(418, "") == GraphErrorKind::OTHER);
+}
+
+TEST_CASE("errors map to DuckDB exception types", "[errors]") {
+	REQUIRE(ExceptionTypeFor(GraphErrorKind::FORBIDDEN) == GraphExceptionType::PERMISSION);
+	REQUIRE(ExceptionTypeFor(GraphErrorKind::BAD_REQUEST) == GraphExceptionType::INVALID_INPUT);
+	REQUIRE(ExceptionTypeFor(GraphErrorKind::THROTTLED) == GraphExceptionType::IO);
+	REQUIRE(ExceptionTypeFor(GraphErrorKind::SERVER) == GraphExceptionType::IO);
+	REQUIRE(ExceptionTypeFor(GraphErrorKind::UNAUTHENTICATED) == GraphExceptionType::IO);
+}
+
+TEST_CASE("Retry-After is honoured in its seconds form only", "[errors]") {
+	REQUIRE(ParseRetryAfterSeconds("") == 0);
+	REQUIRE(ParseRetryAfterSeconds("7") == 7);
+	REQUIRE(ParseRetryAfterSeconds(" 12 ") == 12);
+	REQUIRE(ParseRetryAfterSeconds("Wed, 21 Oct 2026 07:28:00 GMT") == 0); // HTTP-date: not trusted
+	REQUIRE(ParseRetryAfterSeconds("-3") == 0);
+	REQUIRE(ParseRetryAfterSeconds("99999999999999999999") == kMaxRetryAfterSeconds); // clamped, no overflow
+	REQUIRE(ParseRetryAfterSeconds("100000") == kMaxRetryAfterSeconds);
+}
+
+TEST_CASE("backoff doubles from 500 ms, caps at 20 s, honours Retry-After", "[errors]") {
+	// jitter 1.0 = the nominal schedule.
+	REQUIRE(BackoffDelayMs(1, 0, 1.0) == 500);
+	REQUIRE(BackoffDelayMs(2, 0, 1.0) == 1000);
+	REQUIRE(BackoffDelayMs(3, 0, 1.0) == 2000);
+	REQUIRE(BackoffDelayMs(10, 0, 1.0) == 20000);
+	REQUIRE(BackoffDelayMs(64, 0, 1.0) == 20000); // no shift overflow
+	// +/-25% jitter, clamped to that band whatever the caller passes.
+	REQUIRE(BackoffDelayMs(1, 0, 0.75) == 375);
+	REQUIRE(BackoffDelayMs(1, 0, 1.25) == 625);
+	REQUIRE(BackoffDelayMs(1, 0, 9.0) == 625);
+	REQUIRE(BackoffDelayMs(1, 0, 0.0) == 375);
+	// The server's Retry-After is a floor, never shortened by jitter.
+	REQUIRE(BackoffDelayMs(1, 3, 0.75) == 3000);
+	REQUIRE(BackoffDelayMs(5, 1, 1.0) == 8000);
+}
+
+TEST_CASE("graph error messages carry the code and stay one line", "[errors]") {
+	const auto msg = FormatGraphError("move 'a' -> 'b'", 409, "nameAlreadyExists", "Name already exists");
+	REQUIRE(msg == "sharepoint: move 'a' -> 'b' failed: HTTP 409 (conflict, nameAlreadyExists): Name already exists");
+	REQUIRE(FormatGraphError("stat 'x'", 503, "", "") == "sharepoint: stat 'x' failed: HTTP 503 (throttled)");
+	// Graph's message is truncated and newline-free.
+	const auto long_msg = FormatGraphError("op", 400, "invalidRequest", std::string(1000, 'm') + "\nsecond line");
+	REQUIRE(long_msg.size() < 400);
+	REQUIRE(long_msg.find('\n') == std::string::npos);
+}
+
 // ---------------------------------------------------------------------------
 // Verbatim HTTP/1.1 for Graph's pre-authenticated URLs. httplib 0.27 (DuckDB
 // 1.5) re-sorts a request's query parameters, and SharePoint's signed

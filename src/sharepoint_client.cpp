@@ -18,7 +18,10 @@
 #include <picojson.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <random>
+#include <thread>
 
 namespace duckdb {
 namespace sharepoint {
@@ -56,26 +59,78 @@ duckdb_httplib_openssl::Client MakeClient(const string &base_url) {
 	return cli;
 }
 
-// Extract Graph's error.code from a JSON error body (empty if none).
-string ErrorCode(const string &body) {
+// Graph's error.code and error.message from a JSON error body (empty if
+// absent or not JSON).
+void ParseGraphError(const string &body, string &code, string &message) {
+	code.clear();
+	message.clear();
 	picojson::value v;
-	if (picojson::parse(v, body).empty() && v.is<picojson::object>()) {
-		auto &o = v.get<picojson::object>();
-		auto it = o.find("error");
-		if (it != o.end() && it->second.is<picojson::object>()) {
-			auto &e = it->second.get<picojson::object>();
-			auto c = e.find("code");
-			if (c != e.end() && c->second.is<string>()) {
-				return c->second.get<string>();
-			}
-		}
+	if (!picojson::parse(v, body).empty() || !v.is<picojson::object>()) {
+		return;
 	}
-	return string();
+	auto &o = v.get<picojson::object>();
+	auto it = o.find("error");
+	if (it == o.end() || !it->second.is<picojson::object>()) {
+		return;
+	}
+	auto &e = it->second.get<picojson::object>();
+	auto c = e.find("code");
+	if (c != e.end() && c->second.is<string>()) {
+		code = c->second.get<string>();
+	}
+	auto m = e.find("message");
+	if (m != e.end() && m->second.is<string>()) {
+		message = m->second.get<string>();
+	}
 }
 
+string ErrorCode(const string &body) {
+	string code, message;
+	ParseGraphError(body, code, message);
+	return code;
+}
+
+// Throw the DuckDB exception type the error's kind maps to, with Graph's code
+// and message: "403 accessDenied" reads very differently from "HTTP 403".
 [[noreturn]] void ThrowGraph(const string &op, int status, const string &body) {
-	auto kind = ClassifyGraphError(status, ErrorCode(body));
-	throw IOException("sharepoint: %s failed: HTTP %d (%s)", op.c_str(), status, GraphErrorKindName(kind));
+	string code, message;
+	ParseGraphError(body, code, message);
+	const string text = FormatGraphError(op, status, code, message);
+	switch (ExceptionTypeFor(ClassifyGraphError(status, code))) {
+	case GraphExceptionType::PERMISSION:
+		throw PermissionException(text);
+	case GraphExceptionType::INVALID_INPUT:
+		throw InvalidInputException(text);
+	default:
+		throw IOException(text);
+	}
+}
+
+// Sleep before retry number `failed_attempt` (see BackoffDelayMs). The jitter
+// is per thread so concurrent scan threads spread out.
+void SleepBeforeRetry(int failed_attempt, int retry_after_seconds) {
+	static thread_local std::mt19937 rng(std::random_device {}());
+	std::uniform_real_distribution<double> jitter(0.75, 1.25);
+	std::this_thread::sleep_for(
+	    std::chrono::milliseconds(BackoffDelayMs(failed_attempt, retry_after_seconds, jitter(rng))));
+}
+
+// Send a Graph request, retrying transport failures, 5xx and throttling
+// (429/503, Graph's throttling codes) with backoff -- Graph throttles
+// SharePoint aggressively, and one 429 must not fail a whole scan. Every
+// request routed here is safe to repeat: GET/DELETE/PUT-replace are
+// idempotent, folder creation tolerates the 409 of a lost first response,
+// and a move or upload-session POST that is repeated lands in the same state.
+template <class Send>
+duckdb_httplib_openssl::Result SendWithRetry(Send send) {
+	for (int attempt = 1;; attempt++) {
+		auto res = send();
+		const bool retryable = !res || IsRetryable(ClassifyGraphError(res->status, ErrorCode(res->body)));
+		if (!retryable || attempt >= kMaxGraphAttempts) {
+			return res;
+		}
+		SleepBeforeRetry(attempt, res ? ParseRetryAfterSeconds(res->get_header_value("Retry-After")) : 0);
+	}
 }
 
 DriveItemMeta ParseMeta(const picojson::object &o) {
@@ -156,7 +211,7 @@ DriveItemMeta GraphClient::StatByPath(const string &root_relative_path) {
 	                  ? "/v1.0/drives/" + auth.drive_id + "/root?$select=id,name,size,file,folder,cTag,eTag,lastModifiedDateTime"
 	                  : "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) +
 	                        "?$select=id,name,size,file,folder,cTag,eTag,lastModifiedDateTime";
-	auto res = cli.Get(path.c_str(), h);
+	auto res = SendWithRetry([&] { return cli.Get(path.c_str(), h); });
 	if (!res) {
 		throw IOException("sharepoint: stat '%s' failed at the transport layer", root_relative_path.c_str());
 	}
@@ -178,7 +233,7 @@ DriveItemMeta GraphClient::StatById(const string &item_id) {
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id +
 	              "?$select=id,name,size,file,folder,cTag,eTag,lastModifiedDateTime";
-	auto res = cli.Get(path.c_str(), h);
+	auto res = SendWithRetry([&] { return cli.Get(path.c_str(), h); });
 	if (!res) {
 		throw IOException("sharepoint: stat id '%s' failed at the transport layer", item_id.c_str());
 	}
@@ -204,7 +259,7 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 	string range = "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + length - 1);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}, {"Range", range}};
 	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id + "/content";
-	auto res = cli.Get(path.c_str(), h);
+	auto res = SendWithRetry([&] { return cli.Get(path.c_str(), h); });
 	if (!res) {
 		throw IOException("sharepoint: ranged read of id '%s' failed at the transport layer", item_id.c_str());
 	}
@@ -225,8 +280,30 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 			throw IOException("sharepoint: read id '%s' redirected to a non-https location; refusing to follow",
 			                  item_id.c_str());
 		}
-		auto dl = PreauthenticatedRequest("GET", location, {{"Range", range}}, "", kPreauthTimeoutSeconds,
-		                                  static_cast<std::size_t>(offset + length));
+		// The download host throttles and fails like Graph does; the signed URL
+		// stays valid for minutes, so the same request can simply be repeated.
+		RawHttpResponse dl;
+		for (int attempt = 1;; attempt++) {
+			string transport_error;
+			try {
+				dl = PreauthenticatedRequest("GET", location, {{"Range", range}}, "", kPreauthTimeoutSeconds,
+				                             static_cast<std::size_t>(offset + length));
+			} catch (IOException &e) {
+				transport_error = e.what();
+			}
+			const bool retryable =
+			    !transport_error.empty() || IsRetryable(ClassifyGraphError(dl.status, ErrorCode(dl.body)));
+			if (!retryable) {
+				break;
+			}
+			if (attempt >= kMaxGraphAttempts) {
+				if (!transport_error.empty()) {
+					throw IOException(transport_error);
+				}
+				break;
+			}
+			SleepBeforeRetry(attempt, transport_error.empty() ? ParseRetryAfterSeconds(dl.Header("Retry-After")) : 0);
+		}
 		status = dl.status;
 		content_range = dl.Header("Content-Range");
 		body = std::move(dl.body);
@@ -256,7 +333,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 	// MiB, so switch at the configured chunk size.
 	if (bytes.size() <= chunk_bytes) {
 		string path = "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) + ":/content";
-		auto res = cli.Put(path.c_str(), h, bytes, "application/octet-stream");
+		auto res = SendWithRetry([&] { return cli.Put(path.c_str(), h, bytes, "application/octet-stream"); });
 		if (!res) {
 			throw IOException("sharepoint: upload of '%s' failed at the transport layer",
 			                  root_relative_path.c_str());
@@ -280,7 +357,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 	string session_path =
 	    "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) + ":/createUploadSession";
 	string session_body = "{\"item\":{\"@microsoft.graph.conflictBehavior\":\"replace\"}}";
-	auto sres = cli.Post(session_path.c_str(), h, session_body, "application/json");
+	auto sres = SendWithRetry([&] { return cli.Post(session_path.c_str(), h, session_body, "application/json"); });
 	if (!sres || sres->status < 200 || sres->status >= 300) {
 		ThrowGraph("createUploadSession '" + root_relative_path + "'", sres ? sres->status : 0,
 		           sres ? sres->body : string());
@@ -349,6 +426,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 		// already stored is safe, so a resume that returns the same offset is fine.
 		bool retryable = !transport_ok || IsRetryable(ClassifyGraphError(res.status, ErrorCode(res.body)));
 		if (retryable && ++failures <= kMaxUploadChunkRetries) {
+			SleepBeforeRetry(failures, transport_ok ? ParseRetryAfterSeconds(res.Header("Retry-After")) : 0);
 			idx_t resume_at = offset;
 			if (QueryUploadResumeOffset(upload_url, resume_at) && resume_at <= total) {
 				offset = resume_at;
@@ -375,8 +453,10 @@ bool GraphClient::DeleteItem(const string &item_id, bool permanent) {
 	// A plain DELETE moves the item to the site's recycle bin. Permanent deletion
 	// is its own Graph action, POST .../permanentDelete (a `Prefer` header on
 	// DELETE is not part of the contract and was silently ignored).
-	auto res = permanent ? cli.Post((item_path + "/permanentDelete").c_str(), h, "", "application/json")
-	                     : cli.Delete(item_path.c_str(), h);
+	auto res = SendWithRetry([&] {
+		return permanent ? cli.Post((item_path + "/permanentDelete").c_str(), h, "", "application/json")
+		                 : cli.Delete(item_path.c_str(), h);
+	});
 	if (!res) {
 		throw IOException("sharepoint: delete of id '%s' failed at the transport layer", item_id.c_str());
 	}
@@ -427,7 +507,7 @@ void GraphClient::MoveByPath(const string &source_root_relative, const string &t
 	// tmp_ file and moves it onto the final name, so without this every re-run
 	// of a COPY fails with 409 nameAlreadyExists.
 	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + src.id + "?@microsoft.graph.conflictBehavior=replace";
-	auto res = cli.Patch(path.c_str(), h, picojson::value(body).serialize(), "application/json");
+	auto res = SendWithRetry([&] { return cli.Patch(path.c_str(), h, picojson::value(body).serialize(), "application/json"); });
 	if (!res || res->status < 200 || res->status >= 300) {
 		ThrowGraph("move '" + source_root_relative + "' -> '" + target_root_relative + "'",
 		           res ? res->status : 0, res ? res->body : string());
@@ -449,7 +529,7 @@ void GraphClient::CreateFolder(const string &root_relative_path) {
 	body["name"] = picojson::value(name);
 	body["folder"] = picojson::value(picojson::object());
 	body["@microsoft.graph.conflictBehavior"] = picojson::value(string("fail"));
-	auto res = cli.Post(path.c_str(), h, picojson::value(body).serialize(), "application/json");
+	auto res = SendWithRetry([&] { return cli.Post(path.c_str(), h, picojson::value(body).serialize(), "application/json"); });
 	if (!res) {
 		throw IOException("sharepoint: create folder '%s' failed at the transport layer",
 		                  root_relative_path.c_str());
@@ -478,7 +558,7 @@ vector<ChildEntry> GraphClient::ListChildren(const string &folder_root_relative_
 	                  : "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(folder_root_relative_path) +
 	                        ":/children?$select=name,folder,file&$top=200";
 	while (!next.empty()) {
-		auto res = cli.Get(next.c_str(), h);
+		auto res = SendWithRetry([&] { return cli.Get(next.c_str(), h); });
 		if (!res) {
 			throw IOException("sharepoint: list of '%s' failed at the transport layer",
 			                  folder_root_relative_path.c_str());
