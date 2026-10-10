@@ -34,3 +34,9 @@ e2e/.uv-cache/
 
 # agent-crew review runs (local only)
 .crew/
+
+# Live-test credentials and the e2e harness's local state
+.env.sharepoint
+e2e/.venv/
+e2e/.pytest_cache/
+e2e/**/__pycache__/

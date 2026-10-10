@@ -12,6 +12,10 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Nightly: sweep the e2e scratch folders crashed runs leaked. 03:47 UTC,
+    # off the hour (gdrive sweeps at 03:17).
+    - cron: '47 3 * * *'
 
 concurrency:
   group: checks-${{ github.ref }}
@@ -194,3 +198,33 @@ jobs:
           SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
           SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
         run: make smoke_loadable
+      - uses: astral-sh/setup-uv@v5
+      # What SQL tests cannot express: out-of-band changes seen by a running
+      # process, restarts, multi-threaded scans, DuckLake, two drives.
+      - name: E2E harness
+        env:
+          # Step-scoped, not job-wide: the build steps above never see them.
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
+          SHAREPOINT_SITE_ID: ${{ secrets.SHAREPOINT_SITE_ID }}
+          DATAZOO_DISABLE_TELEMETRY: '1'
+        run: cd e2e && uv run pytest -v
+
+  # Crashed runs leak /_duckdb_sharepoint_e2e/run-* folders into a REAL
+  # document library. Not `make sweep_orphans`: the Makefile includes the
+  # extension-ci-tools submodule, which this job does not check out.
+  sweep:
+    name: Sweep orphaned e2e scratch folders
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - env:
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
+        run: cd e2e && uv run python -m helpers.sweep
