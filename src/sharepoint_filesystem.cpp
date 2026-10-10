@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <unordered_set>
 
 namespace duckdb {
 namespace sharepoint {
@@ -457,46 +458,70 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 	}
 	auto &context = RequireContext(opener, "glob");
 	auto auth = GetAuthContext(context, path);
-
-	auto &segs = uri.segments;
-	if (segs.empty()) {
-		return result;
-	}
-
-	// A fully literal path is one Stat, not a tree walk -- and it is the only
-	// case where a matching item may be a folder (DuckDB globs a bare path
-	// before opening it).
-	bool has_meta = false;
-	for (auto &s : segs) {
-		if (HasGlobMeta(s)) {
-			has_meta = true;
-			break;
-		}
-	}
-	if (!has_meta) {
-		GraphClient client(auth);
-		auto meta = client.StatByPath(uri.RootRelativePath());
-		if (meta.found) {
-			result.emplace_back(path);
-		}
-		return result;
-	}
-
-	// Wildcard pattern: walk folders through GraphClient::ListChildren. `**`
-	// recurses across levels; `*`/`?` stay within a segment. The matcher itself
-	// is pure (sharepoint_glob.*) and unit-tested; here we only adapt the lister.
 	GraphClient client(auth);
-	auto lister = [&client](const string &folder) -> vector<GlobEntry> {
-		vector<GlobEntry> entries;
-		for (auto &c : client.ListChildren(folder)) {
-			entries.push_back(GlobEntry {c.name, c.is_folder});
+
+	// {a,b} alternation first, over the whole root-relative pattern (an
+	// alternative may contain '/'); each expansion is then globbed on its own.
+	const auto patterns = ExpandBraces(uri.RootRelativePath());
+	if (patterns.empty()) {
+		throw InvalidInputException("sharepoint: glob pattern '%s' expands to too many alternatives", path);
+	}
+	std::unordered_set<string> seen;
+	auto emit = [&](const string &rel) {
+		if (seen.insert(rel).second) {
+			result.emplace_back(string(SHAREPOINT_SCHEME) + rel);
 		}
-		return entries;
 	};
-	// Qualify: FileSystem also declares a GlobFiles member, which unqualified
-	// would shadow our pure matcher here inside a FileSystem subclass.
-	for (auto &rel : sharepoint::GlobFiles(segs, lister)) {
-		result.emplace_back(string(SHAREPOINT_SCHEME) + rel);
+	for (const auto &pattern : patterns) {
+		auto parsed = ParseSharepointUri(string(SHAREPOINT_SCHEME) + pattern);
+		if (!parsed.ok || parsed.uri.kind != SharepointUriKind::PATH || parsed.uri.segments.empty()) {
+			continue;
+		}
+		const auto &segs = parsed.uri.segments;
+
+		// A fully literal path is one Stat, not a tree walk -- and it is the only
+		// case where a matching item may be a folder (DuckDB globs a bare path
+		// before opening it).
+		bool has_meta = false;
+		for (auto &seg : segs) {
+			if (HasGlobMetacharacters(seg)) {
+				has_meta = true;
+				break;
+			}
+		}
+		if (!has_meta) {
+			if (client.StatByPath(parsed.uri.RootRelativePath()).found) {
+				emit(parsed.uri.RootRelativePath());
+			}
+			continue;
+		}
+
+		// Wildcard pattern: walk folders through GraphClient::ListChildren. `**`
+		// recurses across levels; `*`/`?`/`[...]` stay within a segment. The
+		// matcher is pure (sharepoint_glob.*) and unit-tested; here we only adapt
+		// the lister.
+		auto lister = [&client](const string &folder) -> vector<GlobEntry> {
+			vector<GlobEntry> entries;
+			for (auto &c : client.ListChildren(folder)) {
+				entries.push_back(GlobEntry {c.name, c.is_folder});
+			}
+			return entries;
+		};
+		// Qualify: FileSystem also declares a GlobFiles member, which unqualified
+		// would shadow our pure matcher here inside a FileSystem subclass.
+		for (auto &rel : sharepoint::GlobFiles(segs, lister)) {
+			emit(rel);
+		}
+	}
+	// Names may legitimately contain glob characters ("report[1].csv",
+	// "{draft}.txt"). When a pattern matched nothing, try it as a literal path,
+	// as DuckDB's local filesystem does -- otherwise such a file could never be
+	// read by its own name. Costs one stat, only on an empty match.
+	if (result.empty() && HasGlobMetacharacters(uri.RootRelativePath())) {
+		auto meta = client.StatByPath(uri.RootRelativePath());
+		if (meta.found && !meta.is_folder) {
+			emit(uri.RootRelativePath());
+		}
 	}
 	return result;
 }

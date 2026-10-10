@@ -178,6 +178,28 @@ SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree/*.parquet')
 ----
 1
 
+# Character classes and {a,b} alternation -- the same pattern syntax as the
+# sibling gdrive. An alternative may span folders.
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree/**/[xyz].parquet');
+----
+3
+
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree/**/[!x].parquet');
+----
+2
+
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree/{x,nothere}.parquet');
+----
+1
+
+query I
+SELECT sum(a) FROM read_parquet('sharepoint://_duckdb_sharepoint_live/tree/{sub/y,sub/deep/z}.parquet');
+----
+5
+
 # ---------------------------------------------------------------------------
 # 6. move_file: write a staging file, publish it under its final name.
 # ---------------------------------------------------------------------------
@@ -229,6 +251,8 @@ SELECT move_file('sharepoint://_duckdb_sharepoint_live/odd/staging.tmp',
 ----
 true
 
+# '{x}' is also glob alternation; a pattern that matches nothing falls back to
+# the literal name, as DuckDB's local filesystem does.
 query I
 SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live/odd/it''s #1 %41+b & ünï;{x}.txt');
 ----
