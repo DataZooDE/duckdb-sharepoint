@@ -21,7 +21,9 @@ on:
     - cron: '47 3 * * *'
 
 concurrency:
-  group: checks-${{ github.ref }}
+  # The nightly sweep gets its own group so it never cancels or queues
+  # behind a push run on main.
+  group: checks-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'run' }}
   # Never cancel a run on main mid-way: a cancelled live/e2e job leaks its
   # scratch folders into the tenant.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
@@ -217,7 +219,7 @@ jobs:
           SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
           SHAREPOINT_SITE_ID: ${{ secrets.SHAREPOINT_SITE_ID }}
           DATAZOO_DISABLE_TELEMETRY: '1'
-        run: cd e2e && uv run pytest -v
+        run: cd e2e && uv run --locked pytest -v
 
   # Crashed runs leak /_duckdb_sharepoint_e2e/run-* folders into a REAL
   # document library. Not `make sweep_orphans`: the Makefile includes the
@@ -234,4 +236,4 @@ jobs:
           SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
           SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
           SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
-        run: cd e2e && uv run python -m helpers.sweep
+        run: cd e2e && uv run --locked python -m helpers.sweep
