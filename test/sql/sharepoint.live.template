@@ -258,7 +258,9 @@ SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live/odd
 ----
 odd
 
-# A name SharePoint forbids is Graph's clean 400, not a malformed request.
+# A name SharePoint forbids is refused up front with a message that says so
+# (it used to reach Graph: '"' came back as a bare 400, and ':' -- Graph's own
+# root:/path: delimiter -- as "Resource not found for the segment 'root:'").
 statement ok
 SELECT write_blob('sharepoint://_duckdb_sharepoint_live/odd/staging2.tmp', 'odd'::BLOB);
 
@@ -266,7 +268,12 @@ statement error
 SELECT move_file('sharepoint://_duckdb_sharepoint_live/odd/staging2.tmp',
                  'sharepoint://_duckdb_sharepoint_live/odd/q"uote.txt');
 ----
-HTTP 400
+SharePoint does not allow '"'
+
+statement error
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/odd/colon:name.txt', 'x'::BLOB);
+----
+SharePoint does not allow ':'
 
 statement ok
 SELECT remove_file('sharepoint://_duckdb_sharepoint_live/odd/staging2.tmp');

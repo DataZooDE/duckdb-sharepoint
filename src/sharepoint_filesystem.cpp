@@ -70,6 +70,19 @@ string ImmutablePrefixes(ClientContext &context) {
 //! cleared: a few hundred bytes each, so ~5 MB worst case.
 constexpr idx_t kMaxMetaCacheEntries = 20000;
 
+//! Refuse to CREATE an item whose name SharePoint forbids -- before Graph
+//! answers with an opaque 400.
+void CheckCreatableNames(const SharepointUri &uri, const string &path) {
+	for (const auto &segment : uri.segments) {
+		const char bad = ForbiddenNameChar(segment);
+		if (bad != '\0') {
+			throw InvalidInputException("sharepoint: '%s': SharePoint does not allow '%s' in file or folder names "
+			                            "(forbidden: \" * : < > ? \\ |)",
+			                            path, string(1, bad));
+		}
+	}
+}
+
 bool PermanentDelete(ClientContext &context) {
 	Value v;
 	if (context.TryGetCurrentSetting("sharepoint_permanent_delete", v) && !v.IsNull()) {
@@ -150,6 +163,7 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 			if (uri.kind != SharepointUriKind::PATH) {
 				throw IOException("sharepoint: writing addresses a path, not an id: form ('%s')", path);
 			}
+			CheckCreatableNames(uri, path);
 			auto handle = make_uniq<SharepointFileHandle>(*this, path, flags, std::move(auth));
 			handle->is_write = true;
 			handle->write_root_relative = uri.RootRelativePath();
@@ -361,6 +375,7 @@ bool SharepointFileSystem::DirectoryExists(const string &directory, optional_ptr
 void SharepointFileSystem::CreateDirectory(const string &directory, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		auto uri = ParseOrThrow(directory);
+		CheckCreatableNames(uri, directory);
 		auto &context = RequireContext(opener, "create directory");
 		auto auth = GetAuthContext(context, directory);
 		GraphClient(auth).CreateFolder(uri.RootRelativePath());
@@ -416,6 +431,7 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 		if (src.kind != SharepointUriKind::PATH || dst.kind != SharepointUriKind::PATH) {
 			throw IOException("sharepoint: move addresses paths on both sides, not id: forms");
 		}
+		CheckCreatableNames(dst, target);
 		auto &context = RequireContext(opener, "move");
 		auto auth = GetAuthContext(context, source);
 		// The target may fall under a different secret (scoped secrets) and hence a

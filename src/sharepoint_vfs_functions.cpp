@@ -67,30 +67,34 @@ void MoveFileScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 // CreateDirectoriesRecursive walks upward with Path::Parent(), which does not
 // understand a URL-form path and stops after one level.
 void EnsureParentDirectories(FileSystem &fs, const string &target) {
-	auto last_sep = target.find_last_of('/');
-	if (last_sep == string::npos) {
-		return;
-	}
-	size_t start = 0;
+	// Walk UP from the target's parent to the nearest folder that exists, then
+	// create the missing ones top-down. Usually that is one existence check
+	// (the parent is there), not one per path level -- and it never touches an
+	// ancestor ABOVE an existing folder, which may lie outside the path prefix
+	// (SCOPE) the only applicable secret covers: walking top-down from the
+	// root asked for a secret for `scheme://top` and failed there.
+	size_t root_end = 0;
 	auto scheme = target.find("://");
 	if (scheme != string::npos) {
-		start = scheme + 3;
+		root_end = scheme + 3;
 	} else if (!target.empty() && target.front() == '/') {
-		start = 1;
+		root_end = 1;
 	}
-	for (auto i = target.find('/', start); i != string::npos && i <= last_sep; i = target.find('/', i + 1)) {
-		auto dir = target.substr(0, i);
-		if (dir.empty()) {
-			continue;
+	vector<string> missing;
+	auto sep = target.find_last_of('/');
+	while (sep != string::npos && sep > root_end) {
+		auto dir = target.substr(0, sep);
+		if (fs.DirectoryExists(dir)) {
+			break;
 		}
-		if (!fs.DirectoryExists(dir)) {
-			if (fs.FileExists(dir)) {
-				throw IOException("sharepoint: cannot create directory '%s': a file of that name already "
-				                  "exists.",
-				                  dir);
-			}
-			fs.CreateDirectory(dir);
+		if (fs.FileExists(dir)) {
+			throw IOException("cannot create directory '%s': a file of that name already exists.", dir);
 		}
+		missing.push_back(dir);
+		sep = target.find_last_of('/', sep - 1);
+	}
+	for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+		fs.CreateDirectory(*it);
 	}
 }
 
