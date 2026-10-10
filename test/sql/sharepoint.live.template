@@ -200,6 +200,20 @@ SELECT sum(a) FROM read_parquet('sharepoint://_duckdb_sharepoint_live/tree/{sub/
 ----
 5
 
+# Cross-check with gdrive (same scenario script on both backends): glob yields
+# FILES only -- a literal folder path is no match -- and reading an absent
+# file is DuckDB's "No files found", not a Graph error from the literal
+# fallback stat-ing core's synthesized "<path>/**/*.csv" probe.
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree');
+----
+0
+
+statement error
+SELECT * FROM read_csv('sharepoint://_duckdb_sharepoint_live/tree/absent.csv');
+----
+No files found
+
 # ---------------------------------------------------------------------------
 # 6. move_file: write a staging file, publish it under its final name.
 # ---------------------------------------------------------------------------

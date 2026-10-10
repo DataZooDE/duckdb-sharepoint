@@ -520,7 +520,10 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 				}
 			}
 			if (!has_meta) {
-				if (client.StatByPath(parsed.uri.RootRelativePath()).found) {
+				// Files only, as on every other filesystem (and gdrive): a
+				// folder is not a glob match.
+				auto meta = client.StatByPath(parsed.uri.RootRelativePath());
+				if (meta.found && !meta.is_folder) {
 					emit(parsed.uri.RootRelativePath());
 				}
 				continue;
@@ -547,7 +550,15 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 		// "{draft}.txt"). When a pattern matched nothing, try it as a literal path,
 		// as DuckDB's local filesystem does -- otherwise such a file could never be
 		// read by its own name. Costs one stat, only on an empty match.
-		if (result.empty() && HasGlobMetacharacters(uri.RootRelativePath())) {
+		// Only for names that could exist: SharePoint forbids '*' and '?', so a
+		// pattern containing them (e.g. core's synthesized "<path>/**/*.csv"
+		// probe after a literal miss) is never stat-ed -- Graph rejects such a
+		// path with 400 "potentially dangerous Request.Path value".
+		bool could_exist = true;
+		for (const auto &segment : uri.segments) {
+			could_exist = could_exist && ForbiddenNameChar(segment) == '\0';
+		}
+		if (result.empty() && could_exist && HasGlobMetacharacters(uri.RootRelativePath())) {
 			auto meta = client.StatByPath(uri.RootRelativePath());
 			if (meta.found && !meta.is_folder) {
 				emit(uri.RootRelativePath());
