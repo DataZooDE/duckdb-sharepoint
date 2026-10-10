@@ -43,5 +43,11 @@ struct AuthContext {
 //!   * PROVIDER config with REFRESH_TOKEN -> grant_type=refresh_token.
 AuthContext GetAuthContext(ClientContext &context, const string &path);
 
+//! True if any `sharepoint` secret exists at all (whatever its scope). Lets
+//! FileExists answer core's speculative probes with false when the extension
+//! is simply unconfigured, while user-facing calls still get the loud
+//! "no secret configured" error from GetAuthContext.
+bool HasAnySharepointSecret(ClientContext &context);
+
 } // namespace sharepoint
 } // namespace duckdb

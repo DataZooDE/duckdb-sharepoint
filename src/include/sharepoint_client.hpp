@@ -77,7 +77,7 @@ public:
 
 	//! List the immediate children of a folder given by root-relative path,
 	//! following @odata.nextLink pages.
-	vector<ChildEntry> ListChildren(const string &folder_root_relative_path);
+	vector<ChildEntry> ListChildren(const string &folder_root_relative_path, bool *found = nullptr);
 
 private:
 	const AuthContext &auth;

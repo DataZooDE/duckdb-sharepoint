@@ -356,6 +356,20 @@ statement ok
 SELECT remove_file('sharepoint://_duckdb_sharepoint_live/imm/a.txt');
 
 # ---------------------------------------------------------------------------
+# 12. Folders are not files, and not absent (crew finding F10): an existing
+#     folder used to make remove_file return false and file_size NULL.
+# ---------------------------------------------------------------------------
+statement error
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/tree');
+----
+is a directory
+
+statement error
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/tree');
+----
+is a directory
+
+# ---------------------------------------------------------------------------
 # Best-effort teardown of the leaf files. Empty fixture folders may remain; the
 # next run replaces every file in place, so a lingering tree is harmless.
 # ---------------------------------------------------------------------------

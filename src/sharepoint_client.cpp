@@ -605,7 +605,7 @@ void GraphClient::CreateFolder(const string &root_relative_path) {
 	}
 }
 
-vector<ChildEntry> GraphClient::ListChildren(const string &folder_root_relative_path) {
+vector<ChildEntry> GraphClient::ListChildren(const string &folder_root_relative_path, bool *found) {
 	vector<ChildEntry> out;
 	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
@@ -613,7 +613,19 @@ vector<ChildEntry> GraphClient::ListChildren(const string &folder_root_relative_
 	                  ? "/v1.0/drives/" + auth.drive_id + "/root/children?$select=name,folder,file&$top=200"
 	                  : "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(folder_root_relative_path) +
 	                        ":/children?$select=name,folder,file&$top=200";
+	if (found) {
+		*found = true;
+	}
+	// 200 entries a page: 5000 pages is a million children in one folder, far
+	// beyond anything SharePoint serves well. A nextLink chain longer than that
+	// is a server bug, and must not loop forever.
+	constexpr int kMaxListPages = 5000;
+	int pages = 0;
 	while (!next.empty()) {
+		if (++pages > kMaxListPages) {
+			throw IOException("sharepoint: listing '%s' exceeded %d pages", folder_root_relative_path.c_str(),
+			                  kMaxListPages);
+		}
 		IncrementCounter(Counter::LIST_PAGE);
 		auto res = SendWithRetry([&] { return cli.Get(next.c_str(), h); });
 		if (!res) {
@@ -621,6 +633,9 @@ vector<ChildEntry> GraphClient::ListChildren(const string &folder_root_relative_
 			                  folder_root_relative_path.c_str());
 		}
 		if (res->status == 404) {
+			if (found) {
+				*found = false;
+			}
 			return out; // an absent folder lists as empty
 		}
 		if (res->status < 200 || res->status >= 300) {

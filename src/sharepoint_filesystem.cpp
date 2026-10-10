@@ -137,6 +137,12 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 	auto &context = RequireContext(opener, "open");
 	auto auth = GetAuthContext(context, path);
 
+	if (flags.OpenForAppending()) {
+		// Graph replaces whole files; "append" would silently drop the existing
+		// content. Refuse instead.
+		throw NotImplementedException("sharepoint: appending to '%s' is not supported -- Graph replaces whole files",
+		                              path);
+	}
 	if (flags.OpenForWriting()) {
 		if (uri.kind != SharepointUriKind::PATH) {
 			throw IOException("sharepoint: writing addresses a path, not an id: form ('%s')", path);
@@ -164,7 +170,12 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 			MetaCachePut(meta_key, meta);
 		}
 	}
-	if (!meta.found || meta.is_folder) {
+	if (meta.found && meta.is_folder) {
+		// A folder is not "absent": returning null here made remove_file report
+		// false and file_size NULL for an existing folder.
+		throw IOException("sharepoint: '%s' is a directory, not a file", path);
+	}
+	if (!meta.found) {
 		if (flags.ReturnNullIfNotExists()) {
 			return nullptr;
 		}
@@ -252,7 +263,14 @@ int64_t SharepointFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr
 	if (!h.is_write) {
 		throw IOException("sharepoint: '%s' was not opened for writing", handle.path.c_str());
 	}
-	h.write_buffer.append(static_cast<const char *>(buffer), static_cast<size_t>(nr_bytes));
+	try {
+		h.write_buffer.append(static_cast<const char *>(buffer), static_cast<size_t>(nr_bytes));
+	} catch (...) {
+		// Never publish what we have so far as if it were the whole file: Close()
+		// skips the upload once a write failed (gdrive does the same).
+		h.write_failed = true;
+		throw;
+	}
 	h.position += nr_bytes;
 	return nr_bytes;
 }
@@ -304,7 +322,7 @@ bool SharepointFileSystem::FileExists(const string &filename, optional_ptr<FileO
 	// false rather than throw (the leniency sharepoint_vfs_functions.cpp's
 	// ConfirmedAbsent accounts for).
 	auto context = FileOpener::TryGetClientContext(opener.get());
-	if (!context) {
+	if (!context || !HasAnySharepointSecret(*context)) {
 		return false;
 	}
 	auto parsed = ParseSharepointUri(filename);
@@ -320,12 +338,15 @@ bool SharepointFileSystem::FileExists(const string &filename, optional_ptr<FileO
 
 bool SharepointFileSystem::DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) {
 	auto context = FileOpener::TryGetClientContext(opener.get());
-	if (!context) {
+	if (!context || !HasAnySharepointSecret(*context)) {
 		return false;
 	}
 	auto parsed = ParseSharepointUri(directory);
 	if (!parsed.ok || parsed.uri.kind == SharepointUriKind::FILE_ID) {
 		return false;
+	}
+	if (parsed.uri.RootRelativePath().empty()) {
+		return true; // the drive root always exists
 	}
 	auto auth = GetAuthContext(*context, directory);
 	GraphClient client(auth);
@@ -369,11 +390,13 @@ bool SharepointFileSystem::ListFiles(const string &directory,
 	auto uri = ParseOrThrow(directory);
 	auto &context = RequireContext(opener, "list files");
 	auto auth = GetAuthContext(context, directory);
-	auto children = GraphClient(auth).ListChildren(uri.RootRelativePath());
+	bool found = false;
+	auto children = GraphClient(auth).ListChildren(uri.RootRelativePath(), &found);
 	for (auto &c : children) {
 		callback(c.name, c.is_folder);
 	}
-	return !children.empty();
+	// FileSystem contract: true if the directory exists -- an empty folder too.
+	return found;
 }
 
 void SharepointFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {

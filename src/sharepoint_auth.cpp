@@ -146,10 +146,22 @@ SecretMatch LookupSecret(ClientContext &context, const string &path) {
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 	auto match = secret_manager.LookupSecret(transaction, path, kSecretTypeName);
 	if (!match.HasMatch()) {
+		// A secret may EXIST and still not apply: DuckDB's SCOPE clause limits
+		// which paths a secret covers, and SCOPE is easy to reach for when the
+		// OAuth scope (GRAPH_SCOPE) was meant. "No secret configured" would send
+		// that user off to create a second one that does not match either.
+		if (HasAnySharepointSecret(context)) {
+			throw InvalidInputException(
+			    "sharepoint: a `sharepoint` secret exists, but none applies to '%s'. A secret's SCOPE clause "
+			    "limits which paths it covers (the OAuth scope option is GRAPH_SCOPE, not SCOPE). Check: "
+			    "SELECT name, scope FROM duckdb_secrets();",
+			    path);
+		}
 		throw InvalidInputException(
-		    "sharepoint: no `sharepoint` secret is configured. Create one, e.g.\n"
+		    "sharepoint: no `sharepoint` secret configured for '%s'. Create one, e.g.\n"
 		    "  CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,\n"
-		    "                    TENANT_ID '...', CLIENT_ID '...', CLIENT_SECRET '...', DRIVE_ID 'b!...');");
+		    "                    TENANT_ID '...', CLIENT_ID '...', CLIENT_SECRET '...', DRIVE_ID 'b!...');",
+		    path);
 	}
 	return match;
 }
@@ -317,6 +329,17 @@ AuthContext GetAuthContext(ClientContext &context, const string &path) {
 	// same-drive check on moves: credentials + cloud + drive.
 	auth.identity = Fingerprint({credential_fp, graph_endpoint, auth.drive_id});
 	return auth;
+}
+
+bool HasAnySharepointSecret(ClientContext &context) {
+	auto &secret_manager = SecretManager::Get(context);
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	for (const auto &entry : secret_manager.AllSecrets(transaction)) {
+		if (entry.secret && entry.secret->GetType() == kSecretTypeName) {
+			return true;
+		}
+	}
+	return false;
 }
 
 } // namespace sharepoint

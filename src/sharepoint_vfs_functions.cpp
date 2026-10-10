@@ -35,15 +35,13 @@ bool ConfirmedAbsent(FileSystem &fs, const string &path) {
 
 bool RemoveOne(FileSystem &fs, const string &path) {
 	if (!fs.FileExists(path)) {
+		if (fs.DirectoryExists(path)) {
+			throw IOException("'%s' is a directory, not a file; remove_file does not remove directories", path);
+		}
 		if (ConfirmedAbsent(fs, path)) {
 			return false;
 		}
-		if (fs.DirectoryExists(path)) {
-			throw IOException("sharepoint: '%s' is a directory, not a file; remove_file does not remove "
-			                  "directories",
-			                  path);
-		}
-		throw IOException("sharepoint: '%s' exists but is not a removable file", path);
+		throw IOException("'%s' exists but is not a removable file", path);
 	}
 	fs.RemoveFile(path);
 	return true;
@@ -128,14 +126,14 @@ void FileSizeScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	    args.data[0], result, args.size(), [&](string_t path, ValidityMask &mask, idx_t idx) -> int64_t {
 		    auto p = path.GetString();
 		    if (!fs.FileExists(p)) {
+			    if (fs.DirectoryExists(p)) {
+				    throw IOException("'%s' is a directory, not a file; it has no byte size", p);
+			    }
 			    if (ConfirmedAbsent(fs, p)) {
 				    mask.SetInvalid(idx);
 				    return 0;
 			    }
-			    if (fs.DirectoryExists(p)) {
-				    throw IOException("sharepoint: '%s' is a directory, not a file; it has no byte size", p);
-			    }
-			    throw IOException("sharepoint: '%s' exists but its size cannot be read as a file", p);
+			    throw IOException("'%s' exists but its size cannot be read as a file", p);
 		    }
 		    auto handle = fs.OpenFile(p, FileFlags::FILE_FLAGS_READ);
 		    if (!handle) {
@@ -148,6 +146,12 @@ void FileSizeScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 
 } // namespace
 
+// The four functions are scheme-generic and shared, byte for byte in
+// behaviour, with the sibling gdrive extension, which registers them too.
+// Registering with IGNORE_ON_CONFLICT lets both extensions load into one
+// database in either order: whichever loads second keeps the first's
+// (identical) definitions. Without it the second LOAD failed with
+// 'Scalar Function with name "remove_file" already exists!'.
 void RegisterVfsFunctions(ExtensionLoader &loader) {
 	{
 		ScalarFunction fn("remove_file", {LogicalType::VARCHAR}, LogicalType::BOOLEAN, RemoveFileScalar);
@@ -167,6 +171,7 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		desc.examples = {"SELECT remove_file('sharepoint://reports/old.parquet')"};
 		desc.categories = {"sharepoint"};
 		info.descriptions.push_back(std::move(desc));
+		info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(info));
 	}
 
@@ -185,6 +190,7 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		desc.examples = {"SELECT move_file('sharepoint://staging/part.tmp', 'sharepoint://data/part.parquet')"};
 		desc.categories = {"sharepoint"};
 		info.descriptions.push_back(std::move(desc));
+		info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(info));
 	}
 
@@ -204,6 +210,7 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		write_desc.examples = {"SELECT write_blob('sharepoint://notes/readme.md', '# Title'::BLOB)"};
 		write_desc.categories = {"sharepoint"};
 		write_info.descriptions.push_back(std::move(write_desc));
+		write_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(write_info));
 	}
 
@@ -220,6 +227,7 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		size_desc.examples = {"SELECT file_size('sharepoint://data/part.parquet')"};
 		size_desc.categories = {"sharepoint"};
 		size_info.descriptions.push_back(std::move(size_desc));
+		size_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(size_info));
 	}
 }
