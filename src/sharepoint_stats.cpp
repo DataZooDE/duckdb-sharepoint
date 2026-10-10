@@ -8,6 +8,8 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
+#include <cstdint>
+
 namespace duckdb {
 namespace sharepoint {
 
