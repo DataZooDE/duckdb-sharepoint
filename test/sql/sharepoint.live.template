@@ -380,6 +380,19 @@ SELECT octet_length(content) FROM read_blob('sharepoint://_duckdb_sharepoint_liv
 ----
 6
 
+# file_size opens first: one stat for a present file (it used to ask
+# FileExists, then open -- two; three for an absent file).
+statement ok
+CALL sharepoint_reset_stats();
+
+statement ok
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/data/nums.parquet');
+
+query I
+SELECT value FROM sharepoint_stats() WHERE metric = 'stat';
+----
+1
+
 statement ok
 RESET sharepoint_immutable_prefixes;
 

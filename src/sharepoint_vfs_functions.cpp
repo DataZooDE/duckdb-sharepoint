@@ -129,22 +129,21 @@ void FileSizeScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	UnaryExecutor::ExecuteWithNulls<string_t, int64_t>(
 	    args.data[0], result, args.size(), [&](string_t path, ValidityMask &mask, idx_t idx) -> int64_t {
 		    auto p = path.GetString();
-		    if (!fs.FileExists(p)) {
-			    if (fs.DirectoryExists(p)) {
-				    throw IOException("'%s' is a directory, not a file; it has no byte size", p);
-			    }
-			    if (ConfirmedAbsent(fs, p)) {
-				    mask.SetInvalid(idx);
-				    return 0;
-			    }
-			    throw IOException("'%s' exists but its size cannot be read as a file", p);
+		    // Open first: a handle answers "exists, and this big" in one
+		    // remote call, and NULL_IF_NOT_EXISTS is the strict absence test
+		    // (a missing secret still throws, never reads as NULL). Asking
+		    // FileExists and DirectoryExists up front cost three remote stats
+		    // for an absent file and two for a present one -- measured with
+		    // sharepoint_stats() under a throttling burst.
+		    auto handle = fs.OpenFile(p, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS);
+		    if (handle) {
+			    return NumericCast<int64_t>(handle->GetFileSize());
 		    }
-		    auto handle = fs.OpenFile(p, FileFlags::FILE_FLAGS_READ);
-		    if (!handle) {
-			    mask.SetInvalid(idx);
-			    return 0;
+		    if (fs.DirectoryExists(p)) {
+			    throw IOException("'%s' is a directory, not a file; it has no byte size", p);
 		    }
-		    return NumericCast<int64_t>(handle->GetFileSize());
+		    mask.SetInvalid(idx);
+		    return 0;
 	    });
 }
 
