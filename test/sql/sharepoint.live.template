@@ -280,6 +280,38 @@ statement ok
 SELECT remove_file('sharepoint://_duckdb_sharepoint_live/odd/it''s #1 %41+b & ünï;{x}.txt');
 
 # ---------------------------------------------------------------------------
+# 10. Token cache identity (crew finding F5). The cache used to be keyed by
+#     the secret's NAME: recreating `sp_live` with a wrong client secret was
+#     still served the token minted for the right one. Keyed by a fingerprint
+#     of the credentials, the wrong secret must authenticate on its own -- and
+#     fail.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE SECRET sp_live (
+    TYPE sharepoint,
+    PROVIDER client_credentials,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_CLIENT_ID@',
+    CLIENT_SECRET 'definitely-not-the-secret',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@'
+);
+
+statement error
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/data/nums.parquet');
+----
+invalid_client
+
+statement ok
+CREATE OR REPLACE SECRET sp_live (
+    TYPE sharepoint,
+    PROVIDER client_credentials,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_CLIENT_ID@',
+    CLIENT_SECRET '@SHAREPOINT_CLIENT_SECRET@',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@'
+);
+
+# ---------------------------------------------------------------------------
 # Best-effort teardown of the leaf files. Empty fixture folders may remain; the
 # next run replaces every file in place, so a lingering tree is harmless.
 # ---------------------------------------------------------------------------

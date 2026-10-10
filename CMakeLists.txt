@@ -51,6 +51,7 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_upload.cpp
     src/sharepoint_blockcache.cpp
     src/sharepoint_rawhttp.cpp
+    src/sharepoint_identity.cpp
 )
 
 # ---------------------------------------------------------------------------

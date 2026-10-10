@@ -1,13 +1,15 @@
 // Token acquisition + caching for the `sharepoint` secret.
 //
-// STATUS: this file is part of the network frontier of the scaffold. The DuckDB
-// secret-lookup and httplib call shapes are written against DuckDB v1.x and
-// Microsoft Graph as documented, but the extension has not yet been compiled or
-// run against a live tenant (there is no DuckDB submodule checked out). Treat
-// every Graph interaction here as reviewed-but-unverified until the live SQL
-// suite (test/sql/live/, `make test_live`) passes. See docs/hld.md.
+// Proven by the live SQL suite (`make test_live`) against a real tenant.
+//
+// Every cache here is keyed by a SHA-256 fingerprint of the credential
+// material -- never by the secret's name: a temporary secret is per
+// connection, so one name can mean different credentials, and a name-keyed
+// cache would serve one principal's token to another (the bug the sibling
+// gdrive documents and fixed the same way).
 #include "sharepoint_auth.hpp"
 #include "sharepoint_errors.hpp"
+#include "sharepoint_identity.hpp"
 #include "sharepoint_secret.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -21,6 +23,8 @@
 #include "httplib.hpp"
 
 #include <picojson.h>
+
+#include <openssl/evp.h>
 
 #include <chrono>
 #include <cstdint>
@@ -38,7 +42,29 @@ struct CachedToken {
 };
 
 mutex g_token_lock;
-unordered_map<string, CachedToken> g_tokens; // identity -> token
+unordered_map<string, CachedToken> g_tokens;  // credential fingerprint -> token
+unordered_map<string, string> g_site_drives; // fingerprint of (credentials, site) -> drive id
+
+//! SHA-256 (hex) of length-prefixed credential material. Hashed so no
+//! credential sits in a map key, and a cryptographic hash so distinct
+//! credentials cannot collide into a shared token.
+string Fingerprint(const vector<string> &parts) {
+	const string framed = FrameCredentialMaterial(parts);
+	unsigned char digest[EVP_MAX_MD_SIZE];
+	unsigned int digest_len = 0;
+	if (EVP_Digest(framed.data(), framed.size(), digest, &digest_len, EVP_sha256(), nullptr) != 1) {
+		// Never fail open onto a weaker key -- that is the cross-tenant bug.
+		throw IOException("sharepoint: could not fingerprint the credentials (SHA-256 unavailable)");
+	}
+	static const char *kHex = "0123456789abcdef";
+	string hex;
+	hex.reserve(digest_len * 2);
+	for (unsigned int i = 0; i < digest_len; i++) {
+		hex.push_back(kHex[(digest[i] >> 4) & 0xF]);
+		hex.push_back(kHex[digest[i] & 0xF]);
+	}
+	return hex;
+}
 
 // Read a field from a KeyValueSecret, empty string if absent.
 string SecretField(const KeyValueSecret &secret, const char *key) {
@@ -74,12 +100,28 @@ picojson::object PostToken(const string &login_endpoint, const string &tenant,
 		                  login_endpoint.c_str(), path.c_str());
 	}
 	if (res->status < 200 || res->status >= 300) {
-		// Azure AD returns { "error": "...", "error_description": "..." }.
-		// The description can leak configuration detail but never the secret;
-		// still, keep it short.
-		throw IOException("sharepoint: token endpoint returned HTTP %d (%s). Check TENANT_ID, CLIENT_ID and "
+		// Entra ID returns { "error": "invalid_client", "error_codes": [7000215],
+		// "error_description": "..." }. Surface the short `error` and the AADSTS
+		// code -- enough to look the failure up -- but not the description,
+		// which can echo configuration detail.
+		string aad_error, aad_code;
+		picojson::value ev;
+		if (picojson::parse(ev, res->body).empty() && ev.is<picojson::object>()) {
+			auto &eo = ev.get<picojson::object>();
+			auto e = eo.find("error");
+			if (e != eo.end() && e->second.is<string>()) {
+				aad_error = e->second.get<string>();
+			}
+			auto codes = eo.find("error_codes");
+			if (codes != eo.end() && codes->second.is<picojson::array>() &&
+			    !codes->second.get<picojson::array>().empty() &&
+			    codes->second.get<picojson::array>()[0].is<int64_t>()) {
+				aad_code = " AADSTS" + std::to_string(codes->second.get<picojson::array>()[0].get<int64_t>());
+			}
+		}
+		throw IOException("sharepoint: token endpoint returned HTTP %d (%s%s). Check TENANT_ID, CLIENT_ID and "
 		                  "CLIENT_SECRET, and that the app has admin-consented application permissions.",
-		                  res->status, GraphErrorKindName(ClassifyGraphError(res->status, "")));
+		                  res->status, aad_error.empty() ? "error" : aad_error.c_str(), aad_code.c_str());
 	}
 	picojson::value v;
 	string err = picojson::parse(v, res->body);
@@ -112,9 +154,9 @@ SecretMatch LookupSecret(ClientContext &context, const string &path) {
 
 // Resolve the drive the paths hang off. Prefer an explicit DRIVE_ID; else
 // derive it from SITE_ID via GET /sites/{site-id}/drive (the site's default
-// document library). Result is not cached separately here -- it rides the
-// AuthContext, rebuilt per query, which is cheap next to the data calls.
-string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint, const string &token) {
+// document library), cached per credentials + site.
+string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint, const string &token,
+                      const string &credential_fp) {
 	string drive_id = SecretField(secret, "drive_id");
 	if (!drive_id.empty()) {
 		return drive_id;
@@ -124,6 +166,16 @@ string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint
 		throw InvalidInputException(
 		    "sharepoint: the secret gives neither DRIVE_ID nor SITE_ID, so there is no drive to address. "
 		    "Pass one of them to CREATE SECRET.");
+	}
+	// A site's default library does not move; resolve it once per (credentials,
+	// cloud, site) instead of one extra Graph call per file operation.
+	const string cache_key = Fingerprint({credential_fp, graph_endpoint, site_id});
+	{
+		lock_guard<mutex> guard(g_token_lock);
+		auto it = g_site_drives.find(cache_key);
+		if (it != g_site_drives.end()) {
+			return it->second;
+		}
 	}
 	auto cli = MakeClient(graph_endpoint);
 	duckdb_httplib_openssl::Headers headers = {{"Authorization", "Bearer " + token}};
@@ -142,27 +194,16 @@ string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint
 	if (!id.is<string>()) {
 		throw IOException("sharepoint: site drive response carried no id");
 	}
+	lock_guard<mutex> guard(g_token_lock);
+	g_site_drives[cache_key] = id.get<string>();
 	return id.get<string>();
 }
 
 } // namespace
 
-void InvalidateAuthCache(const string &secret_name) {
-	lock_guard<mutex> guard(g_token_lock);
-	for (auto it = g_tokens.begin(); it != g_tokens.end();) {
-		// identity is "<secret_name>|<drive>"; drop every entry for the secret.
-		if (it->first.rfind(secret_name + "|", 0) == 0) {
-			it = g_tokens.erase(it);
-		} else {
-			++it;
-		}
-	}
-}
-
 AuthContext GetAuthContext(ClientContext &context, const string &path) {
 	const auto match = LookupSecret(context, path);
 	const auto &secret = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
-	const string secret_name = secret.GetName();
 
 	string login_endpoint = "https://login.microsoftonline.com";
 	string graph_endpoint = "https://graph.microsoft.com";
@@ -175,28 +216,55 @@ AuthContext GetAuthContext(ClientContext &context, const string &path) {
 			graph_endpoint = v.ToString();
 		}
 	}
+	// The endpoints are SESSION settings, so they are checked here, at the point
+	// credentials would be sent: only Microsoft cloud hosts over https may
+	// receive the client secret or a bearer token.
+	if (!IsAllowedLoginEndpoint(login_endpoint)) {
+		throw InvalidInputException("sharepoint: sharepoint_login_endpoint '%s' is not a Microsoft Entra ID login "
+		                            "host (https://login.microsoftonline.com, .us, or the China cloud)",
+		                            login_endpoint);
+	}
+	if (!IsAllowedGraphEndpoint(graph_endpoint)) {
+		throw InvalidInputException("sharepoint: sharepoint_graph_endpoint '%s' is not a Microsoft Graph host "
+		                            "(https://graph.microsoft.com, the US Gov / DoD hosts, or the China cloud)",
+		                            graph_endpoint);
+	}
+	while (!graph_endpoint.empty() && graph_endpoint.back() == '/') {
+		graph_endpoint.pop_back();
+	}
+	while (!login_endpoint.empty() && login_endpoint.back() == '/') {
+		login_endpoint.pop_back();
+	}
 
 	const string provider = secret.GetProvider();
 	const string tenant = SecretField(secret, "tenant_id");
-	const string scope = SecretField(secret, "graph_scope");
+	const string client_id = SecretField(secret, "client_id");
+	const string client_secret = SecretField(secret, "client_secret");
+	const string refresh_token = SecretField(secret, "refresh_token");
+	const string configured_scope = SecretField(secret, "graph_scope");
+	const string scope = configured_scope.empty() ? DefaultGraphScope(graph_endpoint) : configured_scope;
 
 	// A config secret with a bare ACCESS_TOKEN is used as-is, no caching or
 	// refresh -- the caller owns its lifetime.
-	string static_token = (provider == "config") ? SecretField(secret, "access_token") : string();
+	const string static_token = (provider == "config") ? SecretField(secret, "access_token") : string();
 
-	// Identity keys the token cache AND everything downstream. Include the
-	// drive so two secrets pointing at different drives never share a token.
-	string drive_hint = SecretField(secret, "drive_id");
-	string identity = secret_name + "|" + drive_hint;
+	// Everything that changes which token comes back -- and where it may be
+	// sent. Two secrets (or one name recreated) share a token only if all of
+	// this is identical.
+	const string credential_fp = Fingerprint({provider, tenant, client_id, client_secret, refresh_token, scope,
+	                                          login_endpoint, static_token});
 
 	string token;
 	if (!static_token.empty()) {
 		token = static_token;
 	} else {
-		// Cached?
+		if (!IsValidTenantId(tenant)) {
+			throw InvalidInputException("sharepoint: TENANT_ID must be a tenant GUID or domain (letters, digits, "
+			                            "'-', '.')");
+		}
 		{
 			lock_guard<mutex> guard(g_token_lock);
-			auto it = g_tokens.find(identity);
+			auto it = g_tokens.find(credential_fp);
 			if (it != g_tokens.end() &&
 			    it->second.expires_at > std::chrono::system_clock::now() + std::chrono::seconds(60)) {
 				token = it->second.access_token;
@@ -204,17 +272,16 @@ AuthContext GetAuthContext(ClientContext &context, const string &path) {
 		}
 		if (token.empty()) {
 			duckdb_httplib_openssl::Params params;
-			params.emplace("client_id", SecretField(secret, "client_id"));
-			params.emplace("client_secret", SecretField(secret, "client_secret"));
+			params.emplace("client_id", client_id);
+			params.emplace("client_secret", client_secret);
+			params.emplace("scope", scope);
 			if (provider == "config") {
 				// refresh_token grant (config secret without a static token).
 				params.emplace("grant_type", "refresh_token");
-				params.emplace("refresh_token", SecretField(secret, "refresh_token"));
-				params.emplace("scope", scope.empty() ? SCOPE_GRAPH_DEFAULT : scope);
+				params.emplace("refresh_token", refresh_token);
 			} else {
 				// client_credentials (the default provider).
 				params.emplace("grant_type", "client_credentials");
-				params.emplace("scope", scope.empty() ? SCOPE_GRAPH_DEFAULT : scope);
 			}
 			auto obj = PostToken(login_endpoint, tenant, params);
 			auto at = obj.find("access_token");
@@ -226,18 +293,27 @@ AuthContext GetAuthContext(ClientContext &context, const string &path) {
 			auto ei = obj.find("expires_in");
 			if (ei != obj.end() && ei->second.is<int64_t>()) {
 				expires_in = ei->second.get<int64_t>();
+			} else if (ei != obj.end() && ei->second.is<string>()) {
+				// Some Entra ID endpoints send it as a string.
+				char *end = nullptr;
+				const auto parsed = std::strtoll(ei->second.get<string>().c_str(), &end, 10);
+				if (end && *end == '\0' && parsed > 0) {
+					expires_in = parsed;
+				}
 			}
 			lock_guard<mutex> guard(g_token_lock);
-			g_tokens[identity] = CachedToken{
-			    token, std::chrono::system_clock::now() + std::chrono::seconds(expires_in)};
+			g_tokens[credential_fp] =
+			    CachedToken {token, std::chrono::system_clock::now() + std::chrono::seconds(expires_in)};
 		}
 	}
 
 	AuthContext auth;
 	auth.access_token = token;
 	auth.graph_endpoint = graph_endpoint;
-	auth.drive_id = ResolveDriveId(secret, graph_endpoint, token);
-	auth.identity = secret_name + "|" + auth.drive_id;
+	auth.drive_id = ResolveDriveId(secret, graph_endpoint, token, credential_fp);
+	// Keys every per-identity cache downstream (block cache) and the
+	// same-drive check on moves: credentials + cloud + drive.
+	auth.identity = Fingerprint({credential_fp, graph_endpoint, auth.drive_id});
 	return auth;
 }
 

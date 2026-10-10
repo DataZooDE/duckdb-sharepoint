@@ -10,10 +10,13 @@ SELECT sharepoint_version() IS NOT NULL;
 ----
 true
 
-# The scheme-generic mutation functions registered.
-statement ok
-SELECT function_name FROM duckdb_functions()
+# The scheme-generic mutation functions registered. (`query`, not
+# `statement ok`: a SELECT that returns 0 rows would pass `statement ok`.)
+query I
+SELECT count(DISTINCT function_name) FROM duckdb_functions()
 WHERE function_name IN ('write_blob', 'remove_file', 'move_file', 'file_size');
+----
+4
 
 # The `sharepoint` secret type exists (creating one needs no network).
 statement ok
@@ -32,15 +35,62 @@ SELECT secret_string NOT LIKE '%not-a-real-secret%' FROM duckdb_secrets() WHERE 
 ----
 true
 
+# ---------------------------------------------------------------------------
+# Credentials only ever go to Microsoft cloud hosts. The endpoints are SESSION
+# settings, so without this any SQL user could point them at a host they
+# control and receive another connection's bearer token -- or, via the login
+# endpoint, the client secret itself. Refused before any network call.
+# ---------------------------------------------------------------------------
+statement ok
+SET sharepoint_graph_endpoint = 'https://evil.example.com';
+
+statement error
+SELECT * FROM glob('sharepoint://anything/*');
+----
+is not a Microsoft Graph host
+
+statement ok
+SET sharepoint_graph_endpoint = 'http://graph.microsoft.com';
+
+statement error
+SELECT * FROM glob('sharepoint://anything/*');
+----
+is not a Microsoft Graph host
+
+statement ok
+RESET sharepoint_graph_endpoint;
+
+statement ok
+SET sharepoint_login_endpoint = 'https://login.microsoftonline.com.evil.example';
+
+statement error
+SELECT * FROM glob('sharepoint://anything/*');
+----
+is not a Microsoft Entra ID login host
+
+statement ok
+RESET sharepoint_login_endpoint;
+
+# The tenant is spliced into the token URL path; a path-shaped one is refused.
+statement ok
+CREATE OR REPLACE SECRET sp_test (
+    TYPE sharepoint,
+    PROVIDER client_credentials,
+    TENANT_ID '../evil?x=',
+    CLIENT_ID '11111111-1111-1111-1111-111111111111',
+    CLIENT_SECRET 'not-a-real-secret',
+    DRIVE_ID 'b!placeholder'
+);
+
+statement error
+SELECT * FROM glob('sharepoint://anything/*');
+----
+TENANT_ID must be a tenant GUID or domain
+
 statement ok
 DROP SECRET sp_test;
 
-# ---------------------------------------------------------------------------
-# Live round trip. Skipped unless SHAREPOINT_TENANT_ID et al. are set; the
-# materialised copy under test/sql/live/ (generated with real values) is what
-# `make test_live` runs. This top-level file only proves load + registration.
-# ---------------------------------------------------------------------------
-require-env SHAREPOINT_TENANT_ID
-
-# (Live assertions are materialised into test/sql/live/ from a template at run
-# time so no credential is ever committed. See docs/hld.md §7.5.)
+# The live round trip is test/sql/sharepoint.live.template, materialised with
+# real ids by `make test_live`. NOTE: no `require-env` here -- sqllogictest
+# applies it to the WHOLE file wherever it appears, which silently skipped
+# every assertion above whenever credentials were absent.

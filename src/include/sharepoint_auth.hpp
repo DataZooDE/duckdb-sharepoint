@@ -23,10 +23,11 @@ struct AuthContext {
 	//! Graph base URL (sharepoint_graph_endpoint), no trailing slash.
 	string graph_endpoint;
 
-	//! Identity fingerprint (secret name + drive) -- the key any per-identity
-	//! cache (token, future block cache) must include so one tenant never sees
-	//! another's bytes. Mirrors the CacheKey security note in the sibling
-	//! gdrive extension.
+	//! Identity fingerprint: SHA-256 over the credential material, the Graph
+	//! cloud and the drive -- the key any per-identity cache (block cache) must
+	//! include so one principal never sees another's bytes. Never the secret's
+	//! name: a recreated or per-connection secret can reuse a name with
+	//! different credentials.
 	string identity;
 };
 
@@ -41,10 +42,6 @@ struct AuthContext {
 //!   * PROVIDER config with ACCESS_TOKEN -> used as-is (never refreshed).
 //!   * PROVIDER config with REFRESH_TOKEN -> grant_type=refresh_token.
 AuthContext GetAuthContext(ClientContext &context, const string &path);
-
-//! Drop any cached token for a secret -- called when a secret is dropped or
-//! recreated so a stale token is never reused.
-void InvalidateAuthCache(const string &secret_name);
 
 } // namespace sharepoint
 } // namespace duckdb

@@ -3,6 +3,7 @@
 #include "sharepoint_blockcache.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_glob.hpp"
+#include "sharepoint_identity.hpp"
 #include "sharepoint_rawhttp.hpp"
 #include "sharepoint_upload.hpp"
 #include "sharepoint_uri.hpp"
@@ -538,4 +539,58 @@ TEST_CASE("ranged reply acceptance", "[rawhttp]") {
 	REQUIRE_FALSE(AcceptRangeReply(200, "", body, 10, 5));
 	body = "x";
 	REQUIRE_FALSE(AcceptRangeReply(404, "", body, 0, 1));
+}
+
+// ---------------------------------------------------------------------------
+// Identity: which endpoints may receive credentials, and how credential
+// material is framed before it is hashed into a cache key.
+// ---------------------------------------------------------------------------
+TEST_CASE("only Microsoft cloud endpoints may receive credentials", "[identity]") {
+	// sharepoint_graph_endpoint / sharepoint_login_endpoint are session
+	// settings: without an allowlist any SQL user could point them at a host
+	// they control and receive bearer tokens -- or the client secret itself.
+	for (const char *ok : {"https://graph.microsoft.com", "https://graph.microsoft.com/", "https://graph.microsoft.us",
+	                       "https://dod-graph.microsoft.us", "https://microsoftgraph.chinacloudapi.cn",
+	                       "HTTPS://Graph.Microsoft.com"}) {
+		INFO(ok);
+		REQUIRE(IsAllowedGraphEndpoint(ok));
+	}
+	for (const char *ok : {"https://login.microsoftonline.com", "https://login.microsoftonline.us",
+	                       "https://login.partner.microsoftonline.cn", "https://login.chinacloudapi.cn"}) {
+		INFO(ok);
+		REQUIRE(IsAllowedLoginEndpoint(ok));
+	}
+	for (const char *bad :
+	     {"http://graph.microsoft.com", "https://graph.microsoft.com.evil.example", "https://evil.example",
+	      "https://graph.microsoft.com:8443", "https://graph.microsoft.com/v1.0", "https://user@graph.microsoft.com",
+	      "https://login.microsoftonline.com", ""}) {
+		INFO(bad);
+		REQUIRE_FALSE(IsAllowedGraphEndpoint(bad));
+	}
+	REQUIRE_FALSE(IsAllowedLoginEndpoint("https://graph.microsoft.com"));
+	REQUIRE_FALSE(IsAllowedLoginEndpoint("http://login.microsoftonline.com"));
+}
+
+TEST_CASE("credential material framing is unambiguous", "[identity]") {
+	// "a|b" + "c" and "a" + "b|c" must never frame to the same key material.
+	REQUIRE(FrameCredentialMaterial({"a|b", "c"}) != FrameCredentialMaterial({"a", "b|c"}));
+	REQUIRE(FrameCredentialMaterial({"ab", ""}) != FrameCredentialMaterial({"a", "b"}));
+	REQUIRE(FrameCredentialMaterial({"", ""}) != FrameCredentialMaterial({""}));
+	REQUIRE(FrameCredentialMaterial({"x", "y"}) == FrameCredentialMaterial({"x", "y"}));
+}
+
+TEST_CASE("the default scope follows the Graph cloud", "[identity]") {
+	REQUIRE(DefaultGraphScope("https://graph.microsoft.com") == "https://graph.microsoft.com/.default");
+	REQUIRE(DefaultGraphScope("https://graph.microsoft.us/") == "https://graph.microsoft.us/.default");
+}
+
+TEST_CASE("tenant ids are a GUID or a domain", "[identity]") {
+	// The tenant is spliced into the token URL path: "/<tenant>/oauth2/...".
+	REQUIRE(IsValidTenantId("72f988bf-86f1-41af-91ab-2d7cd011db47"));
+	REQUIRE(IsValidTenantId("contoso.onmicrosoft.com"));
+	REQUIRE(IsValidTenantId("organizations"));
+	for (const char *bad : {"", "a/b", "x?y", "x#y", "..", "a b", "contoso.com/../evil", "%2e%2e"}) {
+		INFO(bad);
+		REQUIRE_FALSE(IsValidTenantId(bad));
+	}
 }
