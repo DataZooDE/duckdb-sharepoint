@@ -20,9 +20,14 @@ namespace sharepoint {
 //! 320 KiB -- the granularity Graph requires for every non-final chunk.
 constexpr std::uint64_t kGraphUploadChunkMultiple = 327680;
 
-//! Round `requested` DOWN to a positive multiple of 320 KiB. Never returns 0: a
-//! request below one multiple is clamped up to a single 320-KiB chunk, so the
-//! loop always makes progress.
+//! Largest chunk Graph accepts: every request must be under 60 MiB, so the
+//! biggest 320-KiB multiple below that (192 * 320 KiB = 60 MiB is already too
+//! big).
+constexpr std::uint64_t kGraphUploadChunkMax = 191 * kGraphUploadChunkMultiple;
+
+//! Round `requested` DOWN to a positive multiple of 320 KiB, at most
+//! kGraphUploadChunkMax. Never returns 0: a request below one multiple is
+//! clamped up to a single 320-KiB chunk, so the loop always makes progress.
 std::uint64_t NormalizeUploadChunkSize(std::uint64_t requested);
 
 //! The value for a chunk's Content-Range request header, end-inclusive:

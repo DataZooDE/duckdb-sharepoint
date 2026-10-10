@@ -48,7 +48,9 @@ idx_t UploadChunkBytes(ClientContext &context) {
 idx_t BlockSizeBytes(ClientContext &context) {
 	Value v;
 	if (context.TryGetCurrentSetting("sharepoint_block_size_bytes", v) && !v.IsNull()) {
-		return v.GetValue<idx_t>();
+		// Capped: each block is one ranged GET held in memory, so an unbounded
+		// value would turn every small read into a whole-file download.
+		return MinValue<idx_t>(v.GetValue<idx_t>(), 64ULL * 1024 * 1024);
 	}
 	return 8ULL * 1024 * 1024;
 }

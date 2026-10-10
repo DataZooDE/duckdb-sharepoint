@@ -47,23 +47,29 @@ std::shared_ptr<SharepointBlockCache::Block> SharepointBlockCache::AcquireBlock(
 
 void SharepointBlockCache::AccountAndEvict(const std::string &just_loaded_key, const std::shared_ptr<Block> &blk) {
 	std::lock_guard<std::mutex> g(mtx);
-	// A block a failed fetch already Forget()-ed is no longer in the map: it
-	// serves only the read that loaded it and must not be counted.
+	// A block a failed fetch already Forget()-ed -- or one evicted by now, see
+	// below -- is no longer in the map: it serves only the read that loaded it
+	// and must not be counted.
 	auto cur = blocks.find(just_loaded_key);
 	if (cur == blocks.end() || cur->second != blk) {
 		return;
 	}
+	// Counting and becoming evictable happen together, under mtx: eviction only
+	// ever subtracts bytes that were added. (Deciding eviction on `loaded`,
+	// which is written under the block's load_mtx, let another thread evict a
+	// block and subtract its bytes before they were added -- the unsigned
+	// counter then wrapped. It was also a data race; TSan flagged it.)
+	blk->accounted = true;
 	resident_bytes += blk->data.size();
-	// Evict least-recently-used LOADED blocks until back within budget. A block
-	// still loading is skipped, not waited on: its bytes are not yet counted,
-	// so leaving it resident is safe, and stopping at it would let one slow or
-	// failing fetch at the LRU tail wedge eviction for the whole process.
+	// Evict least-recently-used accounted blocks until back within budget.
+	// Blocks still loading are not yet accounted and are skipped, so one slow or
+	// failing fetch at the LRU tail cannot wedge eviction.
 	auto it = lru.end();
 	while (resident_bytes > max_bytes && it != lru.begin()) {
 		--it;
 		const std::string victim = *it;
 		auto vit = blocks.find(victim);
-		if (vit == blocks.end() || !vit->second->loaded || victim == just_loaded_key) {
+		if (vit == blocks.end() || !vit->second->accounted || victim == just_loaded_key) {
 			continue;
 		}
 		resident_bytes -= vit->second->data.size();

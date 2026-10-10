@@ -7,6 +7,9 @@ namespace duckdb {
 namespace sharepoint {
 
 std::uint64_t NormalizeUploadChunkSize(std::uint64_t requested) {
+	if (requested > kGraphUploadChunkMax) {
+		return kGraphUploadChunkMax;
+	}
 	std::uint64_t rounded = (requested / kGraphUploadChunkMultiple) * kGraphUploadChunkMultiple;
 	return rounded == 0 ? kGraphUploadChunkMultiple : rounded;
 }

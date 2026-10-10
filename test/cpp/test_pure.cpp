@@ -11,7 +11,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
 #include <cstdint>
+#include <atomic>
 #include <map>
+#include <thread>
 #include <vector>
 
 using namespace duckdb::sharepoint;
@@ -166,6 +168,12 @@ TEST_CASE("upload chunk size rounds down to a 320 KiB multiple", "[upload]") {
 	// Below one multiple clamps up, never to zero -- the loop must progress.
 	REQUIRE(NormalizeUploadChunkSize(1) == kGraphUploadChunkMultiple);
 	REQUIRE(NormalizeUploadChunkSize(0) == kGraphUploadChunkMultiple);
+	// Graph rejects any single request of 60 MiB or more: clamp to the largest
+	// 320-KiB multiple below that, so one SET cannot make every upload fail.
+	REQUIRE(kGraphUploadChunkMax < 60ull * 1024 * 1024);
+	REQUIRE(kGraphUploadChunkMax % kGraphUploadChunkMultiple == 0);
+	REQUIRE(NormalizeUploadChunkSize(1ull << 40) == kGraphUploadChunkMax);
+	REQUIRE(NormalizeUploadChunkSize(60ull * 1024 * 1024) == kGraphUploadChunkMax);
 }
 
 TEST_CASE("content-range header is byte-inclusive", "[upload]") {
@@ -329,6 +337,44 @@ TEST_CASE("a failed block fetch is not cached and does not wedge eviction", "[bl
 	cache.Read("f", 100, 300, 200, 100, &out[0], fetch);
 	REQUIRE(fetches == 4);
 	REQUIRE(cache.ResidentBytes() <= 150);
+}
+
+TEST_CASE("block cache accounting stays exact under concurrent loads", "[blockcache][concurrency]") {
+	// Many threads load and evict blocks of several files through a cache that
+	// holds only two blocks. Accounting and eviction must agree exactly: a
+	// block evicted before its own bytes were counted used to drive the
+	// unsigned resident counter below zero (wrapping) or past the budget.
+	const std::uint64_t kBlock = 64;
+	const std::string file(kBlock * 4, 'b');
+	auto fetch = [&](std::uint64_t off, std::uint64_t len) {
+		std::this_thread::yield();
+		return file.substr(off, len);
+	};
+	SharepointBlockCache cache(2 * kBlock);
+	std::atomic<bool> bad {false};
+	std::vector<std::thread> threads;
+	for (int t = 0; t < 8; t++) {
+		threads.emplace_back([&, t] {
+			std::string out(kBlock, '\0');
+			for (int i = 0; i < 3000; i++) {
+				const std::string key = "f" + std::to_string((t + i) % 5);
+				const std::uint64_t block = static_cast<std::uint64_t>((i * 7 + t) % 4);
+				cache.Read(key, kBlock, file.size(), block * kBlock, kBlock, &out[0], fetch);
+				if (out != file.substr(block * kBlock, kBlock)) {
+					bad = true;
+				}
+				const auto resident = cache.ResidentBytes();
+				if (resident > 4 * kBlock || resident % kBlock != 0) {
+					bad = true; // wrapped, or over budget by more than in-flight loads
+				}
+			}
+		});
+	}
+	for (auto &th : threads) {
+		th.join();
+	}
+	REQUIRE_FALSE(bad);
+	REQUIRE(cache.ResidentBytes() <= 2 * kBlock);
 }
 
 TEST_CASE("block cache evicts LRU when over budget", "[blockcache]") {

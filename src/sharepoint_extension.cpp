@@ -63,17 +63,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// (10 MiB) is a multiple and a common recommendation.
 	loader.GetDatabaseInstance().config.AddExtensionOption(
 	    "sharepoint_upload_chunk_bytes",
-	    "Chunk size for resumable uploads of files larger than 4 MiB (default 10 MiB). Must be a "
-	    "multiple of 327680 (320 KiB) per the Graph upload-session contract.",
+	    "Files up to this size upload in one PUT; larger ones use a resumable session in chunks of "
+	    "this size (default 10 MiB), rounded down to a multiple of 320 KiB and capped below 60 MiB "
+	    "per the Graph upload-session contract.",
 	    LogicalType::UBIGINT, Value::UBIGINT(10ULL * 1024 * 1024));
 
 	// Like gdrive's block cache: a ranged read pays a round trip regardless of
 	// size, so a larger block amortises fewer requests. 0 disables and reads
-	// exact ranges. Caching is a documented follow-up (see docs/hld.md); the
-	// option is declared now so enabling it later is not a config break.
+	// exact ranges. Served by SharepointBlockCache (sharepoint_blockcache.*).
 	loader.GetDatabaseInstance().config.AddExtensionOption(
 	    "sharepoint_block_size_bytes",
-	    "Block size for cached reads (default 8 MiB, 0 to disable and read exact ranges).",
+	    "Block size for cached reads (default 8 MiB, at most 64 MiB; 0 disables the cache and reads "
+	    "exact ranges).",
 	    LogicalType::UBIGINT, Value::UBIGINT(8ULL * 1024 * 1024));
 
 	// Suppresses the per-open metadata refresh for prefixes whose files are
