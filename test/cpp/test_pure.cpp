@@ -63,6 +63,19 @@ TEST_CASE("id: form parses and forbids trailing segments", "[uri]") {
 	REQUIRE_FALSE(ParseSharepointUri("sharepoint://id:abc/oops").ok); // a real typo still rejects
 }
 
+TEST_CASE("id: values are restricted to Graph's id alphabet", "[uri]") {
+	// The id is spliced into /items/<id> URLs (including DELETE), so anything
+	// that could change the URL's meaning is refused at parse time.
+	REQUIRE(ParseSharepointUri("sharepoint://id:01KNPSQFNSEEL3YBPKXNGZ3JSQ5W7MTKIC").ok);
+	REQUIRE(ParseSharepointUri("sharepoint://id:b!AbC-d_e.f").ok);
+	for (const char *bad : {"sharepoint://id:..", "sharepoint://id:.", "sharepoint://id:x?$expand=children",
+	                        "sharepoint://id:x#frag", "sharepoint://id:%2F..", "sharepoint://id:a b",
+	                        "sharepoint://id:x&y", "sharepoint://id:x;y"}) {
+		INFO(bad);
+		REQUIRE_FALSE(ParseSharepointUri(bad).ok);
+	}
+}
+
 TEST_CASE("non-sharepoint URIs are rejected", "[uri]") {
 	REQUIRE_FALSE(IsSharepointUri("s3://bucket/x"));
 	REQUIRE_FALSE(ParseSharepointUri("gdrive://a/b").ok);

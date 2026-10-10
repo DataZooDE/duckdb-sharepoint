@@ -356,15 +356,12 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 bool GraphClient::DeleteItem(const string &item_id, bool permanent) {
 	auto cli = MakeClient(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
-	// A plain DELETE moves the item to the recycle bin. "Permanent" delete has
-	// no single documented Graph verb for SharePoint drives; the closest is
-	// DELETE with the Prefer: permanent-delete header (OneDrive) -- kept behind
-	// the flag and marked for live verification.
-	if (permanent) {
-		h.emplace("Prefer", "permanent-delete");
-	}
-	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id;
-	auto res = cli.Delete(path.c_str(), h);
+	const string item_path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id;
+	// A plain DELETE moves the item to the site's recycle bin. Permanent deletion
+	// is its own Graph action, POST .../permanentDelete (a `Prefer` header on
+	// DELETE is not part of the contract and was silently ignored).
+	auto res = permanent ? cli.Post((item_path + "/permanentDelete").c_str(), h, "", "application/json")
+	                     : cli.Delete(item_path.c_str(), h);
 	if (!res) {
 		throw IOException("sharepoint: delete of id '%s' failed at the transport layer", item_id.c_str());
 	}
@@ -377,29 +374,45 @@ bool GraphClient::DeleteItem(const string &item_id, bool permanent) {
 	return true;
 }
 
+namespace {
+
+//! Split a root-relative path into its parent path and final name.
+void SplitParent(const string &root_relative, string &parent, string &name) {
+	auto slash = root_relative.find_last_of('/');
+	parent = (slash == string::npos) ? string() : root_relative.substr(0, slash);
+	name = (slash == string::npos) ? root_relative : root_relative.substr(slash + 1);
+}
+
+} // namespace
+
 void GraphClient::MoveByPath(const string &source_root_relative, const string &target_root_relative) {
-	// Resolve the source id, then PATCH its parentReference + name. Split the
-	// target into parent path and final name.
 	auto src = StatByPath(source_root_relative);
 	if (!src.found) {
 		throw IOException("sharepoint: move source '%s' does not exist", source_root_relative.c_str());
 	}
-	auto slash = target_root_relative.find_last_of('/');
-	string parent = (slash == string::npos) ? string() : target_root_relative.substr(0, slash);
-	string name = (slash == string::npos) ? target_root_relative : target_root_relative.substr(slash + 1);
-
-	// parentReference by path: "/drives/{drive}/root:/{parent}"
-	string parent_ref = "/drives/" + auth.drive_id + "/root:";
-	if (!parent.empty()) {
-		parent_ref += "/" + parent;
+	string parent, name;
+	SplitParent(target_root_relative, parent, name);
+	// Address the new parent by drive + item id rather than by a path string:
+	// nothing user-controlled is interpreted as a path inside the body, and the
+	// item can only ever move within this secret's drive.
+	auto dest_parent = StatByPath(parent);
+	if (!dest_parent.found || !dest_parent.is_folder) {
+		throw IOException("sharepoint: move target folder '%s' does not exist", parent.c_str());
 	}
-	// A minimal JSON body. picojson could build it, but the shape is fixed.
-	string body = "{\"parentReference\":{\"path\":\"" + parent_ref + "\"},\"name\":\"" + name + "\"}";
+	picojson::object parent_ref;
+	parent_ref["driveId"] = picojson::value(auth.drive_id);
+	parent_ref["id"] = picojson::value(dest_parent.id);
+	picojson::object body;
+	body["parentReference"] = picojson::value(parent_ref);
+	body["name"] = picojson::value(name);
 
 	auto cli = MakeClient(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
-	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + src.id;
-	auto res = cli.Patch(path.c_str(), h, body, "application/json");
+	// Replace an existing target, as a local rename does. DuckDB's COPY writes a
+	// tmp_ file and moves it onto the final name, so without this every re-run
+	// of a COPY fails with 409 nameAlreadyExists.
+	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + src.id + "?@microsoft.graph.conflictBehavior=replace";
+	auto res = cli.Patch(path.c_str(), h, picojson::value(body).serialize(), "application/json");
 	if (!res || res->status < 200 || res->status >= 300) {
 		ThrowGraph("move '" + source_root_relative + "' -> '" + target_root_relative + "'",
 		           res ? res->status : 0, res ? res->body : string());
@@ -407,26 +420,34 @@ void GraphClient::MoveByPath(const string &source_root_relative, const string &t
 }
 
 void GraphClient::CreateFolder(const string &root_relative_path) {
-	auto slash = root_relative_path.find_last_of('/');
-	string parent = (slash == string::npos) ? string() : root_relative_path.substr(0, slash);
-	string name = (slash == string::npos) ? root_relative_path : root_relative_path.substr(slash + 1);
+	string parent, name;
+	SplitParent(root_relative_path, parent, name);
 
 	auto cli = MakeClient(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	string path = parent.empty()
 	                  ? "/v1.0/drives/" + auth.drive_id + "/root/children"
 	                  : "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(parent) + ":/children";
-	// conflictBehavior=fail so a pre-existing folder is a 409 we can tolerate,
+	// conflictBehavior=fail so a pre-existing item is a 409 we then inspect,
 	// never a duplicate.
-	string body = "{\"name\":\"" + name +
-	              "\",\"folder\":{},\"@microsoft.graph.conflictBehavior\":\"fail\"}";
-	auto res = cli.Post(path.c_str(), h, body, "application/json");
+	picojson::object body;
+	body["name"] = picojson::value(name);
+	body["folder"] = picojson::value(picojson::object());
+	body["@microsoft.graph.conflictBehavior"] = picojson::value(string("fail"));
+	auto res = cli.Post(path.c_str(), h, picojson::value(body).serialize(), "application/json");
 	if (!res) {
 		throw IOException("sharepoint: create folder '%s' failed at the transport layer",
 		                  root_relative_path.c_str());
 	}
 	if (res->status == 409) {
-		return; // already exists -- idempotent
+		// Idempotent only if what exists is a FOLDER; a file of that name is a
+		// real conflict.
+		auto existing = StatByPath(root_relative_path);
+		if (existing.found && existing.is_folder) {
+			return;
+		}
+		throw IOException("sharepoint: cannot create folder '%s': a file with that name exists",
+		                  root_relative_path.c_str());
 	}
 	if (res->status < 200 || res->status >= 300) {
 		ThrowGraph("create folder '" + root_relative_path + "'", res->status, res->body);

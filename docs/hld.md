@@ -169,6 +169,35 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
    community-extensions submission, and a signing key (`DUCKDB_EXTENSION_SIGNING_PK`)
    if a signed build is ever wanted.
 
+## 7a. Discovered on the first live runs (2026-10-10)
+
+Things the Graph docs do not tell you, each found against a real tenant and
+each guarded by a test so it is not rediscovered:
+
+- **Signed URLs must be sent byte for byte.** `GET .../items/{id}/content`
+  302s to `https://<tenant>.sharepoint.com/.../download.aspx?UniqueId=..&
+  Translate=false&tempauth=..&ApiVersion=2.0`; the upload session's
+  `uploadUrl` has the same shape. SharePoint validates the query string AS
+  SENT: re-encoding it is fine, but **any reordering is a 401**. cpp-httplib
+  0.27 (bundled with DuckDB 1.5) parses every request query into a key-sorted
+  `std::multimap` and re-serialises it, with no option to opt out, so these
+  URLs go through `sharepoint_preauth.cpp` (raw TLS, verbatim target) instead.
+  DuckDB 1.4's httplib 0.14 sent paths verbatim. The download host also accepts
+  the request with or without the Graph bearer; we never send it there.
+- **The download host is not reachable with a Graph token directly** —
+  `/_api/v2.x/drives/.../content` on the tenant host is a 401 for a
+  `graph.microsoft.com` audience token, so the redirect is unavoidable.
+- **`Prefer: permanent-delete` is ignored** on SharePoint drives (the item goes
+  to the recycle bin). Permanent deletion is `POST .../items/{id}/permanentDelete`.
+- **DuckDB's COPY moves a `tmp_` file onto the final name**, so a move must send
+  `?@microsoft.graph.conflictBehavior=replace`, or every re-run of a COPY is a
+  409 `nameAlreadyExists`.
+- **SharePoint forbids `" * : < > ? / \ |` in names** (Graph answers 400). JSON
+  bodies are still built with picojson; the legal "hostile" set (`' # % + & ;
+  { }`, spaces, non-ASCII) round-trips and is in the live suite.
+- **DuckDB 1.5's Parquet reader calls `GetLastModifiedTime`**; it is served from
+  `lastModifiedDateTime` (RFC 3339).
+
 ## 8. Two-actor note
 
 The extension binary is built and released from **this** repo (ghcr / the

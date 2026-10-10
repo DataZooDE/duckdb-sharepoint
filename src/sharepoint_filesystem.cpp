@@ -286,12 +286,21 @@ void SharepointFileSystem::RemoveDirectory(const string &directory, optional_ptr
 	// Graph deletes a folder and its contents).
 	auto uri = ParseOrThrow(directory);
 	auto &context = RequireContext(opener, "remove directory");
+	if (uri.kind != SharepointUriKind::PATH || uri.RootRelativePath().empty()) {
+		// The empty path is the drive root: a recursive delete of the whole
+		// library is never what `remove directory` on a URI typo should do.
+		throw IOException("sharepoint: refusing to remove '%s' (the drive root, or not a folder path)", directory);
+	}
 	auto auth = GetAuthContext(context, directory);
 	GraphClient client(auth);
 	auto meta = client.StatByPath(uri.RootRelativePath());
-	if (meta.found) {
-		client.DeleteItem(meta.id, PermanentDelete(context));
+	if (!meta.found) {
+		return;
 	}
+	if (!meta.is_folder) {
+		throw IOException("sharepoint: '%s' is a file, not a directory", directory);
+	}
+	client.DeleteItem(meta.id, PermanentDelete(context));
 }
 
 bool SharepointFileSystem::ListFiles(const string &directory,
@@ -315,6 +324,14 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 	}
 	auto &context = RequireContext(opener, "move");
 	auto auth = GetAuthContext(context, source);
+	// The target may fall under a different secret (scoped secrets) and hence a
+	// different drive. Graph moves within one drive here; silently moving into
+	// the SOURCE's drive instead would put the file somewhere nobody asked for.
+	auto target_auth = GetAuthContext(context, target);
+	if (target_auth.identity != auth.identity) {
+		throw IOException("sharepoint: cannot move '%s' to '%s': they resolve to different secrets or drives",
+		                  source, target);
+	}
 	GraphClient(auth).MoveByPath(src.RootRelativePath(), dst.RootRelativePath());
 }
 

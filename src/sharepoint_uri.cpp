@@ -102,6 +102,22 @@ SharepointUriParse ParseSharepointUri(const std::string &uri) {
 			               uri + "'";
 			return result;
 		}
+		// The id is spliced into /items/<id> URLs (DELETE included), so only
+		// Graph's id alphabet passes: anything else (?, #, %, ., ..) could
+		// change which URL is requested.
+		bool id_ok = id != "." && id != "..";
+		for (char c : id) {
+			if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '!' ||
+			      c == '-' || c == '_' || c == '.')) {
+				id_ok = false;
+			}
+		}
+		if (!id_ok) {
+			result.error = "the sharepoint://id: form takes a Graph item id (letters, digits, '!', '-', '_', "
+			               "'.'): '" +
+			               uri + "'";
+			return result;
+		}
 		result.uri.kind = SharepointUriKind::FILE_ID;
 		result.uri.item_id = id;
 		result.ok = true;

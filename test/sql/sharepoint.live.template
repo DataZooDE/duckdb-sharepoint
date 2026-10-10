@@ -202,6 +202,84 @@ SELECT file_size('sharepoint://_duckdb_sharepoint_live/staging.tmp') IS NULL;
 true
 
 # ---------------------------------------------------------------------------
+# 7. COPY re-run onto an existing file. DuckDB writes a tmp_ file and MOVES it
+#    onto the final name; without conflictBehavior=replace the second run is a
+#    409 (crew finding F8). Section 3 already wrote nums.parquet once.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT 42 AS id, 0 AS v) TO 'sharepoint://_duckdb_sharepoint_live/data/nums.parquet' (FORMAT parquet);
+
+query I
+SELECT sum(id) FROM read_parquet('sharepoint://_duckdb_sharepoint_live/data/nums.parquet');
+----
+42
+
+# ---------------------------------------------------------------------------
+# 8. Hostile names. Names used to be concatenated into the move /
+#    create-folder JSON bodies unescaped (crew finding F6). SharePoint itself
+#    forbids " * : < > ? / \ | in names, so the legal hostile set is
+#    ' # % + & ; { } spaces and non-ASCII -- which also exercises path encoding.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/odd/staging.tmp', 'odd'::BLOB);
+
+query I
+SELECT move_file('sharepoint://_duckdb_sharepoint_live/odd/staging.tmp',
+                 'sharepoint://_duckdb_sharepoint_live/odd/it''s #1 %41+b & ünï;{x}.txt');
+----
+true
+
+query I
+SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live/odd/it''s #1 %41+b & ünï;{x}.txt');
+----
+odd
+
+# A name SharePoint forbids is Graph's clean 400, not a malformed request.
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/odd/staging2.tmp', 'odd'::BLOB);
+
+statement error
+SELECT move_file('sharepoint://_duckdb_sharepoint_live/odd/staging2.tmp',
+                 'sharepoint://_duckdb_sharepoint_live/odd/q"uote.txt');
+----
+HTTP 400
+
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/odd/staging2.tmp');
+
+# A folder with a hostile name, created implicitly by write_blob.
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/odd/f''ol #der/x.txt', 'x'::BLOB);
+
+query I
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/odd/f''ol #der/x.txt');
+----
+1
+
+# ---------------------------------------------------------------------------
+# 9. Permanent delete uses Graph's permanentDelete action (the old
+#    `Prefer: permanent-delete` header was silently ignored -> recycle bin).
+# ---------------------------------------------------------------------------
+statement ok
+SET sharepoint_permanent_delete = true;
+
+query I
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/odd/f''ol #der/x.txt');
+----
+true
+
+query I
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/odd/f''ol #der/x.txt') IS NULL;
+----
+true
+
+statement ok
+RESET sharepoint_permanent_delete;
+
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/odd/it''s #1 %41+b & ünï;{x}.txt');
+
+# ---------------------------------------------------------------------------
 # Best-effort teardown of the leaf files. Empty fixture folders may remain; the
 # next run replaces every file in place, so a lingering tree is harmless.
 # ---------------------------------------------------------------------------
