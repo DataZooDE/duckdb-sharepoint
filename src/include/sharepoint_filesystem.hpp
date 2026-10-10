@@ -65,6 +65,16 @@ public:
 	~SharepointFileSystem() override = default;
 
 	bool CanHandleFile(const string &fpath) override;
+#ifndef SHAREPOINT_DUCKDB_LTS
+	//! sharepoint:// paths are already canonical. The base implementation
+	//! collapses "//" for any scheme missing from DuckDB's hard-coded list of
+	//! remote prefixes, which turned `ATTACH 'sharepoint://a/db.duckdb'` into
+	//! "sharepoint:/a/db.duckdb" and "database does not exist". (DuckDB 1.5+;
+	//! 1.4 does not canonicalize ATTACH paths.)
+	string CanonicalizePath(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		return path;
+	}
+#endif
 	std::string GetName() const override {
 		return "SharepointFileSystem";
 	}

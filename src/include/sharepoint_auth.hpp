@@ -1,10 +1,11 @@
 #pragma once
 
+#include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/string.hpp"
 
 namespace duckdb {
 
-class ClientContext;
+class FileOpener;
 
 namespace sharepoint {
 
@@ -31,6 +32,10 @@ struct AuthContext {
 	string identity;
 };
 
+//! Resolve through the FileOpener, not a ClientContext: DuckDB opens an
+//! ATTACHed database file with a database-level opener that has no client
+//! connection, and secrets and settings are still reachable through it.
+//!
 //! Resolve the `sharepoint` secret in scope for `path`, obtaining (and
 //! caching until it nears expiry) a bearer token. Throws a DuckDB exception
 //! with a fix-teaching message when no secret matches, credentials are
@@ -41,13 +46,13 @@ struct AuthContext {
 //!     with grant_type=client_credentials & scope={graph_scope}.
 //!   * PROVIDER config with ACCESS_TOKEN -> used as-is (never refreshed).
 //!   * PROVIDER config with REFRESH_TOKEN -> grant_type=refresh_token.
-AuthContext GetAuthContext(ClientContext &context, const string &path);
+AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path);
 
 //! True if any `sharepoint` secret exists at all (whatever its scope). Lets
 //! FileExists answer core's speculative probes with false when the extension
 //! is simply unconfigured, while user-facing calls still get the loud
 //! "no secret configured" error from GetAuthContext.
-bool HasAnySharepointSecret(ClientContext &context);
+bool HasAnySharepointSecret(optional_ptr<FileOpener> opener);
 
 } // namespace sharepoint
 } // namespace duckdb

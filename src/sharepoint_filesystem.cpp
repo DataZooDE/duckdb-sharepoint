@@ -32,25 +32,27 @@ SharepointUri ParseOrThrow(const string &path) {
 	return parsed.uri;
 }
 
-ClientContext &RequireContext(optional_ptr<FileOpener> opener, const char *op) {
-	auto context = FileOpener::TryGetClientContext(opener.get());
-	if (!context) {
-		throw IOException("sharepoint: %s needs an active connection context but none was available", op);
+// Secrets and settings are resolved through the opener, which works for a
+// client connection AND for the database-level opener DuckDB uses when it
+// opens an ATTACHed database file (which has no ClientContext).
+optional_ptr<FileOpener> RequireOpener(optional_ptr<FileOpener> opener, const char *op) {
+	if (!FileOpener::TryGetSecretManager(opener)) {
+		throw IOException("sharepoint: %s needs a database context to look up secrets, but none was available", op);
 	}
-	return *context;
+	return opener;
 }
 
-idx_t UploadChunkBytes(ClientContext &context) {
+idx_t UploadChunkBytes(optional_ptr<FileOpener> opener) {
 	Value v;
-	if (context.TryGetCurrentSetting("sharepoint_upload_chunk_bytes", v) && !v.IsNull()) {
+	if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_upload_chunk_bytes", v) && !v.IsNull()) {
 		return v.GetValue<idx_t>();
 	}
 	return 10ULL * 1024 * 1024;
 }
 
-idx_t BlockSizeBytes(ClientContext &context) {
+idx_t BlockSizeBytes(optional_ptr<FileOpener> opener) {
 	Value v;
-	if (context.TryGetCurrentSetting("sharepoint_block_size_bytes", v) && !v.IsNull()) {
+	if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_block_size_bytes", v) && !v.IsNull()) {
 		// Capped: each block is one ranged GET held in memory, so an unbounded
 		// value would turn every small read into a whole-file download.
 		return MinValue<idx_t>(v.GetValue<idx_t>(), 64ULL * 1024 * 1024);
@@ -58,9 +60,9 @@ idx_t BlockSizeBytes(ClientContext &context) {
 	return 8ULL * 1024 * 1024;
 }
 
-string ImmutablePrefixes(ClientContext &context) {
+string ImmutablePrefixes(optional_ptr<FileOpener> opener) {
 	Value v;
-	if (context.TryGetCurrentSetting("sharepoint_immutable_prefixes", v) && !v.IsNull()) {
+	if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_immutable_prefixes", v) && !v.IsNull()) {
 		return v.ToString();
 	}
 	return string();
@@ -83,9 +85,9 @@ void CheckCreatableNames(const SharepointUri &uri, const string &path) {
 	}
 }
 
-bool PermanentDelete(ClientContext &context) {
+bool PermanentDelete(optional_ptr<FileOpener> opener) {
 	Value v;
-	if (context.TryGetCurrentSetting("sharepoint_permanent_delete", v) && !v.IsNull()) {
+	if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_permanent_delete", v) && !v.IsNull()) {
 		return v.GetValue<bool>();
 	}
 	return false;
@@ -150,7 +152,7 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
                                                       optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		auto uri = ParseOrThrow(path);
-		auto &context = RequireContext(opener, "open");
+		auto context = RequireOpener(opener, "open");
 		auto auth = GetAuthContext(context, path);
 
 		if (flags.OpenForAppending()) {
@@ -339,15 +341,14 @@ bool SharepointFileSystem::FileExists(const string &filename, optional_ptr<FileO
 	// Speculative probes during binding may arrive with no opener; answer
 	// false rather than throw (the leniency sharepoint_vfs_functions.cpp's
 	// ConfirmedAbsent accounts for).
-	auto context = FileOpener::TryGetClientContext(opener.get());
-	if (!context || !HasAnySharepointSecret(*context)) {
+	if (!HasAnySharepointSecret(opener)) {
 		return false;
 	}
 	auto parsed = ParseSharepointUri(filename);
 	if (!parsed.ok) {
 		return false;
 	}
-	auto auth = GetAuthContext(*context, filename);
+	auto auth = GetAuthContext(opener, filename);
 	GraphClient client(auth);
 	auto meta = (parsed.uri.kind == SharepointUriKind::FILE_ID) ? client.StatById(parsed.uri.item_id)
 	                                                            : client.StatByPath(parsed.uri.RootRelativePath());
@@ -355,8 +356,7 @@ bool SharepointFileSystem::FileExists(const string &filename, optional_ptr<FileO
 }
 
 bool SharepointFileSystem::DirectoryExists(const string &directory, optional_ptr<FileOpener> opener) {
-	auto context = FileOpener::TryGetClientContext(opener.get());
-	if (!context || !HasAnySharepointSecret(*context)) {
+	if (!HasAnySharepointSecret(opener)) {
 		return false;
 	}
 	auto parsed = ParseSharepointUri(directory);
@@ -366,7 +366,7 @@ bool SharepointFileSystem::DirectoryExists(const string &directory, optional_ptr
 	if (parsed.uri.RootRelativePath().empty()) {
 		return true; // the drive root always exists
 	}
-	auto auth = GetAuthContext(*context, directory);
+	auto auth = GetAuthContext(opener, directory);
 	GraphClient client(auth);
 	auto meta = client.StatByPath(parsed.uri.RootRelativePath());
 	return meta.found && meta.is_folder;
@@ -376,7 +376,7 @@ void SharepointFileSystem::CreateDirectory(const string &directory, optional_ptr
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		auto uri = ParseOrThrow(directory);
 		CheckCreatableNames(uri, directory);
-		auto &context = RequireContext(opener, "create directory");
+		auto context = RequireOpener(opener, "create directory");
 		auto auth = GetAuthContext(context, directory);
 		GraphClient(auth).CreateFolder(uri.RootRelativePath());
 	});
@@ -387,7 +387,7 @@ void SharepointFileSystem::RemoveDirectory(const string &directory, optional_ptr
 		// A directory is a driveItem too; resolve and delete it (recursively, as
 		// Graph deletes a folder and its contents).
 		auto uri = ParseOrThrow(directory);
-		auto &context = RequireContext(opener, "remove directory");
+		auto context = RequireOpener(opener, "remove directory");
 		if (uri.kind != SharepointUriKind::PATH || uri.RootRelativePath().empty()) {
 			// The empty path is the drive root: a recursive delete of the whole
 			// library is never what `remove directory` on a URI typo should do.
@@ -412,7 +412,7 @@ bool SharepointFileSystem::ListFiles(const string &directory,
                                      FileOpener *opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		auto uri = ParseOrThrow(directory);
-		auto &context = RequireContext(opener, "list files");
+		auto context = RequireOpener(opener, "list files");
 		auto auth = GetAuthContext(context, directory);
 		bool found = false;
 		auto children = GraphClient(auth).ListChildren(uri.RootRelativePath(), &found);
@@ -432,7 +432,7 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 			throw IOException("sharepoint: move addresses paths on both sides, not id: forms");
 		}
 		CheckCreatableNames(dst, target);
-		auto &context = RequireContext(opener, "move");
+		auto context = RequireOpener(opener, "move");
 		auto auth = GetAuthContext(context, source);
 		// The target may fall under a different secret (scoped secrets) and hence a
 		// different drive. Graph moves within one drive here; silently moving into
@@ -451,7 +451,7 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 void SharepointFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		auto uri = ParseOrThrow(filename);
-		auto &context = RequireContext(opener, "remove");
+		auto context = RequireOpener(opener, "remove");
 		auto auth = GetAuthContext(context, filename);
 		GraphClient client(auth);
 		string id;
@@ -486,7 +486,7 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 			result.emplace_back(path);
 			return result;
 		}
-		auto &context = RequireContext(opener, "glob");
+		auto context = RequireOpener(opener, "glob");
 		auto auth = GetAuthContext(context, path);
 		GraphClient client(auth);
 

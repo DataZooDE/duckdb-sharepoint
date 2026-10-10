@@ -16,6 +16,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/file_opener.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -141,16 +142,21 @@ picojson::object PostToken(const string &login_endpoint, const string &tenant,
 // destroyed. Returning `const KeyValueSecret &` here was a use-after-free that
 // surfaced on the first live run as "the secret gives neither DRIVE_ID nor
 // SITE_ID" for a secret that plainly had one.
-SecretMatch LookupSecret(ClientContext &context, const string &path) {
-	auto &secret_manager = SecretManager::Get(context);
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-	auto match = secret_manager.LookupSecret(transaction, path, kSecretTypeName);
+SecretMatch LookupSecret(optional_ptr<FileOpener> opener, const string &path) {
+	auto secret_manager = FileOpener::TryGetSecretManager(opener);
+	auto transaction = FileOpener::TryGetCatalogTransaction(opener);
+	if (!secret_manager || !transaction) {
+		throw InvalidInputException("sharepoint: '%s' was opened without a database context, so no secret can be "
+		                            "looked up",
+		                            path);
+	}
+	auto match = secret_manager->LookupSecret(*transaction, path, kSecretTypeName);
 	if (!match.HasMatch()) {
 		// A secret may EXIST and still not apply: DuckDB's SCOPE clause limits
 		// which paths a secret covers, and SCOPE is easy to reach for when the
 		// OAuth scope (GRAPH_SCOPE) was meant. "No secret configured" would send
 		// that user off to create a second one that does not match either.
-		if (HasAnySharepointSecret(context)) {
+		if (HasAnySharepointSecret(opener)) {
 			throw InvalidInputException(
 			    "sharepoint: a `sharepoint` secret exists, but none applies to '%s'. A secret's SCOPE clause "
 			    "limits which paths it covers (the OAuth scope option is GRAPH_SCOPE, not SCOPE). Check: "
@@ -215,18 +221,18 @@ string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint
 
 } // namespace
 
-AuthContext GetAuthContext(ClientContext &context, const string &path) {
-	const auto match = LookupSecret(context, path);
+AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) {
+	const auto match = LookupSecret(opener, path);
 	const auto &secret = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
 
 	string login_endpoint = "https://login.microsoftonline.com";
 	string graph_endpoint = "https://graph.microsoft.com";
 	{
 		Value v;
-		if (context.TryGetCurrentSetting("sharepoint_login_endpoint", v) && !v.IsNull()) {
+		if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_login_endpoint", v) && !v.IsNull()) {
 			login_endpoint = v.ToString();
 		}
-		if (context.TryGetCurrentSetting("sharepoint_graph_endpoint", v) && !v.IsNull()) {
+		if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_graph_endpoint", v) && !v.IsNull()) {
 			graph_endpoint = v.ToString();
 		}
 	}
@@ -331,10 +337,13 @@ AuthContext GetAuthContext(ClientContext &context, const string &path) {
 	return auth;
 }
 
-bool HasAnySharepointSecret(ClientContext &context) {
-	auto &secret_manager = SecretManager::Get(context);
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-	for (const auto &entry : secret_manager.AllSecrets(transaction)) {
+bool HasAnySharepointSecret(optional_ptr<FileOpener> opener) {
+	auto secret_manager = FileOpener::TryGetSecretManager(opener);
+	auto transaction = FileOpener::TryGetCatalogTransaction(opener);
+	if (!secret_manager || !transaction) {
+		return false;
+	}
+	for (const auto &entry : secret_manager->AllSecrets(*transaction)) {
 		if (entry.secret && entry.secret->GetType() == kSecretTypeName) {
 			return true;
 		}
