@@ -1,6 +1,7 @@
 #include "sharepoint_counters.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <cstddef>
 
 namespace duckdb {
