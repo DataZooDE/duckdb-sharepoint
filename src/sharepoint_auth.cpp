@@ -8,6 +8,7 @@
 // cache would serve one principal's token to another (the bug the sibling
 // gdrive documents and fixed the same way).
 #include "sharepoint_auth.hpp"
+#include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_identity.hpp"
 #include "sharepoint_secret.hpp"
@@ -92,6 +93,7 @@ duckdb_httplib_openssl::Client MakeClient(const string &base_url) {
 // on any non-2xx.
 picojson::object PostToken(const string &login_endpoint, const string &tenant,
                            const duckdb_httplib_openssl::Params &params) {
+	IncrementCounter(Counter::TOKEN_REQUEST);
 	auto cli = MakeClient(login_endpoint);
 	string path = "/" + tenant + "/oauth2/v2.0/token";
 	auto res = cli.Post(path.c_str(), params);

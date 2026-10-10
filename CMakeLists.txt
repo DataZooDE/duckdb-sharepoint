@@ -52,6 +52,7 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_blockcache.cpp
     src/sharepoint_rawhttp.cpp
     src/sharepoint_identity.cpp
+    src/sharepoint_counters.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,7 @@ file(GLOB DUCKDB_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_auth.cpp
     src/sharepoint_client.cpp
     src/sharepoint_preauth.cpp
+    src/sharepoint_stats.cpp
     src/sharepoint_filesystem.cpp
     src/sharepoint_vfs_functions.cpp
 )

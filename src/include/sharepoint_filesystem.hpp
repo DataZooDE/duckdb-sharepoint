@@ -4,6 +4,8 @@
 #include "sharepoint_client.hpp"
 
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/common/mutex.hpp"
+#include "duckdb/common/unordered_map.hpp"
 
 #include <cstdint>
 
@@ -101,6 +103,10 @@ public:
 		return false;
 	}
 
+	//! Forget cached metadata for "<identity>|<root-relative path>" and everything
+	//! beneath it (a folder). Called after every write, move and delete we make.
+	void InvalidateMeta(const string &key);
+
 	//! Graph cannot write at an offset or trim in place; both throw.
 	void Truncate(FileHandle &handle, int64_t new_size) override;
 	bool Trim(FileHandle &handle, idx_t offset_bytes, idx_t length_bytes) override;
@@ -110,6 +116,17 @@ private:
 	//! DatabaseInstance, so the cache spans every ClientContext. Keys carry the
 	//! caller identity + cTag so it is never a cross-tenant or cross-version leak.
 	SharepointBlockCache block_cache;
+
+	//! Metadata of files under sharepoint_immutable_prefixes, keyed
+	//! "<identity>|<root-relative path>": the user promised those files are
+	//! never rewritten in place, so a remembered stat cannot be stale and the
+	//! per-open Graph round trip is skipped (gdrive_immutable_prefixes does the
+	//! same). Our own writes, moves and deletes invalidate entries; anything
+	//! done to those files by OTHER clients is the user's promise to keep.
+	mutex meta_cache_lock;
+	unordered_map<string, DriveItemMeta> meta_cache;
+	bool MetaCacheGet(const string &key, DriveItemMeta &out);
+	void MetaCachePut(const string &key, const DriveItemMeta &meta);
 };
 
 } // namespace sharepoint

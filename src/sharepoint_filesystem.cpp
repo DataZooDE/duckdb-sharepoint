@@ -5,6 +5,7 @@
 // implemented, but nothing here has run against a live tenant yet.
 #include "sharepoint_filesystem.hpp"
 #include "sharepoint_uri.hpp"
+#include "sharepoint_counters.hpp"
 #include "sharepoint_glob.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -55,6 +56,18 @@ idx_t BlockSizeBytes(ClientContext &context) {
 	return 8ULL * 1024 * 1024;
 }
 
+string ImmutablePrefixes(ClientContext &context) {
+	Value v;
+	if (context.TryGetCurrentSetting("sharepoint_immutable_prefixes", v) && !v.IsNull()) {
+		return v.ToString();
+	}
+	return string();
+}
+
+//! Entries the immutable-prefix metadata cache may hold before it is simply
+//! cleared: a few hundred bytes each, so ~5 MB worst case.
+constexpr idx_t kMaxMetaCacheEntries = 20000;
+
 bool PermanentDelete(ClientContext &context) {
 	Value v;
 	if (context.TryGetCurrentSetting("sharepoint_permanent_delete", v) && !v.IsNull()) {
@@ -77,9 +90,41 @@ void SharepointFileHandle::Close() {
 	// creates an empty file, matching local-fs semantics. PutContent chooses a
 	// single PUT vs. a resumable session by comparing the buffer to
 	// upload_chunk_bytes (captured at open time).
+	is_write = false;
 	GraphClient client(auth);
 	client.PutContent(write_root_relative, write_buffer, upload_chunk_bytes);
-	is_write = false;
+	static_cast<SharepointFileSystem &>(file_system).InvalidateMeta(auth.identity + "|" + write_root_relative);
+}
+
+bool SharepointFileSystem::MetaCacheGet(const string &key, DriveItemMeta &out) {
+	lock_guard<mutex> guard(meta_cache_lock);
+	auto it = meta_cache.find(key);
+	if (it == meta_cache.end()) {
+		return false;
+	}
+	out = it->second;
+	return true;
+}
+
+void SharepointFileSystem::MetaCachePut(const string &key, const DriveItemMeta &meta) {
+	lock_guard<mutex> guard(meta_cache_lock);
+	if (meta_cache.size() >= kMaxMetaCacheEntries) {
+		meta_cache.clear(); // crude but bounded; a miss only costs one stat
+	}
+	meta_cache[key] = meta;
+}
+
+void SharepointFileSystem::InvalidateMeta(const string &key) {
+	lock_guard<mutex> guard(meta_cache_lock);
+	meta_cache.erase(key);
+	const string folder_prefix = key + "/";
+	for (auto it = meta_cache.begin(); it != meta_cache.end();) {
+		if (it->first.compare(0, folder_prefix.size(), folder_prefix) == 0) {
+			it = meta_cache.erase(it);
+		} else {
+			++it;
+		}
+	}
 }
 
 bool SharepointFileSystem::CanHandleFile(const string &fpath) {
@@ -103,10 +148,22 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 		return std::move(handle);
 	}
 
-	// Read: resolve metadata once.
-	GraphClient client(auth);
-	DriveItemMeta meta = (uri.kind == SharepointUriKind::FILE_ID) ? client.StatById(uri.item_id)
-	                                                              : client.StatByPath(uri.RootRelativePath());
+	// Read: resolve metadata once -- or not at all, for a file under a prefix
+	// the user declared immutable whose metadata we already hold.
+	const string prefixes = uri.kind == SharepointUriKind::PATH ? ImmutablePrefixes(context) : string();
+	const bool immutable = !prefixes.empty() && PathMatchesAnyPrefix(path, prefixes);
+	const string meta_key = auth.identity + "|" + uri.RootRelativePath();
+	DriveItemMeta meta;
+	if (immutable && MetaCacheGet(meta_key, meta)) {
+		IncrementCounter(Counter::META_CACHE_HIT);
+	} else {
+		GraphClient client(auth);
+		meta = (uri.kind == SharepointUriKind::FILE_ID) ? client.StatById(uri.item_id)
+		                                                : client.StatByPath(uri.RootRelativePath());
+		if (immutable && meta.found && !meta.is_folder) {
+			MetaCachePut(meta_key, meta);
+		}
+	}
 	if (!meta.found || meta.is_folder) {
 		if (flags.ReturnNullIfNotExists()) {
 			return nullptr;
@@ -303,6 +360,7 @@ void SharepointFileSystem::RemoveDirectory(const string &directory, optional_ptr
 		throw IOException("sharepoint: '%s' is a file, not a directory", directory);
 	}
 	client.DeleteItem(meta.id, PermanentDelete(context));
+	InvalidateMeta(auth.identity + "|" + uri.RootRelativePath());
 }
 
 bool SharepointFileSystem::ListFiles(const string &directory,
@@ -335,6 +393,8 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 		                  source, target);
 	}
 	GraphClient(auth).MoveByPath(src.RootRelativePath(), dst.RootRelativePath());
+	InvalidateMeta(auth.identity + "|" + src.RootRelativePath());
+	InvalidateMeta(auth.identity + "|" + dst.RootRelativePath());
 }
 
 void SharepointFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
@@ -353,6 +413,9 @@ void SharepointFileSystem::RemoveFile(const string &filename, optional_ptr<FileO
 		id = meta.id;
 	}
 	client.DeleteItem(id, PermanentDelete(context));
+	if (uri.kind == SharepointUriKind::PATH) {
+		InvalidateMeta(auth.identity + "|" + uri.RootRelativePath());
+	}
 }
 
 vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *opener) {

@@ -5,6 +5,7 @@
 // a live tenant. The resumable upload-session path in PutContent is the least
 // exercised and is marked inline.
 #include "sharepoint_client.hpp"
+#include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_preauth.hpp"
 #include "sharepoint_rawhttp.hpp"
@@ -160,10 +161,15 @@ template <class Send>
 duckdb_httplib_openssl::Result SendWithRetry(Send send) {
 	for (int attempt = 1;; attempt++) {
 		auto res = send();
-		const bool retryable = !res || IsRetryable(ClassifyGraphError(res->status, ErrorCode(res->body)));
+		const auto kind = res ? ClassifyGraphError(res->status, ErrorCode(res->body)) : GraphErrorKind::OTHER;
+		if (kind == GraphErrorKind::THROTTLED) {
+			IncrementCounter(Counter::THROTTLED);
+		}
+		const bool retryable = !res || IsRetryable(kind);
 		if (!retryable || attempt >= kMaxGraphAttempts) {
 			return res;
 		}
+		IncrementCounter(Counter::RETRY);
 		SleepBeforeRetry(attempt, res ? ParseRetryAfterSeconds(res->get_header_value("Retry-After")) : 0);
 	}
 }
@@ -240,6 +246,7 @@ bool QueryUploadResumeOffset(const string &upload_url, idx_t &resume_at) {
 } // namespace
 
 DriveItemMeta GraphClient::StatByPath(const string &root_relative_path) {
+	IncrementCounter(Counter::STAT);
 	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	string path = root_relative_path.empty()
@@ -264,6 +271,7 @@ DriveItemMeta GraphClient::StatByPath(const string &root_relative_path) {
 }
 
 DriveItemMeta GraphClient::StatById(const string &item_id) {
+	IncrementCounter(Counter::STAT);
 	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id +
@@ -290,6 +298,7 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 	if (length <= 0) {
 		return; // "bytes=o-(o-1)" is not a valid range; nothing to fetch.
 	}
+	IncrementCounter(Counter::READ_RANGE);
 	auto &cli = GraphConnection(auth.graph_endpoint);
 	string range = "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + length - 1);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}, {"Range", range}};
@@ -337,6 +346,7 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 				}
 				break;
 			}
+			IncrementCounter(Counter::RETRY);
 			SleepBeforeRetry(attempt, transport_error.empty() ? ParseRetryAfterSeconds(dl.Header("Retry-After")) : 0);
 		}
 		status = dl.status;
@@ -354,6 +364,7 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 			                  (unsigned long long)body.size());
 		}
 		out = std::move(body);
+		IncrementCounter(Counter::BYTES_READ, out.size());
 		return;
 	}
 	ThrowGraph("read id '" + item_id + "'", status, body);
@@ -368,6 +379,8 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 	// MiB, so switch at the configured chunk size.
 	if (bytes.size() <= chunk_bytes) {
 		string path = "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) + ":/content";
+		IncrementCounter(Counter::UPLOAD_PUT);
+		IncrementCounter(Counter::BYTES_WRITTEN, bytes.size());
 		auto res = SendWithRetry([&] { return cli.Put(path.c_str(), h, bytes, "application/octet-stream"); });
 		if (!res) {
 			throw IOException("sharepoint: upload of '%s' failed at the transport layer",
@@ -392,6 +405,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 	string session_path =
 	    "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) + ":/createUploadSession";
 	string session_body = "{\"item\":{\"@microsoft.graph.conflictBehavior\":\"replace\"}}";
+	IncrementCounter(Counter::UPLOAD_SESSION);
 	auto sres = SendWithRetry([&] { return cli.Post(session_path.c_str(), h, session_body, "application/json"); });
 	if (!sres || sres->status < 200 || sres->status >= 300) {
 		ThrowGraph("createUploadSession '" + root_relative_path + "'", sres ? sres->status : 0,
@@ -428,6 +442,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 		idx_t len = std::min<idx_t>(chunk, total - offset);
 		RawHttpResponse res;
 		bool transport_ok = true;
+		IncrementCounter(Counter::UPLOAD_CHUNK);
 		try {
 			res = PreauthenticatedRequest("PUT", upload_url,
 			                              {{"Content-Range", UploadContentRange(offset, len, total)},
@@ -442,6 +457,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 
 		// 200/201 come back only on the FINAL chunk, and carry the driveItem.
 		if (transport_ok && (res.status == 200 || res.status == 201)) {
+			IncrementCounter(Counter::BYTES_WRITTEN, len);
 			picojson::value v;
 			if (!picojson::parse(v, res.body).empty() || !v.is<picojson::object>()) {
 				throw IOException("sharepoint: resumable upload of '%s' returned no item metadata",
@@ -451,6 +467,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 		}
 		// 202 Accepted: this chunk landed and Graph now expects the next range.
 		if (transport_ok && res.status == 202) {
+			IncrementCounter(Counter::BYTES_WRITTEN, len);
 			offset += len;
 			failures = 0;
 			continue;
@@ -461,6 +478,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 		// already stored is safe, so a resume that returns the same offset is fine.
 		bool retryable = !transport_ok || IsRetryable(ClassifyGraphError(res.status, ErrorCode(res.body)));
 		if (retryable && ++failures <= kMaxUploadChunkRetries) {
+			IncrementCounter(Counter::RETRY);
 			SleepBeforeRetry(failures, transport_ok ? ParseRetryAfterSeconds(res.Header("Retry-After")) : 0);
 			idx_t resume_at = offset;
 			if (QueryUploadResumeOffset(upload_url, resume_at) && resume_at <= total) {
@@ -482,6 +500,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 }
 
 bool GraphClient::DeleteItem(const string &item_id, bool permanent) {
+	IncrementCounter(Counter::DELETE_ITEM);
 	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	const string item_path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id;
@@ -542,6 +561,7 @@ void GraphClient::MoveByPath(const string &source_root_relative, const string &t
 	// tmp_ file and moves it onto the final name, so without this every re-run
 	// of a COPY fails with 409 nameAlreadyExists.
 	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + src.id + "?@microsoft.graph.conflictBehavior=replace";
+	IncrementCounter(Counter::MOVE);
 	auto res = SendWithRetry([&] { return cli.Patch(path.c_str(), h, picojson::value(body).serialize(), "application/json"); });
 	if (!res || res->status < 200 || res->status >= 300) {
 		ThrowGraph("move '" + source_root_relative + "' -> '" + target_root_relative + "'",
@@ -550,6 +570,7 @@ void GraphClient::MoveByPath(const string &source_root_relative, const string &t
 }
 
 void GraphClient::CreateFolder(const string &root_relative_path) {
+	IncrementCounter(Counter::CREATE_FOLDER);
 	string parent, name;
 	SplitParent(root_relative_path, parent, name);
 
@@ -593,6 +614,7 @@ vector<ChildEntry> GraphClient::ListChildren(const string &folder_root_relative_
 	                  : "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(folder_root_relative_path) +
 	                        ":/children?$select=name,folder,file&$top=200";
 	while (!next.empty()) {
+		IncrementCounter(Counter::LIST_PAGE);
 		auto res = SendWithRetry([&] { return cli.Get(next.c_str(), h); });
 		if (!res) {
 			throw IOException("sharepoint: list of '%s' failed at the transport layer",

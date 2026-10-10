@@ -2,6 +2,7 @@
 
 #include "sharepoint_extension.hpp"
 #include "sharepoint_filesystem.hpp"
+#include "sharepoint_stats.hpp"
 #include "sharepoint_version.hpp"
 #include "sharepoint_vfs_functions.hpp"
 
@@ -96,6 +97,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// for the one caveat: do not load this AND duckdb-gdrive into the same
 	// process, since both register the same four names.
 	sharepoint::RegisterVfsFunctions(loader);
+	sharepoint::RegisterSharepointStats(loader);
 }
 
 void SharepointExtension::Load(ExtensionLoader &loader) {

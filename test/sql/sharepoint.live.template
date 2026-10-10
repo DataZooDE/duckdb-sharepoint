@@ -312,6 +312,50 @@ CREATE OR REPLACE SECRET sp_live (
 );
 
 # ---------------------------------------------------------------------------
+# 11. sharepoint_stats() and sharepoint_immutable_prefixes. A read costs a stat
+#     for the glob and one for the open; under a declared-immutable prefix the
+#     open's stat is served from the metadata cache. Our own rewrite
+#     invalidates it, so the new content is read.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/imm/a.txt', 'abc'::BLOB);
+
+statement ok
+SET sharepoint_immutable_prefixes = 'sharepoint://_duckdb_sharepoint_live/imm';
+
+# First read under the prefix: both stats go to Graph, and fill the cache.
+statement ok
+SELECT content FROM read_blob('sharepoint://_duckdb_sharepoint_live/imm/a.txt');
+
+statement ok
+CALL sharepoint_reset_stats();
+
+query T
+SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live/imm/a.txt');
+----
+abc
+
+query II
+SELECT (SELECT value FROM sharepoint_stats() WHERE metric = 'stat'),
+       (SELECT value FROM sharepoint_stats() WHERE metric = 'meta_cache_hits');
+----
+1	1
+
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/imm/a.txt', 'abcdef'::BLOB);
+
+query I
+SELECT octet_length(content) FROM read_blob('sharepoint://_duckdb_sharepoint_live/imm/a.txt');
+----
+6
+
+statement ok
+RESET sharepoint_immutable_prefixes;
+
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/imm/a.txt');
+
+# ---------------------------------------------------------------------------
 # Best-effort teardown of the leaf files. Empty fixture folders may remain; the
 # next run replaces every file in place, so a lingering tree is harmless.
 # ---------------------------------------------------------------------------

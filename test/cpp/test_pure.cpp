@@ -1,6 +1,7 @@
 // Catch2 pure-logic tests. No DuckDB linkage, no network, no credentials --
 // runnable by anyone who can build. `make unit_test`.
 #include "sharepoint_blockcache.hpp"
+#include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_glob.hpp"
 #include "sharepoint_identity.hpp"
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <atomic>
 #include <map>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -644,5 +646,27 @@ TEST_CASE("tenant ids are a GUID or a domain", "[identity]") {
 	for (const char *bad : {"", "a/b", "x?y", "x#y", "..", "a b", "contoso.com/../evil", "%2e%2e"}) {
 		INFO(bad);
 		REQUIRE_FALSE(IsValidTenantId(bad));
+	}
+}
+
+TEST_CASE("call counters count, snapshot by name and reset", "[counters]") {
+	ResetCounters();
+	IncrementCounter(Counter::STAT);
+	IncrementCounter(Counter::STAT);
+	IncrementCounter(Counter::BYTES_READ, 4096);
+	std::map<std::string, std::uint64_t> snap;
+	std::set<std::string> names;
+	for (const auto &kv : SnapshotCounters()) {
+		snap[kv.first] = kv.second;
+		names.insert(kv.first);
+		REQUIRE(std::string(kv.first) != "unknown"); // every counter is named
+	}
+	REQUIRE(names.size() == static_cast<std::size_t>(Counter::COUNT_)); // names are unique
+	REQUIRE(snap["stat"] == 2);
+	REQUIRE(snap["bytes_read"] == 4096);
+	REQUIRE(snap["read_range"] == 0);
+	ResetCounters();
+	for (const auto &kv : SnapshotCounters()) {
+		REQUIRE(kv.second == 0);
 	}
 }
