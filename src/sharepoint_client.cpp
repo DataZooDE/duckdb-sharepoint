@@ -407,7 +407,10 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 	// Small file: a single PUT to the content endpoint. Graph permits up to
 	// 250 MiB this way, but the resumable session is more robust past a few
 	// MiB, so switch at the configured chunk size.
-	if (bytes.size() <= chunk_bytes) {
+	// The threshold is the NORMALIZED chunk size (a 320-KiB multiple under 60
+	// MiB): the raw setting could send a file far beyond Graph's single-PUT
+	// limit in one request (413, after five full-body attempts).
+	if (bytes.size() <= NormalizeUploadChunkSize(chunk_bytes)) {
 		string path = "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) + ":/content";
 		IncrementCounter(Counter::UPLOAD_PUT);
 		IncrementCounter(Counter::BYTES_WRITTEN, bytes.size());
@@ -432,6 +435,23 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 	//   then PUT each chunk to uploadUrl with a Content-Range header; the final
 	//   chunk's response carries the driveItem.
 	// Chunks MUST be a multiple of 320 KiB except the last (Graph contract).
+	// What was there before, so a lost reply to the FINAL chunk can be told
+	// apart from a failed upload (see VerifyCommitted below).
+	const DriveItemMeta before = StatByPath(root_relative_path);
+	// The final chunk's reply can be lost after Graph committed the file; the
+	// session is then gone, so resuming fails and a re-PUT is rejected. If the
+	// item now has our size and a different eTag than before, it is ours.
+	// (A concurrent writer of exactly the same size is the residual ambiguity.)
+	auto verify_committed = [&](idx_t total_size, DriveItemMeta &out) -> bool {
+		auto now = StatByPath(root_relative_path);
+		if (now.found && !now.is_folder && static_cast<idx_t>(now.size) == total_size &&
+		    (!before.found || now.etag != before.etag)) {
+			out = now;
+			return true;
+		}
+		return false;
+	};
+
 	string session_path =
 	    "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) + ":/createUploadSession";
 	string session_body = "{\"item\":{\"@microsoft.graph.conflictBehavior\":\"replace\"}}";
@@ -515,6 +535,12 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 				offset = resume_at;
 			}
 			continue;
+		}
+		if (offset + len == total) {
+			DriveItemMeta committed;
+			if (verify_committed(total, committed)) {
+				return committed;
+			}
 		}
 		if (!transport_ok) {
 			throw IOException("sharepoint: upload chunk of '%s' failed after %d attempts: %s",

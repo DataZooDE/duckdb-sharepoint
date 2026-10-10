@@ -53,9 +53,14 @@ idx_t UploadChunkBytes(optional_ptr<FileOpener> opener) {
 idx_t BlockSizeBytes(optional_ptr<FileOpener> opener) {
 	Value v;
 	if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_block_size_bytes", v) && !v.IsNull()) {
-		// Capped: each block is one ranged GET held in memory, so an unbounded
-		// value would turn every small read into a whole-file download.
-		return MinValue<idx_t>(v.GetValue<idx_t>(), 64ULL * 1024 * 1024);
+		const auto requested = v.GetValue<idx_t>();
+		if (requested == 0) {
+			return 0; // cache disabled: exact ranges
+		}
+		// Clamped to [64 KiB, 64 MiB]: each block is one ranged GET held in
+		// memory, so an unbounded value turns small reads into whole-file
+		// downloads, and a tiny one costs a redirect + TLS handshake per block.
+		return MaxValue<idx_t>(64ULL * 1024, MinValue<idx_t>(requested, 64ULL * 1024 * 1024));
 	}
 	return 8ULL * 1024 * 1024;
 }
@@ -129,6 +134,17 @@ void SharepointFileSystem::MetaCachePut(const string &key, const DriveItemMeta &
 		meta_cache.clear(); // crude but bounded; a miss only costs one stat
 	}
 	meta_cache[key] = meta;
+}
+
+void SharepointFileSystem::InvalidateMetaById(const string &item_id) {
+	lock_guard<mutex> guard(meta_cache_lock);
+	for (auto it = meta_cache.begin(); it != meta_cache.end();) {
+		if (it->second.id == item_id) {
+			it = meta_cache.erase(it);
+		} else {
+			++it;
+		}
+	}
 }
 
 void SharepointFileSystem::InvalidateMeta(const string &key) {
@@ -451,22 +467,29 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 void SharepointFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		auto uri = ParseOrThrow(filename);
+		if (uri.kind == SharepointUriKind::PATH && uri.RootRelativePath().empty()) {
+			throw IOException("sharepoint: refusing to remove '%s': it is the drive root", filename);
+		}
 		auto context = RequireOpener(opener, "remove");
 		auto auth = GetAuthContext(context, filename);
 		GraphClient client(auth);
-		string id;
-		if (uri.kind == SharepointUriKind::FILE_ID) {
-			id = uri.item_id;
-		} else {
-			auto meta = client.StatByPath(uri.RootRelativePath());
-			if (!meta.found) {
-				return; // already gone
-			}
-			id = meta.id;
+		// RemoveFile removes FILES. Graph's DELETE on a folder is recursive, so
+		// any caller of the FileSystem API (not only remove_file, which checks)
+		// could otherwise delete a whole subtree -- permanently, with
+		// sharepoint_permanent_delete.
+		auto meta = uri.kind == SharepointUriKind::FILE_ID ? client.StatById(uri.item_id)
+		                                                   : client.StatByPath(uri.RootRelativePath());
+		if (!meta.found) {
+			return; // already gone
 		}
-		client.DeleteItem(id, PermanentDelete(context));
+		if (meta.is_folder) {
+			throw IOException("sharepoint: '%s' is a directory, not a file", filename);
+		}
+		client.DeleteItem(meta.id, PermanentDelete(context));
 		if (uri.kind == SharepointUriKind::PATH) {
 			InvalidateMeta(auth.identity + "|" + uri.RootRelativePath());
+		} else {
+			InvalidateMetaById(meta.id);
 		}
 	});
 }

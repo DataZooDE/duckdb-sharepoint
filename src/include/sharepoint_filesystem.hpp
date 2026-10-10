@@ -116,6 +116,9 @@ public:
 	//! Forget cached metadata for "<identity>|<root-relative path>" and everything
 	//! beneath it (a folder). Called after every write, move and delete we make.
 	void InvalidateMeta(const string &key);
+	//! Same, for every entry describing item `item_id` (a delete by id: form
+	//! does not know the path it was cached under).
+	void InvalidateMetaById(const string &item_id);
 
 	//! Graph cannot write at an offset or trim in place; both throw.
 	void Truncate(FileHandle &handle, int64_t new_size) override;
