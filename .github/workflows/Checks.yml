@@ -107,9 +107,13 @@ jobs:
       # artifact is stamped for a version that does not exist.
       - name: Fetch duckdb tags (DuckDB versions itself from git describe)
         run: git -C duckdb fetch --tags --force origin
-      - name: Install vcpkg
+      # Pinned to the commit extension-ci-tools' v1.5 distribution uses, never
+      # HEAD: the live job holds tenant secrets, so nothing it runs may float.
+      - name: Install vcpkg (pinned)
         run: |
-          git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          git init -q "$HOME/vcpkg"
+          git -C "$HOME/vcpkg" fetch -q --depth 1 https://github.com/microsoft/vcpkg.git 84bab45d415d22042bd0b9081aea57f362da3f35
+          git -C "$HOME/vcpkg" checkout -q FETCH_HEAD
           "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
           echo "VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
@@ -129,6 +133,7 @@ jobs:
         run: |
           curl -sSLo /tmp/duckdb.zip \
             https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
+          echo "6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f  /tmp/duckdb.zip" | sha256sum -c -
           unzip -q -o /tmp/duckdb.zip -d /tmp/duckdb-cli
           sudo install -m 0755 /tmp/duckdb-cli/duckdb /usr/local/bin/duckdb
           duckdb -noheader -list -c "SELECT version();"
@@ -144,20 +149,19 @@ jobs:
     # `secrets` is not available in job-level `if`, so gate on the event:
     # fork PRs have a head repo different from the base repo.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    env:
-      SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
-      SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
-      SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
-      SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - name: Fetch duckdb tags (DuckDB versions itself from git describe)
         run: git -C duckdb fetch --tags --force origin
-      - name: Install vcpkg
+      # Pinned to the commit extension-ci-tools' v1.5 distribution uses, never
+      # HEAD: the live job holds tenant secrets, so nothing it runs may float.
+      - name: Install vcpkg (pinned)
         run: |
-          git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          git init -q "$HOME/vcpkg"
+          git -C "$HOME/vcpkg" fetch -q --depth 1 https://github.com/microsoft/vcpkg.git 84bab45d415d22042bd0b9081aea57f362da3f35
+          git -C "$HOME/vcpkg" checkout -q FETCH_HEAD
           "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
           echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
           echo "VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
@@ -168,12 +172,25 @@ jobs:
       # Fails loudly when the secrets are absent -- a missing secret must not
       # look like a passing live suite.
       - name: Live SQL tests
+        env:
+          # Step-scoped, not job-wide: the build steps above never see them.
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
         run: make test_live
       - name: Install stock duckdb v1.5.6
         run: |
           curl -sSLo /tmp/duckdb.zip \
             https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
+          echo "6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f  /tmp/duckdb.zip" | sha256sum -c -
           unzip -q -o /tmp/duckdb.zip -d /tmp/duckdb-cli
           sudo install -m 0755 /tmp/duckdb-cli/duckdb /usr/local/bin/duckdb
       - name: Shipped artifact reaches real Graph from a stock duckdb
+        env:
+          # Step-scoped, not job-wide: the build steps above never see them.
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
         run: make smoke_loadable
