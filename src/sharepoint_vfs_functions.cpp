@@ -100,7 +100,7 @@ void EnsureParentDirectories(FileSystem &fs, const string &target) {
 
 // The inverse of core's read_blob(). FILE_CREATE_NEW gives overwrite
 // semantics; FILE_CREATE would leave a tail of longer previous content behind.
-// A single Write() call matters on sharepoint://, whose handle uploads on
+// A single Write() call matters on remote filesystems whose handle uploads on
 // close: one call is one upload, so the file appears complete or not at all.
 void WriteBlobScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &fs = FileSystem::GetFileSystem(state.GetContext());
@@ -149,8 +149,10 @@ void FileSizeScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 
 } // namespace
 
-// The four functions are scheme-generic and shared, byte for byte in
-// behaviour, with the sibling gdrive extension, which registers them too.
+// The four functions are scheme-generic and shared with the sibling gdrive
+// extension, which registers them too: KEEP THIS FILE IDENTICAL to
+// duckdb-gdrive/src/gdrive_vfs_functions.cpp up to the namespace and include
+// names (scripts/check_vfs_parity.sh compares them).
 // Registering with IGNORE_ON_CONFLICT lets both extensions load into one
 // database in either order: whichever loads second keeps the first's
 // (identical) definitions. Without it the second LOAD failed with
@@ -166,13 +168,14 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		desc.description =
 		    "Delete the file at `path`, returning true if it existed and was removed and false if it did "
 		    "not exist. Dispatches on the path's scheme through DuckDB's virtual filesystem, so it works "
-		    "for sharepoint://, s3://, gs:// and local paths alike. For a sharepoint:// path the item is "
-		    "moved to the recycle bin unless sharepoint_permanent_delete is set. Errors other than "
+		    "for local paths and for every remote scheme an extension registers (gdrive://, "
+		    "sharepoint://, s3://, ...). Remote stores may keep a deleted file in a trash or recycle bin "
+		    "(see the extension's *_permanent_delete setting). Folders are refused. Errors other than "
 		    "not-found are raised, not returned as false.";
 		desc.parameter_names = {"path"};
 		desc.parameter_types = {LogicalType::VARCHAR};
-		desc.examples = {"SELECT remove_file('sharepoint://reports/old.parquet')"};
-		desc.categories = {"sharepoint"};
+		desc.examples = {"SELECT remove_file('reports/old.parquet')"};
+		desc.categories = {"filesystem"};
 		info.descriptions.push_back(std::move(desc));
 		info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(info));
@@ -190,8 +193,8 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		    "fully-written temporary file under its final name.";
 		desc.parameter_names = {"source", "target"};
 		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
-		desc.examples = {"SELECT move_file('sharepoint://staging/part.tmp', 'sharepoint://data/part.parquet')"};
-		desc.categories = {"sharepoint"};
+		desc.examples = {"SELECT move_file('staging/part.tmp', 'data/part.parquet')"};
+		desc.categories = {"filesystem"};
 		info.descriptions.push_back(std::move(desc));
 		info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(info));
@@ -206,12 +209,12 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		write_desc.description =
 		    "Write `content` to `path`, replacing any existing file, and return the number of bytes "
 		    "written. The inverse of read_blob(): together they give SQL a byte-exact round trip for any "
-		    "filesystem DuckDB can reach, including sharepoint://. Accepts arbitrary binary content -- a "
+		    "filesystem DuckDB can reach, local or remote. Accepts arbitrary binary content -- a "
 		    "BLOB, not a VARCHAR.";
 		write_desc.parameter_names = {"path", "content"};
 		write_desc.parameter_types = {LogicalType::VARCHAR, LogicalType::BLOB};
-		write_desc.examples = {"SELECT write_blob('sharepoint://notes/readme.md', '# Title'::BLOB)"};
-		write_desc.categories = {"sharepoint"};
+		write_desc.examples = {"SELECT write_blob('notes/readme.md', '# Title'::BLOB)"};
+		write_desc.categories = {"filesystem"};
 		write_info.descriptions.push_back(std::move(write_desc));
 		write_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(write_info));
@@ -227,8 +230,8 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		    "read_blob, which downloads the body.";
 		size_desc.parameter_names = {"path"};
 		size_desc.parameter_types = {LogicalType::VARCHAR};
-		size_desc.examples = {"SELECT file_size('sharepoint://data/part.parquet')"};
-		size_desc.categories = {"sharepoint"};
+		size_desc.examples = {"SELECT file_size('data/part.parquet')"};
+		size_desc.categories = {"filesystem"};
 		size_info.descriptions.push_back(std::move(size_desc));
 		size_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(size_info));

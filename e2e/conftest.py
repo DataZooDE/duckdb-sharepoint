@@ -33,6 +33,16 @@ def _load_dotenv() -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def scrub(text: str) -> str:
+    """Remove credential values from text that may end up in a failure report
+    (and so in CI logs)."""
+    for name in ("SHAREPOINT_CLIENT_SECRET", "SHAREPOINT_CLIENT_ID",):
+        value = os.environ.get(name)
+        if value:
+            text = text.replace(value, f"<{name}>")
+    return text
+
+
 _load_dotenv()
 
 from helpers.graph import Graph, credentials_available  # noqa: E402
@@ -113,14 +123,16 @@ def sql(duckdb_cli: Path, isolated_home: dict):
         args = [str(duckdb_cli), "-noheader", "-list"]
         if db:
             args.append(db)
-        proc = subprocess.run(args + ["-c", statements], capture_output=True, text=True,
+        # Over stdin, never argv: a CREATE SECRET on the command line is
+        # readable by every user of the machine via ps / /proc.
+        proc = subprocess.run(args, input=statements, capture_output=True, text=True,
                               timeout=900, env=isolated_home)
         output = proc.stdout + proc.stderr
         if expect_error:
             if proc.returncode == 0:
-                raise AssertionError(f"expected an error, got success:\n{output}")
+                raise AssertionError(f"expected an error, got success:\n{scrub(output)}")
         elif proc.returncode != 0:
-            raise AssertionError(f"duckdb failed ({proc.returncode}):\n{output}")
+            raise AssertionError(f"duckdb failed ({proc.returncode}):\n{scrub(output)}")
         return output.strip()
 
     return _run
