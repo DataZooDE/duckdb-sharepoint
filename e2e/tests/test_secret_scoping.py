@@ -26,7 +26,8 @@ def site_scratch(graph):
         pytest.skip("SHAREPOINT_SITE_ID's default library is the DRIVE_ID library")
     other = type(graph)(graph.tenant, graph.client_id, graph.client_secret, site_drive)
     folder = f"_duckdb_sharepoint_e2e_site/run-{uuid.uuid4().hex[:12]}"
-    other.mkdir("_duckdb_sharepoint_e2e_site") if other.stat("_duckdb_sharepoint_e2e_site") is None else None
+    if other.stat("_duckdb_sharepoint_e2e_site") is None:
+        other.mkdir("_duckdb_sharepoint_e2e_site")
     other.mkdir(folder)
     try:
         yield site, other, folder

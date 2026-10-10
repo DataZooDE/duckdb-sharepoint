@@ -9,7 +9,10 @@
 #
 name: Checks
 on:
+  # main only: a same-repo PR branch already runs via pull_request, and the
+  # live job must not hit the tenant twice per push.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
   schedule:
@@ -19,7 +22,9 @@ on:
 
 concurrency:
   group: checks-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel a run on main mid-way: a cancelled live/e2e job leaks its
+  # scratch folders into the tenant.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -152,7 +157,9 @@ jobs:
     runs-on: ubuntu-latest
     # `secrets` is not available in job-level `if`, so gate on the event:
     # fork PRs have a head repo different from the base repo.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # Not on the nightly schedule (that only sweeps), and not for fork PRs,
+    # which cannot read secrets.
+    if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - uses: actions/checkout@v4
         with:

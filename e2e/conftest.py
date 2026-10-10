@@ -55,7 +55,8 @@ def scratch(graph: Graph):
     runs never collide; under one root so `make sweep_orphans` can find leaks.
     """
     path = f"{SCRATCH_ROOT}/run-{uuid.uuid4().hex[:12]}"
-    graph.mkdir(SCRATCH_ROOT) if graph.stat(SCRATCH_ROOT) is None else None
+    if graph.stat(SCRATCH_ROOT) is None:
+        graph.mkdir(SCRATCH_ROOT)
     graph.mkdir(path)
     try:
         yield path

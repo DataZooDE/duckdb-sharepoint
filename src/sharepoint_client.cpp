@@ -1,9 +1,6 @@
-// Microsoft Graph HTTP client.
-//
-// STATUS: network frontier of the scaffold (see sharepoint_auth.cpp's header).
-// Request shapes follow the Graph v1.0 driveItem docs; none has yet run against
-// a live tenant. The resumable upload-session path in PutContent is the least
-// exercised and is marked inline.
+// Microsoft Graph HTTP client. Every request shape here is proven against a
+// real tenant by the live SQL suite and the e2e harness; the non-obvious Graph
+// behaviours it works around are recorded in docs/hld.md section 7a.
 #include "sharepoint_client.hpp"
 #include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"

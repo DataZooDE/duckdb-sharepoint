@@ -1,8 +1,6 @@
-// The sharepoint:// virtual filesystem.
-//
-// STATUS: network frontier of the scaffold (see sharepoint_auth.cpp's header).
-// The DuckDB FileSystem method surface is complete and the Graph mapping is
-// implemented, but nothing here has run against a live tenant yet.
+// The sharepoint:// virtual filesystem: DuckDB's FileSystem API mapped onto
+// Graph driveItems (GraphClient), with the shared block cache for reads and
+// the immutable-prefix metadata cache. Proven by the live SQL suite and e2e.
 #include "sharepoint_filesystem.hpp"
 #include "sharepoint_banner.hpp"
 #include "sharepoint_uri.hpp"
