@@ -212,24 +212,6 @@ TEST_CASE("only https URLs are followed or uploaded to", "[upload]") {
 	REQUIRE_FALSE(IsHttpsUrl(""));
 }
 
-TEST_CASE("a 200 full-body reply is sliced to the requested range", "[upload]") {
-	// A server that ignores Range returns 200 with the WHOLE file; returning it
-	// as-is would hand a Parquet footer read the file's header bytes.
-	std::string body = "0123456789";
-	REQUIRE(SliceRangeFromFullBody(body, 3, 4));
-	REQUIRE(body == "3456");
-
-	body = "0123456789";
-	REQUIRE(SliceRangeFromFullBody(body, 0, 10));
-	REQUIRE(body == "0123456789");
-
-	// Too short to contain the range: refuse rather than return short bytes.
-	body = "0123";
-	REQUIRE_FALSE(SliceRangeFromFullBody(body, 2, 5));
-	body = "0123";
-	REQUIRE_FALSE(SliceRangeFromFullBody(body, 10, 1));
-}
-
 TEST_CASE("nextExpectedRanges start offset parses", "[upload]") {
 	std::uint64_t s = 999;
 	REQUIRE(ParseRangeStart("512-1023", s));
@@ -422,12 +404,12 @@ TEST_CASE("graph errors classify by status and code", "[errors]") {
 TEST_CASE("raw request keeps the target byte for byte", "[rawhttp]") {
 	std::string req;
 	const std::string target = "/_layouts/15/download.aspx?UniqueId=abc&Translate=false&tempauth=v1.x&ApiVersion=2.0";
-	REQUIRE(BuildRawHttpRequest("GET", "tenant.sharepoint.com", target, {{"Range", "bytes=0-4"}}, "", req));
+	REQUIRE(BuildRawHttpRequest("GET", "tenant.sharepoint.com", 443, target, {{"Range", "bytes=0-4"}}, "", req));
 	REQUIRE(req == "GET " + target +
 	                   " HTTP/1.1\r\nHost: tenant.sharepoint.com\r\nConnection: close\r\nRange: bytes=0-4\r\n"
 	                   "Content-Length: 0\r\n\r\n");
 
-	REQUIRE(BuildRawHttpRequest("PUT", "h", "/u?a=1", {}, "xyz", req));
+	REQUIRE(BuildRawHttpRequest("PUT", "h", 443, "/u?a=1", {}, "xyz", req));
 	REQUIRE(req.size() >= 3);
 	REQUIRE(req.substr(req.size() - 3) == "xyz");
 	REQUIRE(req.find("Content-Length: 3\r\n") != std::string::npos);
@@ -435,13 +417,13 @@ TEST_CASE("raw request keeps the target byte for byte", "[rawhttp]") {
 
 TEST_CASE("raw request refuses header and request-line injection", "[rawhttp]") {
 	std::string req;
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/a b", {}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/a\r\nX: y", {}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "no-leading-slash", {}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h\r\nX: y", "/", {}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/", {{"Range", "bytes=0-1\r\nEvil: 1"}}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/", {{"Bad Name", "v"}}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("G T", "h", "/", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/a b", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/a\r\nX: y", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "no-leading-slash", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h\r\nX: y", 443, "/", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/", {{"Range", "bytes=0-1\r\nEvil: 1"}}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/", {{"Bad Name", "v"}}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("G T", "h", 443, "/", {}, "", req));
 }
 
 TEST_CASE("raw response parses content-length, chunked and EOF bodies", "[rawhttp]") {
@@ -485,4 +467,75 @@ TEST_CASE("https origin splits into host and port", "[rawhttp]") {
 	REQUIRE_FALSE(SplitHttpsOrigin("https://h:0", host, port));
 	REQUIRE_FALSE(SplitHttpsOrigin("https://h:99999", host, port));
 	REQUIRE_FALSE(SplitHttpsOrigin("https://h:x", host, port));
+}
+
+TEST_CASE("raw request: reserved headers, non-ASCII values, Host port", "[rawhttp]") {
+	std::string req;
+	// The builder owns framing and routing headers; a caller copy would smuggle.
+	for (const char *h : {"Content-Length", "transfer-encoding", "Host", "Connection"}) {
+		INFO(h);
+		REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/", {{h, "1"}}, "", req));
+	}
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/", {{"X", "caf\xc3\xa9"}}, "", req));
+	REQUIRE(BuildRawHttpRequest("GET", "h", 8443, "/", {}, "", req));
+	REQUIRE(req.find("Host: h:8443\r\n") != std::string::npos);
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 0, "/", {}, "", req));
+}
+
+TEST_CASE("raw response framing is strict", "[rawhttp]") {
+	RawHttpResponse r;
+	// Conflicting framing is refused rather than guessed at.
+	REQUIRE_FALSE(ParseRawHttpResponse("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab", r));
+	REQUIRE_FALSE(ParseRawHttpResponse(
+	    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", r));
+	REQUIRE_FALSE(
+	    ParseRawHttpResponse("HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999999\r\n\r\n", r));
+	// Identical duplicates are harmless.
+	REQUIRE(ParseRawHttpResponse("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nab", r));
+	REQUIRE(r.body == "ab");
+}
+
+TEST_CASE("raw response completeness lets the reader stop before EOF", "[rawhttp]") {
+	// A peer that ignores `Connection: close` must not make every request wait
+	// for the socket timeout: a framed response is done when its body is.
+	REQUIRE_FALSE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"));
+	REQUIRE_FALSE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel"));
+	REQUIRE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"));
+	REQUIRE_FALSE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"));
+	REQUIRE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+	// Unframed: only EOF ends it.
+	REQUIRE_FALSE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\n\r\nabc"));
+}
+
+TEST_CASE("https origin and absolute URL edge cases", "[rawhttp]") {
+	std::string host;
+	int port = 0;
+	for (const char *bad : {"https://user@h", "https://h?x", "https://h#x", "https://[::1]", "https://h/p"}) {
+		INFO(bad);
+		REQUIRE_FALSE(SplitHttpsOrigin(bad, host, port));
+	}
+	std::string origin, rest;
+	// A query with no path keeps its query.
+	REQUIRE(SplitAbsoluteUrl("https://h?a=1&b=2", origin, rest));
+	REQUIRE(origin == "https://h");
+	REQUIRE(rest == "/?a=1&b=2");
+}
+
+TEST_CASE("ranged reply acceptance", "[rawhttp]") {
+	std::string body = "hello";
+	REQUIRE(AcceptRangeReply(206, "bytes 10-14/100", body, 10, 5));
+	REQUIRE(body == "hello");
+	// 206 of the wrong length or for the wrong start is not our range.
+	body = "hell";
+	REQUIRE_FALSE(AcceptRangeReply(206, "", body, 10, 5));
+	body = "hello";
+	REQUIRE_FALSE(AcceptRangeReply(206, "bytes 0-4/100", body, 10, 5));
+	// 200 = whole file: sliced, or refused if too short.
+	body = "0123456789abcdef";
+	REQUIRE(AcceptRangeReply(200, "", body, 10, 5));
+	REQUIRE(body == "abcde");
+	body = "0123";
+	REQUIRE_FALSE(AcceptRangeReply(200, "", body, 10, 5));
+	body = "x";
+	REQUIRE_FALSE(AcceptRangeReply(404, "", body, 0, 1));
 }

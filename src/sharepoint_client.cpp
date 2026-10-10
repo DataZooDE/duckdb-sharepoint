@@ -7,6 +7,7 @@
 #include "sharepoint_client.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_preauth.hpp"
+#include "sharepoint_rawhttp.hpp"
 #include "sharepoint_upload.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -106,6 +107,10 @@ constexpr int kMaxUploadChunkRetries = 5;
 //! chunk), matching the Graph client's read timeout.
 constexpr int kPreauthTimeoutSeconds = 300;
 
+//! Body cap for upload-session replies (small JSON: a driveItem or the next
+//! expected ranges).
+constexpr std::size_t kUploadReplyMaxBytes = 1 << 20;
+
 //! GET an upload session and return the first byte Graph still expects, parsed
 //! from nextExpectedRanges. Sent verbatim, without an Authorization header --
 //! the uploadUrl is pre-authenticated. Returns false if the session advertises
@@ -114,7 +119,7 @@ constexpr int kPreauthTimeoutSeconds = 300;
 bool QueryUploadResumeOffset(const string &upload_url, idx_t &resume_at) {
 	RawHttpResponse res;
 	try {
-		res = PreauthenticatedRequest("GET", upload_url, {}, "", kPreauthTimeoutSeconds);
+		res = PreauthenticatedRequest("GET", upload_url, {}, "", kPreauthTimeoutSeconds, kUploadReplyMaxBytes);
 	} catch (std::exception &) {
 		return false;
 	}
@@ -209,7 +214,10 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 	// tempauth query is the credential).
 	// The URL is signed over its exact query string, so it is sent verbatim by
 	// PreauthenticatedRequest (httplib 0.27 would re-sort the query -> 401).
+	// Its body is capped at the range's end: a 200 longer than that means the
+	// host ignored Range and would otherwise stream the whole file per block.
 	int status = res->status;
+	string content_range = res->get_header_value("Content-Range");
 	string body = std::move(res->body);
 	if (status >= 300 && status < 400) {
 		const string location = res->get_header_value("Location");
@@ -217,23 +225,23 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 			throw IOException("sharepoint: read id '%s' redirected to a non-https location; refusing to follow",
 			                  item_id.c_str());
 		}
-		auto dl = PreauthenticatedRequest("GET", location, {{"Range", range}}, "", kPreauthTimeoutSeconds);
+		auto dl = PreauthenticatedRequest("GET", location, {{"Range", range}}, "", kPreauthTimeoutSeconds,
+		                                  static_cast<std::size_t>(offset + length));
 		status = dl.status;
+		content_range = dl.Header("Content-Range");
 		body = std::move(dl.body);
 	}
-	if (status == 206) {
-		out = std::move(body);
-		return;
-	}
-	// 200: the server ignored Range and sent the whole file. Slice it, or the
-	// caller would get bytes from offset 0 (a Parquet footer read would see the
-	// file header).
-	if (status == 200) {
-		out = std::move(body);
-		if (!SliceRangeFromFullBody(out, static_cast<uint64_t>(offset), static_cast<uint64_t>(length))) {
-			throw IOException("sharepoint: short read of id '%s' (wanted %lld bytes at %lld, file has %llu)",
-			                  item_id.c_str(), (long long)length, (long long)offset, (unsigned long long)out.size());
+	// 206 must be exactly our range; a 200 carries the whole file and is sliced
+	// (returning it as-is would hand a Parquet footer read the file's header).
+	if (status == 200 || status == 206) {
+		if (!AcceptRangeReply(status, content_range, body, static_cast<uint64_t>(offset),
+		                      static_cast<uint64_t>(length))) {
+			throw IOException("sharepoint: read id '%s' returned HTTP %d that does not cover bytes %lld-%lld "
+			                  "(got %llu bytes)",
+			                  item_id.c_str(), status, (long long)offset, (long long)(offset + length - 1),
+			                  (unsigned long long)body.size());
 		}
+		out = std::move(body);
 		return;
 	}
 	ThrowGraph("read id '" + item_id + "'", status, body);
@@ -303,6 +311,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 	const idx_t chunk = NormalizeUploadChunkSize(chunk_bytes);
 	idx_t offset = 0;
 	int failures = 0;
+	string last_transport_error;
 	while (offset < total) {
 		idx_t len = std::min<idx_t>(chunk, total - offset);
 		RawHttpResponse res;
@@ -311,9 +320,12 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 			res = PreauthenticatedRequest("PUT", upload_url,
 			                              {{"Content-Range", UploadContentRange(offset, len, total)},
 			                               {"Content-Type", "application/octet-stream"}},
-			                              bytes.substr(offset, len), kPreauthTimeoutSeconds);
-		} catch (IOException &) {
+			                              bytes.substr(offset, len), kPreauthTimeoutSeconds, kUploadReplyMaxBytes);
+		} catch (IOException &e) {
+			// Transport failures are retried below. A REFUSAL (InvalidInputException:
+			// bad URL or request shape) is not caught here: retrying cannot fix it.
 			transport_ok = false;
+			last_transport_error = e.what();
 		}
 
 		// 200/201 come back only on the FINAL chunk, and carry the driveItem.
@@ -343,8 +355,11 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 			}
 			continue;
 		}
-		ThrowGraph("upload chunk of '" + root_relative_path + "'", transport_ok ? res.status : 0,
-		           transport_ok ? res.body : string());
+		if (!transport_ok) {
+			throw IOException("sharepoint: upload chunk of '%s' failed after %d attempts: %s",
+			                  root_relative_path.c_str(), failures, last_transport_error.c_str());
+		}
+		ThrowGraph("upload chunk of '" + root_relative_path + "'", res.status, res.body);
 	}
 	// A non-empty file always returns from the 200/201 branch above; reaching
 	// here means the loop advanced past the end with no final response, which

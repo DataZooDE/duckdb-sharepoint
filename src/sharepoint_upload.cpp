@@ -24,13 +24,15 @@ bool SplitAbsoluteUrl(const std::string &url, std::string &origin, std::string &
 	if (scheme == std::string::npos) {
 		return false;
 	}
-	auto slash = url.find('/', scheme + 3);
-	if (slash == std::string::npos) {
+	// The authority ends at the first '/', '?' or '#'. A query with no path
+	// ("https://h?a=1") keeps its query behind an implied "/".
+	auto end = url.find_first_of("/?#", scheme + 3);
+	if (end == std::string::npos) {
 		origin = url;
 		path_and_query = "/";
 	} else {
-		origin = url.substr(0, slash);
-		path_and_query = url.substr(slash);
+		origin = url.substr(0, end);
+		path_and_query = url[end] == '/' ? url.substr(end) : "/" + url.substr(end);
 	}
 	return true;
 }
@@ -50,14 +52,6 @@ bool IsHttpsUrl(const std::string &url) {
 			return false;
 		}
 	}
-	return true;
-}
-
-bool SliceRangeFromFullBody(std::string &body, std::uint64_t offset, std::uint64_t length) {
-	if (offset > body.size() || length > body.size() - offset) {
-		return false;
-	}
-	body = body.substr(offset, length);
 	return true;
 }
 

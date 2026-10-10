@@ -49,11 +49,6 @@ bool SplitAbsoluteUrl(const std::string &url, std::string &origin, std::string &
 //! followed over TLS; a downgrade to http:// is refused.
 bool IsHttpsUrl(const std::string &url);
 
-//! A ranged GET answered 200 (Range ignored) carries the WHOLE file. Cut `body`
-//! down to [offset, offset+length) in place. Returns false, leaving `body`
-//! untouched, if the body is too short to contain that range.
-bool SliceRangeFromFullBody(std::string &body, std::uint64_t offset, std::uint64_t length);
-
 //! Parse the start offset of a Graph nextExpectedRanges entry:
 //!   "512-1023" -> 512 ; "655360-" -> 655360.
 //! Returns false if `range` has no leading decimal integer.
