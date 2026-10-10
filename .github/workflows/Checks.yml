@@ -73,7 +73,8 @@ jobs:
             apk add --no-cache g++ >/dev/null
             fail=0
             for f in src/sharepoint_uri.cpp src/sharepoint_errors.cpp src/sharepoint_glob.cpp \
-                     src/sharepoint_upload.cpp src/sharepoint_blockcache.cpp src/sharepoint_version.cpp; do
+                     src/sharepoint_upload.cpp src/sharepoint_blockcache.cpp src/sharepoint_rawhttp.cpp \
+                     src/sharepoint_version.cpp; do
               if g++ -std=c++17 -fsyntax-only -Isrc/include "$f"; then
                 echo "  ok   $f"
               else

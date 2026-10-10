@@ -3,6 +3,7 @@
 #include "sharepoint_blockcache.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_glob.hpp"
+#include "sharepoint_rawhttp.hpp"
 #include "sharepoint_upload.hpp"
 #include "sharepoint_uri.hpp"
 #include "sharepoint_version.hpp"
@@ -352,4 +353,77 @@ TEST_CASE("graph errors classify by status and code", "[errors]") {
 	REQUIRE(ClassifyGraphError(200, "") == GraphErrorKind::OK);
 	REQUIRE(IsRetryable(GraphErrorKind::THROTTLED));
 	REQUIRE_FALSE(IsRetryable(GraphErrorKind::UNAUTHENTICATED));
+}
+
+// ---------------------------------------------------------------------------
+// Verbatim HTTP/1.1 for Graph's pre-authenticated URLs. httplib 0.27 (DuckDB
+// 1.5) re-sorts a request's query parameters, and SharePoint's signed
+// download/upload URLs then answer 401 -- so these are sent byte for byte.
+// ---------------------------------------------------------------------------
+TEST_CASE("raw request keeps the target byte for byte", "[rawhttp]") {
+	std::string req;
+	const std::string target = "/_layouts/15/download.aspx?UniqueId=abc&Translate=false&tempauth=v1.x&ApiVersion=2.0";
+	REQUIRE(BuildRawHttpRequest("GET", "tenant.sharepoint.com", target, {{"Range", "bytes=0-4"}}, "", req));
+	REQUIRE(req == "GET " + target +
+	                   " HTTP/1.1\r\nHost: tenant.sharepoint.com\r\nConnection: close\r\nRange: bytes=0-4\r\n"
+	                   "Content-Length: 0\r\n\r\n");
+
+	REQUIRE(BuildRawHttpRequest("PUT", "h", "/u?a=1", {}, "xyz", req));
+	REQUIRE(req.size() >= 3);
+	REQUIRE(req.substr(req.size() - 3) == "xyz");
+	REQUIRE(req.find("Content-Length: 3\r\n") != std::string::npos);
+}
+
+TEST_CASE("raw request refuses header and request-line injection", "[rawhttp]") {
+	std::string req;
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/a b", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/a\r\nX: y", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "no-leading-slash", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h\r\nX: y", "/", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/", {{"Range", "bytes=0-1\r\nEvil: 1"}}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/", {{"Bad Name", "v"}}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("G T", "h", "/", {}, "", req));
+}
+
+TEST_CASE("raw response parses content-length, chunked and EOF bodies", "[rawhttp]") {
+	RawHttpResponse r;
+	REQUIRE(ParseRawHttpResponse("HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\n"
+	                             "Content-Range: bytes 0-4/11\r\n\r\nhelloEXTRA",
+	                             r));
+	REQUIRE(r.status == 206);
+	REQUIRE(r.body == "hello");
+	REQUIRE(r.Header("content-range") == "bytes 0-4/11");
+
+	REQUIRE(ParseRawHttpResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+	                             "5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n",
+	                             r));
+	REQUIRE(r.status == 200);
+	REQUIRE(r.body == "hello world");
+
+	// Neither header: the body runs to connection close.
+	REQUIRE(ParseRawHttpResponse("HTTP/1.1 202 Accepted\r\nX: y\r\n\r\n{\"a\":1}", r));
+	REQUIRE(r.status == 202);
+	REQUIRE(r.body == "{\"a\":1}");
+
+	// Truncated: promised more bytes than arrived.
+	REQUIRE_FALSE(ParseRawHttpResponse("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort", r));
+	REQUIRE_FALSE(ParseRawHttpResponse("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel", r));
+	REQUIRE_FALSE(ParseRawHttpResponse("garbage", r));
+	REQUIRE_FALSE(ParseRawHttpResponse("HTTP/1.1 200 OK\r\nContent-Length: 5", r)); // no end of head
+}
+
+TEST_CASE("https origin splits into host and port", "[rawhttp]") {
+	std::string host;
+	int port = 0;
+	REQUIRE(SplitHttpsOrigin("https://tenant.sharepoint.com", host, port));
+	REQUIRE(host == "tenant.sharepoint.com");
+	REQUIRE(port == 443);
+	REQUIRE(SplitHttpsOrigin("https://h:8443", host, port));
+	REQUIRE(host == "h");
+	REQUIRE(port == 8443);
+	REQUIRE_FALSE(SplitHttpsOrigin("http://h", host, port));
+	REQUIRE_FALSE(SplitHttpsOrigin("https://", host, port));
+	REQUIRE_FALSE(SplitHttpsOrigin("https://h:0", host, port));
+	REQUIRE_FALSE(SplitHttpsOrigin("https://h:99999", host, port));
+	REQUIRE_FALSE(SplitHttpsOrigin("https://h:x", host, port));
 }

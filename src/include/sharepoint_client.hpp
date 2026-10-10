@@ -20,6 +20,8 @@ struct DriveItemMeta {
 	bool is_folder = false;
 	string ctag;
 	string etag;
+	//! RFC 3339, e.g. "2026-10-10T07:12:03Z" (Graph's lastModifiedDateTime).
+	string last_modified;
 	bool found = false; // false => the item did not exist (a NOT_FOUND, not a throw)
 };
 

@@ -10,6 +10,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/local_file_system.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #include <cstdint>
@@ -200,6 +201,38 @@ int64_t SharepointFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr
 int64_t SharepointFileSystem::GetFileSize(FileHandle &handle) {
 	auto &h = handle.Cast<SharepointFileHandle>();
 	return h.is_write ? static_cast<int64_t>(h.write_buffer.size()) : h.meta.size;
+}
+
+namespace {
+
+//! RFC 3339 (Graph's lastModifiedDateTime) -> DuckDB timestamp, as in the
+//! sibling gdrive. Graph sends a 'T' separator and a 'Z'; Timestamp::FromString
+//! wants a space and an explicit offset. Unparseable -> epoch rather than a
+//! failed scan: the time is metadata, never data.
+timestamp_t ParseRfc3339(const string &rfc3339) {
+	if (rfc3339.empty()) {
+		return timestamp_t(0);
+	}
+	string normalised = rfc3339;
+	auto t_pos = normalised.find('T');
+	if (t_pos != string::npos) {
+		normalised[t_pos] = ' ';
+	}
+	if (normalised.back() == 'Z') {
+		normalised.pop_back();
+		normalised += "+00";
+	}
+	try {
+		return Timestamp::FromString(normalised, true);
+	} catch (...) {
+		return timestamp_t(0);
+	}
+}
+
+} // namespace
+
+timestamp_t SharepointFileSystem::GetLastModifiedTime(FileHandle &handle) {
+	return ParseRfc3339(handle.Cast<SharepointFileHandle>().meta.last_modified);
 }
 
 string SharepointFileSystem::GetVersionTag(FileHandle &handle) {

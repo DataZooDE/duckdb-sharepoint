@@ -78,6 +78,7 @@ public:
 
 	int64_t GetFileSize(FileHandle &handle) override;
 	string GetVersionTag(FileHandle &handle) override;
+	timestamp_t GetLastModifiedTime(FileHandle &handle) override;
 
 	bool FileExists(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	bool DirectoryExists(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;

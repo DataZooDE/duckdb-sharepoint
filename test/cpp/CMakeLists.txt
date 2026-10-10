@@ -37,6 +37,7 @@ add_executable(sharepoint_unit_tests
     ${SP_ROOT}/src/sharepoint_glob.cpp
     ${SP_ROOT}/src/sharepoint_upload.cpp
     ${SP_ROOT}/src/sharepoint_blockcache.cpp
+    ${SP_ROOT}/src/sharepoint_rawhttp.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_pure.cpp
 )
 target_include_directories(sharepoint_unit_tests PRIVATE ${SP_ROOT}/src/include)

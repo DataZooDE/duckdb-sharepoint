@@ -6,6 +6,7 @@
 // exercised and is marked inline.
 #include "sharepoint_client.hpp"
 #include "sharepoint_errors.hpp"
+#include "sharepoint_preauth.hpp"
 #include "sharepoint_upload.hpp"
 
 #include "duckdb/common/exception.hpp"
@@ -87,6 +88,7 @@ DriveItemMeta ParseMeta(const picojson::object &o) {
 	m.name = get_str("name");
 	m.ctag = get_str("cTag");
 	m.etag = get_str("eTag");
+	m.last_modified = get_str("lastModifiedDateTime");
 	auto sz = o.find("size");
 	if (sz != o.end() && sz->second.is<int64_t>()) {
 		m.size = sz->second.get<int64_t>();
@@ -100,17 +102,27 @@ DriveItemMeta ParseMeta(const picojson::object &o) {
 //! session where to resume from.
 constexpr int kMaxUploadChunkRetries = 5;
 
+//! Timeout for one request to a pre-authenticated URL (download or upload
+//! chunk), matching the Graph client's read timeout.
+constexpr int kPreauthTimeoutSeconds = 300;
+
 //! GET an upload session and return the first byte Graph still expects, parsed
-//! from nextExpectedRanges. No Authorization header -- the uploadUrl is
-//! pre-authenticated. Returns false if the session advertises no range (e.g. it
-//! is already complete or the body is unexpected), leaving `resume_at` untouched.
-bool QueryUploadResumeOffset(duckdb_httplib_openssl::Client &up, const string &path, idx_t &resume_at) {
-	auto res = up.Get(path.c_str());
-	if (!res || res->status < 200 || res->status >= 300) {
+//! from nextExpectedRanges. Sent verbatim, without an Authorization header --
+//! the uploadUrl is pre-authenticated. Returns false if the session advertises
+//! no range (e.g. it is already complete), the body is unexpected, or the
+//! request fails, leaving `resume_at` untouched.
+bool QueryUploadResumeOffset(const string &upload_url, idx_t &resume_at) {
+	RawHttpResponse res;
+	try {
+		res = PreauthenticatedRequest("GET", upload_url, {}, "", kPreauthTimeoutSeconds);
+	} catch (std::exception &) {
+		return false;
+	}
+	if (res.status < 200 || res.status >= 300) {
 		return false;
 	}
 	picojson::value v;
-	if (!picojson::parse(v, res->body).empty() || !v.is<picojson::object>()) {
+	if (!picojson::parse(v, res.body).empty() || !v.is<picojson::object>()) {
 		return false;
 	}
 	auto &o = v.get<picojson::object>();
@@ -136,9 +148,9 @@ DriveItemMeta GraphClient::StatByPath(const string &root_relative_path) {
 	auto cli = MakeClient(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	string path = root_relative_path.empty()
-	                  ? "/v1.0/drives/" + auth.drive_id + "/root?$select=id,name,size,file,folder,cTag,eTag"
+	                  ? "/v1.0/drives/" + auth.drive_id + "/root?$select=id,name,size,file,folder,cTag,eTag,lastModifiedDateTime"
 	                  : "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) +
-	                        "?$select=id,name,size,file,folder,cTag,eTag";
+	                        "?$select=id,name,size,file,folder,cTag,eTag,lastModifiedDateTime";
 	auto res = cli.Get(path.c_str(), h);
 	if (!res) {
 		throw IOException("sharepoint: stat '%s' failed at the transport layer", root_relative_path.c_str());
@@ -160,7 +172,7 @@ DriveItemMeta GraphClient::StatById(const string &item_id) {
 	auto cli = MakeClient(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id +
-	              "?$select=id,name,size,file,folder,cTag,eTag";
+	              "?$select=id,name,size,file,folder,cTag,eTag,lastModifiedDateTime";
 	auto res = cli.Get(path.c_str(), h);
 	if (!res) {
 		throw IOException("sharepoint: stat id '%s' failed at the transport layer", item_id.c_str());
@@ -195,36 +207,36 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 	// download URL on the tenant's SharePoint host. Follow it ourselves: over
 	// https only, carrying the Range but NOT the bearer token (the URL's
 	// tempauth query is the credential).
-	if (res->status >= 300 && res->status < 400) {
+	// The URL is signed over its exact query string, so it is sent verbatim by
+	// PreauthenticatedRequest (httplib 0.27 would re-sort the query -> 401).
+	int status = res->status;
+	string body = std::move(res->body);
+	if (status >= 300 && status < 400) {
 		const string location = res->get_header_value("Location");
-		string origin, download_path;
-		if (!IsHttpsUrl(location) || !SplitAbsoluteUrl(location, origin, download_path)) {
+		if (!IsHttpsUrl(location)) {
 			throw IOException("sharepoint: read id '%s' redirected to a non-https location; refusing to follow",
 			                  item_id.c_str());
 		}
-		auto dl = MakeClient(origin);
-		res = dl.Get(download_path.c_str(), duckdb_httplib_openssl::Headers {{"Range", range}});
-		if (!res) {
-			throw IOException("sharepoint: ranged read of id '%s' failed at the transport layer (download host)",
-			                  item_id.c_str());
-		}
+		auto dl = PreauthenticatedRequest("GET", location, {{"Range", range}}, "", kPreauthTimeoutSeconds);
+		status = dl.status;
+		body = std::move(dl.body);
 	}
-	if (res->status == 206) {
-		out = std::move(res->body);
+	if (status == 206) {
+		out = std::move(body);
 		return;
 	}
 	// 200: the server ignored Range and sent the whole file. Slice it, or the
 	// caller would get bytes from offset 0 (a Parquet footer read would see the
 	// file header).
-	if (res->status == 200) {
-		out = std::move(res->body);
+	if (status == 200) {
+		out = std::move(body);
 		if (!SliceRangeFromFullBody(out, static_cast<uint64_t>(offset), static_cast<uint64_t>(length))) {
 			throw IOException("sharepoint: short read of id '%s' (wanted %lld bytes at %lld, file has %llu)",
 			                  item_id.c_str(), (long long)length, (long long)offset, (unsigned long long)out.size());
 		}
 		return;
 	}
-	ThrowGraph("read id '" + item_id + "'", res->status, res->body);
+	ThrowGraph("read id '" + item_id + "'", status, body);
 }
 
 DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const string &bytes, idx_t chunk_bytes) {
@@ -280,13 +292,12 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 	}
 
 	// The uploadUrl is a pre-authenticated absolute URL, typically on a
-	// DIFFERENT host than graph_endpoint. It needs its own client, and carries
-	// NO Authorization header -- the URL itself is the credential.
-	string origin, put_path;
-	if (!IsHttpsUrl(upload_url) || !SplitAbsoluteUrl(upload_url, origin, put_path)) {
-		throw IOException("sharepoint: createUploadSession returned a non-https or unparseable uploadUrl");
+	// DIFFERENT host than graph_endpoint. It carries NO Authorization header --
+	// the URL itself is the credential -- and is sent verbatim
+	// (PreauthenticatedRequest): it is signed over its exact query string.
+	if (!IsHttpsUrl(upload_url)) {
+		throw IOException("sharepoint: createUploadSession returned a non-https uploadUrl");
 	}
-	auto up = MakeClient(origin);
 
 	const idx_t total = bytes.size();
 	const idx_t chunk = NormalizeUploadChunkSize(chunk_bytes);
@@ -294,20 +305,28 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 	int failures = 0;
 	while (offset < total) {
 		idx_t len = std::min<idx_t>(chunk, total - offset);
-		duckdb_httplib_openssl::Headers ch = {{"Content-Range", UploadContentRange(offset, len, total)}};
-		auto res = up.Put(put_path.c_str(), ch, bytes.substr(offset, len), "application/octet-stream");
+		RawHttpResponse res;
+		bool transport_ok = true;
+		try {
+			res = PreauthenticatedRequest("PUT", upload_url,
+			                              {{"Content-Range", UploadContentRange(offset, len, total)},
+			                               {"Content-Type", "application/octet-stream"}},
+			                              bytes.substr(offset, len), kPreauthTimeoutSeconds);
+		} catch (IOException &) {
+			transport_ok = false;
+		}
 
 		// 200/201 come back only on the FINAL chunk, and carry the driveItem.
-		if (res && (res->status == 200 || res->status == 201)) {
+		if (transport_ok && (res.status == 200 || res.status == 201)) {
 			picojson::value v;
-			if (!picojson::parse(v, res->body).empty() || !v.is<picojson::object>()) {
+			if (!picojson::parse(v, res.body).empty() || !v.is<picojson::object>()) {
 				throw IOException("sharepoint: resumable upload of '%s' returned no item metadata",
 				                  root_relative_path.c_str());
 			}
 			return ParseMeta(v.get<picojson::object>());
 		}
 		// 202 Accepted: this chunk landed and Graph now expects the next range.
-		if (res && res->status == 202) {
+		if (transport_ok && res.status == 202) {
 			offset += len;
 			failures = 0;
 			continue;
@@ -316,16 +335,16 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 		// Transport failure, 5xx or 429: ask the session where to resume from and
 		// retry, up to a bounded number of attempts. Re-PUTting a range Graph has
 		// already stored is safe, so a resume that returns the same offset is fine.
-		bool retryable = !res || IsRetryable(ClassifyGraphError(res->status, ErrorCode(res->body)));
+		bool retryable = !transport_ok || IsRetryable(ClassifyGraphError(res.status, ErrorCode(res.body)));
 		if (retryable && ++failures <= kMaxUploadChunkRetries) {
 			idx_t resume_at = offset;
-			if (QueryUploadResumeOffset(up, put_path, resume_at) && resume_at <= total) {
+			if (QueryUploadResumeOffset(upload_url, resume_at) && resume_at <= total) {
 				offset = resume_at;
 			}
 			continue;
 		}
-		ThrowGraph("upload chunk of '" + root_relative_path + "'", res ? res->status : 0,
-		           res ? res->body : string());
+		ThrowGraph("upload chunk of '" + root_relative_path + "'", transport_ok ? res.status : 0,
+		           transport_ok ? res.body : string());
 	}
 	// A non-empty file always returns from the 200/201 branch above; reaching
 	// here means the loop advanced past the end with no final response, which
