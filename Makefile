@@ -49,3 +49,28 @@ check_pin:
 .PHONY: check_credentials
 check_credentials:
 	@./scripts/check_no_credentials.sh
+
+# ---------------------------------------------------------------------------
+# musl (a 1.4 LTS distribution target) does not pull <cstdint> in
+# transitively the way glibc does; a missing include breaks only that target.
+# ---------------------------------------------------------------------------
+.PHONY: check_cstdint
+check_cstdint:
+	@./scripts/check_cstdint.sh
+
+# ---------------------------------------------------------------------------
+# The SHIPPED artifact, not the statically linked shell: it must be stamped
+# for the pinned DuckDB, link only platform libs, and load into a stock CLI.
+# ---------------------------------------------------------------------------
+.PHONY: check_stamp
+check_stamp: release
+	@./scripts/check_extension_stamp.sh
+
+.PHONY: smoke_static
+smoke_static: release
+	@./scripts/check_static_linkage.sh \
+		build/release/extension/sharepoint/sharepoint.duckdb_extension
+
+.PHONY: smoke_loadable
+smoke_loadable: release
+	@./scripts/smoke_loadable.sh

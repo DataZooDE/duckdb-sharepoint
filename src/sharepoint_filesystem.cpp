@@ -12,6 +12,7 @@
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/main/client_context.hpp"
 
+#include <cstdint>
 #include <cstring>
 
 namespace duckdb {

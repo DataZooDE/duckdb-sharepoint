@@ -1,14 +1,26 @@
-# Fast per-PR checks that need no DuckDB platform matrix: credential hygiene
-# and (once the duckdb submodule is pinned) the Catch2 pure-logic tests.
+#
+# Correctness gates that the reusable distribution workflow cannot host.
+# Mirrors the sibling duckdb-gdrive's Checks.yml.
+#
+# The live suite runs against a REAL Microsoft Graph tenant -- there is no fake
+# and no replay. A pull request from a FORK cannot access repository secrets,
+# so it runs the credential-free layers only; `live` is skipped there, visibly,
+# rather than passing vacuously.
+#
 name: Checks
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # ---------------------------------------------------------------------------
+  # Always runs. No credentials, no network. Anyone can reproduce this.
+  # ---------------------------------------------------------------------------
   hygiene:
     name: Credential hygiene
     runs-on: ubuntu-latest
@@ -17,17 +29,141 @@ jobs:
       - name: No credentials committed
         run: ./scripts/check_no_credentials.sh
 
-  unit-tests:
-    name: Catch2 pure-logic tests
+  # A submodule that has drifted off the shipped tag makes every local green
+  # meaningless: DuckDB's C++ API differs between versions.
+  pin:
+    name: duckdb submodule on the shipped tag
     runs-on: ubuntu-latest
     steps:
-      # No submodules and nothing to install: the pure layer builds standalone
-      # (test/cpp/CMakeLists.txt) needing only Catch2 -- no DuckDB, no OpenSSL,
-      # no vcpkg. Catch2 comes from the system if present, else FetchContent, so
-      # this stays a seconds-long gate instead of a full platform-matrix build.
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: ./scripts/check_duckdb_pin.sh
+
+  # Seconds-long gate. The pure layer builds standalone (test/cpp/CMakeLists.txt)
+  # needing only Catch2 -- no DuckDB, no OpenSSL, no vcpkg. Catch2 comes from
+  # the system if present, else FetchContent.
+  unit-fast:
+    name: Catch2 pure-logic tests (standalone)
+    runs-on: ubuntu-latest
+    steps:
       - uses: actions/checkout@v4
       - name: Build + run the pure-logic tests
         run: |
           cmake -S test/cpp -B build/unit
           cmake --build build/unit -j
           ./build/unit/sharepoint_unit_tests --reporter console::out=-
+
+  # ---------------------------------------------------------------------------
+  # musl. The 1.4 LTS matrix builds linux_amd64_musl, whose headers do NOT
+  # pull in <cstdint> transitively the way glibc's do. A grep names the file in
+  # milliseconds; a real musl compile of the pure sources catches the rest.
+  # ---------------------------------------------------------------------------
+  musl:
+    name: musl compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fixed-width integer types include <cstdint>
+        run: ./scripts/check_cstdint.sh
+      - name: Compile pure sources against musl
+        run: |
+          docker run --rm -v "$PWD":/w -w /w alpine:3.20 sh -c '
+            set -e
+            apk add --no-cache g++ >/dev/null
+            fail=0
+            for f in src/sharepoint_uri.cpp src/sharepoint_errors.cpp src/sharepoint_glob.cpp \
+                     src/sharepoint_upload.cpp src/sharepoint_blockcache.cpp src/sharepoint_version.cpp; do
+              if g++ -std=c++17 -fsyntax-only -Isrc/include "$f"; then
+                echo "  ok   $f"
+              else
+                echo "  FAIL $f"; fail=1
+              fi
+            done
+            exit $fail
+          '
+
+  # The full extension build, outside the distribution matrix: both test layers
+  # plus the gates on the artifact users actually install.
+  unit:
+    name: Full build + credential-free SQL + artifact gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      # actions/checkout does not fetch submodule TAGS, and DuckDB derives its
+      # own version from `git describe --tags` inside duckdb/. Without them the
+      # artifact is stamped for a version that does not exist.
+      - name: Fetch duckdb tags (DuckDB versions itself from git describe)
+        run: git -C duckdb fetch --tags --force origin
+      - name: Install vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
+          echo "VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
+      - name: Install ninja
+        run: sudo apt-get install -y ninja-build
+      - name: Build
+        run: GEN=ninja make
+      - name: Catch2 + SQL tests (live ones skip without credentials)
+        run: make test
+      - name: Static linkage allowlist
+        run: make smoke_static
+      - name: Extension stamped for the target DuckDB
+        run: make check_stamp
+      # A stock CLI of the EXACT target version, so smoke_loadable really runs;
+      # under CI a skip there is fatal.
+      - name: Install stock duckdb v1.5.6
+        run: |
+          curl -sSLo /tmp/duckdb.zip \
+            https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
+          unzip -q -o /tmp/duckdb.zip -d /tmp/duckdb-cli
+          sudo install -m 0755 /tmp/duckdb-cli/duckdb /usr/local/bin/duckdb
+          duckdb -noheader -list -c "SELECT version();"
+      - name: Shipped artifact loads in a stock duckdb
+        run: make smoke_loadable
+
+  # ---------------------------------------------------------------------------
+  # The real thing. Needs secrets, so it cannot run on fork PRs.
+  # ---------------------------------------------------------------------------
+  live:
+    name: Live tests against a real Graph tenant
+    runs-on: ubuntu-latest
+    # `secrets` is not available in job-level `if`, so gate on the event:
+    # fork PRs have a head repo different from the base repo.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+      SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+      SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+      SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Fetch duckdb tags (DuckDB versions itself from git describe)
+        run: git -C duckdb fetch --tags --force origin
+      - name: Install vcpkg
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$HOME/vcpkg"
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
+          echo "VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
+      - name: Install ninja
+        run: sudo apt-get install -y ninja-build
+      - name: Build
+        run: GEN=ninja make
+      # Fails loudly when the secrets are absent -- a missing secret must not
+      # look like a passing live suite.
+      - name: Live SQL tests
+        run: make test_live
+      - name: Install stock duckdb v1.5.6
+        run: |
+          curl -sSLo /tmp/duckdb.zip \
+            https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
+          unzip -q -o /tmp/duckdb.zip -d /tmp/duckdb-cli
+          sudo install -m 0755 /tmp/duckdb-cli/duckdb /usr/local/bin/duckdb
+      - name: Shipped artifact reaches real Graph from a stock duckdb
+        run: make smoke_loadable

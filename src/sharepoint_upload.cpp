@@ -1,5 +1,6 @@
 #include "sharepoint_upload.hpp"
 
+#include <cstdint>
 #include <cstdlib>
 
 namespace duckdb {

@@ -16,6 +16,7 @@
 #include <picojson.h>
 
 #include <algorithm>
+#include <cstdint>
 
 namespace duckdb {
 namespace sharepoint {

@@ -1,54 +1,109 @@
-# Build + distribute the sharepoint extension across DuckDB's platform matrix
-# via the extension-ci-tools reusable workflow, exactly as the sibling
-# duckdb-gdrive does.
-name: Main Distribution Pipeline
+#
+# Build, test and (on main/tags) publish the extension binaries.
+#
+# Architectures we explicitly exclude:
+#   windows_amd64_mingw -- vcpkg's OpenSSL port on MinGW is fragile; sibling
+#     extensions (duckdb-gdrive, erpl-web, anofox-tabular) also skip it.
+#   wasm_* -- the extension's whole purpose is HTTPS calls to Microsoft Graph,
+#     which a browser sandbox cannot make with a confidential client. A clean "not available on wasm" beats shipping an
+#     artifact that builds green and then fails to LOAD (symbol resolution in
+#     a side-module is deferred to load time, so CI would not catch it).
+#
+# Build matrix: current stable (v1.5.6) and the 1.4 LTS line (v1.4.5). Both
+# are built, because a community extension is installed against whichever
+# DuckDB the user is running and the C++ API differs between the lines.
+#
+# The ci-tools refs are the ROLLING branches -- v1.5-variegata and
+# v1.4-andium -- not per-patch tags, matching the sibling extensions
+# (erpl-web). A per-patch pin means the workflow silently ages out of step
+# with the toolchain fixes that land on the branch; the Windows compiler
+# selection below is exactly that kind of fix. The v1.4-andium branch pins
+# MSVC `cl`; the older per-patch v1.4.x workflows left the Windows compiler
+# to autodetect, and current windows-latest images pick MinGW g++ -- which
+# trips the C++17 std::byte vs Win-SDK `byte` ambiguity and cannot link the
+# MSVC-built vcpkg OpenSSL.
+#
+name: Main Extension Distribution Pipeline
 on:
   push:
-    branches: [main]
-    tags: ["v*.*.*"]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}
-  cancel-in-progress: true
-
-# The deploy job assumes an AWS role via OIDC to publish to the erpl.io bucket.
 permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: true
+
 jobs:
   duckdb-stable-build:
-    name: Build extension binaries
-    # Pinned to the 1.4 LTS line, matching the duckdb (v1.4.5) and
-    # extension-ci-tools (v1.4-andium) submodules this repo builds against. The
-    # reusable-workflow ref and ci_tools_version are the SAME commit, per the
-    # sibling DataZoo house style. Bump together with scripts/check_duckdb_pin.sh.
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@1f04702aae6f4e7ab45f38689fd79e765221b19e
+    name: Build extension binaries (v1.5.6)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
     with:
+      duckdb_version: v1.5.6
+      ci_tools_version: v1.5-variegata
       extension_name: sharepoint
+      exclude_archs: 'windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
+  duckdb-lts-build:
+    name: Build extension binaries (v1.4.5 LTS)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4-andium
+    with:
       duckdb_version: v1.4.5
-      ci_tools_version: 1f04702aae6f4e7ab45f38689fd79e765221b19e
-      # OpenSSL is fragile on mingw and Graph HTTPS has no meaning in wasm.
-      exclude_archs: "windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
-      # The 1.4 LTS build image ships CMake 4, which refuses to bootstrap an old
-      # vcpkg from source (its bundled vcpkg-tool has cmake_minimum_required below
-      # 3.5). Pin the newer vcpkg the sibling DataZoo extensions build the LTS
-      # line with -- it bootstraps clean under CMake 4.
-      vcpkg_commit: ce613c41372b23b1f51333815feb3edd87ef8a8b
+      ci_tools_version: v1.4-andium
+      extension_name: sharepoint
+      # windows_amd64 is excluded from the LTS line only, and it is a real
+      # loss recorded here rather than a tidy-up.
+      #
+      # v1.4-andium defaults to vcpkg ce613c4137 (2025-04-09), whose tree pins
+      # msys2-runtime-3.5.4-2 -- removed from every msys2 mirror since. Every
+      # port whose portfile calls vcpkg_acquire_msys now 404s before a line of
+      # our code compiles. Catch2 was one such port and is excluded from
+      # Windows in vcpkg.json; OpenSSL's pkgconfig fixup is another and cannot
+      # be dropped, so trimming dependencies cannot fix this.
+      #
+      # Pinning the LTS job forward to v1.5-variegata's vcpkg (84bab45d) was
+      # tried and REJECTED: it resolves the msys2 404 but the v1.4 toolchain
+      # does not take that tree -- linux_arm64 then fails inside the Docker
+      # build, so the matrix ends up worse, not better.
+      #
+      # THE COST: a Windows user still on DuckDB 1.4 gets no artifact and a
+      # 404 at INSTALL. Windows remains built and shipped for v1.5.6, the
+      # current stable line. Remove this exclusion once v1.4-andium moves its
+      # vcpkg default forward, or once a revision is found that satisfies both
+      # the msys2 fix and the v1.4 toolchain on all four platforms.
+      exclude_archs: 'windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   # Publish the built binaries to the erpl.io distribution bucket, so users can
-  # `INSTALL sharepoint FROM 'http://get.erpl.io'` (DuckDB started with
-  # -unsigned, as the binary is unsigned). Mirrors the sibling anofox-statistics.
+  #   INSTALL sharepoint FROM 'http://get.erpl.io';   (DuckDB started with -unsigned,
+  # as the binary is unsigned). This is a mirror of the community-extensions
+  # channel, not a replacement -- it lets erpl.io ship a build the moment
+  # a tag lands, without waiting on the community build queue, and serves the
+  # 1.4 LTS line the same way.
+  #
+  # Both DuckDB lines are deployed. The S3 key carries the DuckDB version
+  # (see scripts/extension-upload.sh), so the two uploads land on distinct
+  # paths and DuckDB resolves whichever matches the client it runs -- deploying
+  # only one line would leave users on the other with a 404 at INSTALL.
+  #
   # Gated to main / version tags: PRs build and test but never deploy, so the
-  # deploy never needs OIDC credentials on a pull request. deploy_latest and
-  # deploy_versioned resolve the same way, publishing both the rolling "latest"
-  # path and an immutable versioned path on every main push and release tag.
-  duckdb-lts-deploy:
-    name: Deploy extension binaries (v1.4.5 LTS)
+  # deploy never needs OIDC credentials on a pull request. The reusable deploy
+  # workflow assumes the erpl AWS role via OIDC (id-token: write above) and
+  # reads the bucket from the DEPLOY_S3_BUCKET repo/org variable.
+  duckdb-stable-smoke-test:
+    name: Smoke test (v1.5.6)
     needs: duckdb-stable-build
+    uses: ./.github/workflows/_extension_smoke_test.yml
+    with:
+      duckdb_version: v1.5.6
+      extension_name: sharepoint
+      exclude_archs: 'windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
+  duckdb-stable-deploy:
+    name: Deploy extension binaries (v1.5.6)
+    needs: [duckdb-stable-build, duckdb-stable-smoke-test]
     # Run even if a non-essential matrix arch failed; the deploy fans out per
     # arch and only uploads the artifacts that actually exist.
     if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
@@ -56,8 +111,35 @@ jobs:
     secrets: inherit
     with:
       extension_name: sharepoint
+      duckdb_version: v1.5.6
+      ci_tools_version: v1.5-variegata
+      exclude_archs: 'windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+      deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+      deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+
+  duckdb-lts-smoke-test:
+    name: Smoke test (v1.4.5)
+    needs: duckdb-lts-build
+    uses: ./.github/workflows/_extension_smoke_test.yml
+    with:
       duckdb_version: v1.4.5
-      ci_tools_version: 1f04702aae6f4e7ab45f38689fd79e765221b19e
-      exclude_archs: "windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads"
+      extension_name: sharepoint
+      # Must match duckdb-lts-build's exclusions exactly: this stage looks for
+      # an artifact per arch, so smoke-testing an arch the build no longer
+      # produces fails on a missing download rather than on the extension.
+      exclude_archs: 'windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
+
+  duckdb-lts-deploy:
+    name: Deploy extension binaries (v1.4.5 LTS)
+    needs: [duckdb-lts-build, duckdb-lts-smoke-test]
+    if: ${{ !cancelled() && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    uses: ./.github/workflows/_extension_deploy.yml
+    secrets: inherit
+    with:
+      extension_name: sharepoint
+      duckdb_version: v1.4.5
+      ci_tools_version: v1.4-andium
+      # Same exclusions as the LTS build and smoke test.
+      exclude_archs: 'windows_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}

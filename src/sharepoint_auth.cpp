@@ -23,6 +23,7 @@
 #include <picojson.h>
 
 #include <chrono>
+#include <cstdint>
 
 namespace duckdb {
 namespace sharepoint {

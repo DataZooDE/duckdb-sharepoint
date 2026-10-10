@@ -19,7 +19,7 @@ on:
         required: true
         type: string
       # The extension-ci-tools ref (branch/tag) matching duckdb_version. Required
-      # because the rolling patch releases (e.g. v1.5.4 / v1.4.5) have no matching
+      # because the rolling patch releases (e.g. v1.5.6 / v1.4.5) have no matching
       # extension-ci-tools branch — the codename branches (v1.5-variegata /
       # v1.4-andium) are the canonical targets instead.
       ci_tools_version:
@@ -138,11 +138,11 @@ jobs:
           python3 -m pip install pip awscli
           git config --global --add safe.directory '*'
           cd duckdb
-          git fetch --tags
-          export DUCKDB_VERSION=`git tag --points-at HEAD`
+          git fetch --tags --force
+          export DUCKDB_VERSION=`git tag --points-at HEAD | head -1`
           export DUCKDB_VERSION=${DUCKDB_VERSION:=`git log -1 --format=%h`}
           cd ..
-          git fetch --tags
-          export EXT_VERSION=`git tag --points-at HEAD`
+          git fetch --tags --force
+          export EXT_VERSION=`git tag --points-at HEAD | head -1`
           export EXT_VERSION=${EXT_VERSION:=`git log -1 --format=%h`}
           ${{ inputs.deploy_script }} ${{ inputs.extension_name }} $EXT_VERSION $DUCKDB_VERSION ${{ matrix.duckdb_arch }} $BUCKET_NAME ${{inputs.deploy_latest || 'true' && 'false'}} ${{inputs.deploy_versioned || 'true' && 'false'}}

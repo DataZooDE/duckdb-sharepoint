@@ -1,6 +1,7 @@
 #include "sharepoint_blockcache.hpp"
 
 #include <algorithm>
+#include <cstdint>
 
 namespace duckdb {
 namespace sharepoint {
