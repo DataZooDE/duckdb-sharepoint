@@ -11,6 +11,8 @@
 #include "sharepoint_upload.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/unordered_map.hpp"
 
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.hpp"
@@ -47,16 +49,49 @@ string EncodePath(const string &path) {
 	return out;
 }
 
-duckdb_httplib_openssl::Client MakeClient(const string &base_url) {
-	duckdb_httplib_openssl::Client cli(base_url.c_str());
-	// Redirects are handled explicitly where Graph issues them (the /content
-	// download): the target is a pre-authenticated URL that must be https and
-	// must not receive the bearer token. Blind following lost the request on
-	// the first live run (401 from the download host).
-	cli.set_follow_location(false);
-	cli.set_connection_timeout(30);
-	cli.set_read_timeout(300);
-	return cli;
+// One keep-alive connection per Graph origin per thread, as in the sibling
+// gdrive: a TLS handshake per request roughly doubles the latency of every
+// small call (stat, list, a cached block miss). Per thread, so no locking and
+// no connection is ever shared between concurrent requests.
+//
+// The holder exists for its destructor. At thread exit httplib closes TLS
+// GRACEFULLY: it sends close_notify and then blocks reading the peer's reply
+// on a socket with no receive timeout. Microsoft's front door never replies,
+// so every DuckDB worker thread hung for ~120 s at shutdown (found with gdb:
+// __call_tls_dtors -> ssl3_shutdown -> read). Shutting down the READ side
+// first makes that read return EOF at once; writes are untouched, so there is
+// no SIGPIPE risk.
+struct GraphConnectionHolder {
+	unique_ptr<duckdb_httplib_openssl::Client> client;
+	~GraphConnectionHolder() {
+		if (!client) {
+			return;
+		}
+		const auto sock = client->socket();
+		if (sock != INVALID_SOCKET) {
+#ifdef _WIN32
+			::shutdown(sock, SD_RECEIVE);
+#else
+			::shutdown(sock, SHUT_RD);
+#endif
+		}
+	}
+};
+
+duckdb_httplib_openssl::Client &GraphConnection(const string &base_url) {
+	static thread_local unordered_map<string, GraphConnectionHolder> connections;
+	auto &holder = connections[base_url];
+	if (!holder.client) {
+		holder.client = make_uniq<duckdb_httplib_openssl::Client>(base_url.c_str());
+		// Redirects are handled explicitly where Graph issues them (the
+		// /content download): the target is a pre-authenticated URL that must
+		// be https and must not receive the bearer token.
+		holder.client->set_follow_location(false);
+		holder.client->set_keep_alive(true);
+		holder.client->set_connection_timeout(30);
+		holder.client->set_read_timeout(300);
+	}
+	return *holder.client;
 }
 
 // Graph's error.code and error.message from a JSON error body (empty if
@@ -205,7 +240,7 @@ bool QueryUploadResumeOffset(const string &upload_url, idx_t &resume_at) {
 } // namespace
 
 DriveItemMeta GraphClient::StatByPath(const string &root_relative_path) {
-	auto cli = MakeClient(auth.graph_endpoint);
+	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	string path = root_relative_path.empty()
 	                  ? "/v1.0/drives/" + auth.drive_id + "/root?$select=id,name,size,file,folder,cTag,eTag,lastModifiedDateTime"
@@ -229,7 +264,7 @@ DriveItemMeta GraphClient::StatByPath(const string &root_relative_path) {
 }
 
 DriveItemMeta GraphClient::StatById(const string &item_id) {
-	auto cli = MakeClient(auth.graph_endpoint);
+	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id +
 	              "?$select=id,name,size,file,folder,cTag,eTag,lastModifiedDateTime";
@@ -255,7 +290,7 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 	if (length <= 0) {
 		return; // "bytes=o-(o-1)" is not a valid range; nothing to fetch.
 	}
-	auto cli = MakeClient(auth.graph_endpoint);
+	auto &cli = GraphConnection(auth.graph_endpoint);
 	string range = "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + length - 1);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}, {"Range", range}};
 	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id + "/content";
@@ -325,7 +360,7 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 }
 
 DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const string &bytes, idx_t chunk_bytes) {
-	auto cli = MakeClient(auth.graph_endpoint);
+	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 
 	// Small file: a single PUT to the content endpoint. Graph permits up to
@@ -447,7 +482,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 }
 
 bool GraphClient::DeleteItem(const string &item_id, bool permanent) {
-	auto cli = MakeClient(auth.graph_endpoint);
+	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	const string item_path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id;
 	// A plain DELETE moves the item to the site's recycle bin. Permanent deletion
@@ -501,7 +536,7 @@ void GraphClient::MoveByPath(const string &source_root_relative, const string &t
 	body["parentReference"] = picojson::value(parent_ref);
 	body["name"] = picojson::value(name);
 
-	auto cli = MakeClient(auth.graph_endpoint);
+	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	// Replace an existing target, as a local rename does. DuckDB's COPY writes a
 	// tmp_ file and moves it onto the final name, so without this every re-run
@@ -518,7 +553,7 @@ void GraphClient::CreateFolder(const string &root_relative_path) {
 	string parent, name;
 	SplitParent(root_relative_path, parent, name);
 
-	auto cli = MakeClient(auth.graph_endpoint);
+	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	string path = parent.empty()
 	                  ? "/v1.0/drives/" + auth.drive_id + "/root/children"
@@ -551,7 +586,7 @@ void GraphClient::CreateFolder(const string &root_relative_path) {
 
 vector<ChildEntry> GraphClient::ListChildren(const string &folder_root_relative_path) {
 	vector<ChildEntry> out;
-	auto cli = MakeClient(auth.graph_endpoint);
+	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.access_token}};
 	string next = folder_root_relative_path.empty()
 	                  ? "/v1.0/drives/" + auth.drive_id + "/root/children?$select=name,folder,file&$top=200"
