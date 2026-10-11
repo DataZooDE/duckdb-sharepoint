@@ -161,6 +161,10 @@ as-is; with a `REFRESH_TOKEN` it uses the `refresh_token` grant.
      __sharepoint_never_ignore__`) so failures fail.
 6. **`authorization_code` / `device_code`** delegated providers via the
    `datazoo-oauth2` submodule. *Still open.*
+6b. **DNS is not bounded by the pre-auth transport's deadline.** Connect,
+   handshake, send and receive are; `getaddrinfo` inside `BIO_do_connect`
+   blocks for the OS resolver timeout. Bounding it needs a resolver thread.
+   *Open (crew round 4, F8; low).*
 6a. **Streaming writes.** A write is buffered in memory and uploaded on
    close (gdrive does the same); a multi-GB COPY needs that much RAM. Stream
    full chunks into the upload session instead. *Open (crew round 3, F6).*
