@@ -50,6 +50,8 @@ const char *CounterName(Counter c) {
 		return "bytes_written";
 	case Counter::META_CACHE_HIT:
 		return "meta_cache_hits";
+	case Counter::AUTH_REFRESH:
+		return "auth_refresh";
 	default:
 		return "unknown";
 	}

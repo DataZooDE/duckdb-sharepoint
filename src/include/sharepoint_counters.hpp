@@ -31,6 +31,7 @@ enum class Counter {
 	BYTES_READ,      // content bytes received by READ_RANGE
 	BYTES_WRITTEN,   // content bytes sent by UPLOAD_PUT / UPLOAD_CHUNK
 	META_CACHE_HIT,  // an open served from the immutable-prefix metadata cache
+	AUTH_REFRESH,    // a 401 made a request re-mint its token and re-send
 	COUNT_           // sentinel
 };
 
