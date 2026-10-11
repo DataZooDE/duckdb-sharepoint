@@ -18,7 +18,9 @@ cd "$(dirname "$0")/.."
 
 EXT="$PWD/build/release/extension/sharepoint/sharepoint.duckdb_extension"
 # Keep in step with scripts/check_duckdb_pin.sh and the stable workflow job.
-WANT_VERSION="v1.5.6"
+# shellcheck source=duckdb_version.env
+source scripts/duckdb_version.env
+WANT_VERSION="$DUCKDB_TAG"
 STRICT="${SMOKE_LOADABLE_STRICT:-${CI:+1}}"
 STRICT="${STRICT:-0}"
 
