@@ -23,7 +23,7 @@ if(NOT Catch2_FOUND)
     FetchContent_Declare(
         Catch2
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG v3.5.2
+        GIT_TAG 05e10dfccc28c7f973727c54f850237d07d5e10f # v3.5.2 (by commit: tags can be moved)
     )
     FetchContent_MakeAvailable(Catch2)
 endif()
@@ -37,7 +37,11 @@ add_executable(sharepoint_unit_tests
     ${SP_ROOT}/src/sharepoint_glob.cpp
     ${SP_ROOT}/src/sharepoint_upload.cpp
     ${SP_ROOT}/src/sharepoint_blockcache.cpp
+    ${SP_ROOT}/src/sharepoint_rawhttp.cpp
+    ${SP_ROOT}/src/sharepoint_identity.cpp
+    ${SP_ROOT}/src/sharepoint_counters.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_pure.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_glob.cpp
 )
 target_include_directories(sharepoint_unit_tests PRIVATE ${SP_ROOT}/src/include)
 target_link_libraries(sharepoint_unit_tests PRIVATE Catch2::Catch2WithMain)

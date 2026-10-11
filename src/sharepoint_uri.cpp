@@ -102,6 +102,22 @@ SharepointUriParse ParseSharepointUri(const std::string &uri) {
 			               uri + "'";
 			return result;
 		}
+		// The id is spliced into /items/<id> URLs (DELETE included), so only
+		// Graph's id alphabet passes: anything else (?, #, %, ., ..) could
+		// change which URL is requested.
+		bool id_ok = id != "." && id != "..";
+		for (char c : id) {
+			if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '!' ||
+			      c == '-' || c == '_' || c == '.')) {
+				id_ok = false;
+			}
+		}
+		if (!id_ok) {
+			result.error = "the sharepoint://id: form takes a Graph item id (letters, digits, '!', '-', '_', "
+			               "'.'): '" +
+			               uri + "'";
+			return result;
+		}
 		result.uri.kind = SharepointUriKind::FILE_ID;
 		result.uri.item_id = id;
 		result.ok = true;
@@ -149,6 +165,29 @@ bool IsFileIdFallbackGlobProbe(const std::string &uri) {
 	}
 	std::string ext = tail.substr(2);
 	return !ext.empty() && ext.find('/') == std::string::npos && ext.find('*') == std::string::npos;
+}
+
+bool IsDriveRoot(const SharepointUri &uri) {
+	return uri.kind == SharepointUriKind::PATH && uri.segments.empty();
+}
+
+char ForbiddenNameChar(const std::string &name) {
+	for (char c : name) {
+		switch (c) {
+		case '"':
+		case '*':
+		case ':':
+		case '<':
+		case '>':
+		case '?':
+		case '\\':
+		case '|':
+			return c;
+		default:
+			break;
+		}
+	}
+	return '\0';
 }
 
 bool PathMatchesAnyPrefix(const std::string &path, const std::string &csv_prefixes) {
