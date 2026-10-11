@@ -92,6 +92,14 @@ TEST_CASE("names SharePoint forbids are caught before Graph sees them", "[uri]")
 	}
 }
 
+TEST_CASE("the drive root is recognised in every spelling", "[uri]") {
+	REQUIRE(IsDriveRoot(ParseSharepointUri("sharepoint://").uri));
+	REQUIRE(IsDriveRoot(ParseSharepointUri("sharepoint:///").uri));
+	REQUIRE(IsDriveRoot(ParseSharepointUri("sharepoint:////").uri));
+	REQUIRE_FALSE(IsDriveRoot(ParseSharepointUri("sharepoint://a").uri));
+	REQUIRE_FALSE(IsDriveRoot(ParseSharepointUri("sharepoint://id:01ABC").uri));
+}
+
 TEST_CASE("non-sharepoint URIs are rejected", "[uri]") {
 	REQUIRE_FALSE(IsSharepointUri("s3://bucket/x"));
 	REQUIRE_FALSE(ParseSharepointUri("gdrive://a/b").ok);

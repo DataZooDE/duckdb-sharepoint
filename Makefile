@@ -84,9 +84,15 @@ smoke_loadable: release
 # ---------------------------------------------------------------------------
 .PHONY: e2e
 e2e: release
-	@cd e2e && uv run pytest -v
+	@cd e2e && uv run --locked pytest -v
 
 # Delete scratch folders crashed runs leaked (older than 24 h).
 .PHONY: sweep_orphans
 sweep_orphans:
 	@cd e2e && uv run python -m helpers.sweep
+
+# The shared VFS functions must stay identical to duckdb-gdrive's copy (both
+# register them; whichever loads first wins). Needs a sibling checkout.
+.PHONY: check_vfs_parity
+check_vfs_parity:
+	@./scripts/check_vfs_parity.sh

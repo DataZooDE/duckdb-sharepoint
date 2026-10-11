@@ -11,6 +11,7 @@ the environment, or in a git-ignored `.env.sharepoint` at the repo root.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import uuid
 from pathlib import Path
@@ -32,6 +33,16 @@ def _load_dotenv() -> None:
         key, _, value = line.partition("=")
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
+
+def scrub(text: str) -> str:
+    """Remove credential values, bearer tokens and signed URLs from text that
+    may end up in a failure report (and so in CI logs)."""
+    for name in ("SHAREPOINT_CLIENT_SECRET", "SHAREPOINT_CLIENT_ID", "SHAREPOINT_TENANT_ID"):
+        value = os.environ.get(name)
+        if value:
+            text = text.replace(value, f"<{name}>")
+    text = re.sub(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_.-]+", "<jwt>", text)
+    return re.sub(r"tempauth=[^&\s'\"]+", "tempauth=<redacted>", text, flags=re.I)
 
 _load_dotenv()
 
@@ -55,7 +66,8 @@ def scratch(graph: Graph):
     runs never collide; under one root so `make sweep_orphans` can find leaks.
     """
     path = f"{SCRATCH_ROOT}/run-{uuid.uuid4().hex[:12]}"
-    graph.mkdir(SCRATCH_ROOT) if graph.stat(SCRATCH_ROOT) is None else None
+    if graph.stat(SCRATCH_ROOT) is None:
+        graph.mkdir(SCRATCH_ROOT)
     graph.mkdir(path)
     try:
         yield path
@@ -66,23 +78,15 @@ def scratch(graph: Graph):
             print(f"WARNING: could not clean up scratch {path}: {e}")
 
 
-class RedactedSQL(str):
-    """A str whose repr hides it. pytest prints a failing test's fixture
-    arguments in the traceback -- for the secret fixture that is the client
-    secret, straight into CI logs. Found when a failing run printed it."""
-
-    def __repr__(self) -> str:
-        return "<RedactedSQL: CREATE SECRET ... (credentials hidden)>"
-
-
 @pytest.fixture(scope="session")
 def secret_sql(graph: Graph) -> str:
-    """CREATE SECRET for the test principal. Never written to a tracked file,
-    and never shown in a traceback (RedactedSQL)."""
-    return RedactedSQL(
+    """CREATE SECRET for the test principal. The values are read by DuckDB
+    with getenv(), so the SQL text itself never holds a credential -- it can
+    appear in argv, in a traceback or in a log without leaking anything."""
+    return (
         "CREATE OR REPLACE SECRET sp_e2e (TYPE sharepoint, PROVIDER client_credentials, "
-        f"TENANT_ID '{graph.tenant}', CLIENT_ID '{graph.client_id}', "
-        f"CLIENT_SECRET '{graph.client_secret}', DRIVE_ID '{graph.drive_id}');"
+        "TENANT_ID getenv('SHAREPOINT_TENANT_ID'), CLIENT_ID getenv('SHAREPOINT_CLIENT_ID'), "
+        "CLIENT_SECRET getenv('SHAREPOINT_CLIENT_SECRET'), DRIVE_ID getenv('SHAREPOINT_DRIVE_ID'));"
     )
 
 
@@ -109,17 +113,20 @@ def isolated_home(tmp_path: Path) -> dict:
 def sql(duckdb_cli: Path, isolated_home: dict):
     """Run SQL through the built duckdb shell (one process per call)."""
     def _run(statements: str, expect_error: bool = False, db: str | None = None) -> str:
+        __tracebackhide__ = True  # keep the SQL out of failure reports
         args = [str(duckdb_cli), "-noheader", "-list"]
         if db:
             args.append(db)
-        proc = subprocess.run(args + ["-c", statements], capture_output=True, text=True,
+        # Over stdin, never argv: a CREATE SECRET on the command line is
+        # readable by every user of the machine via ps / /proc.
+        proc = subprocess.run(args, input=statements, capture_output=True, text=True,
                               timeout=900, env=isolated_home)
         output = proc.stdout + proc.stderr
         if expect_error:
             if proc.returncode == 0:
-                raise AssertionError(f"expected an error, got success:\n{output}")
+                raise AssertionError(f"expected an error, got success:\n{scrub(output)}")
         elif proc.returncode != 0:
-            raise AssertionError(f"duckdb failed ({proc.returncode}):\n{output}")
+            raise AssertionError(f"duckdb failed ({proc.returncode}):\n{scrub(output)}")
         return output.strip()
 
     return _run
@@ -137,6 +144,7 @@ class Session:
         self.n = 0
 
     def query(self, sql: str) -> list[str]:
+        __tracebackhide__ = True  # keep the SQL out of failure reports
         self.n += 1
         marker = f"__end_{self.n}__"
         assert self.proc.stdin and self.proc.stdout
@@ -148,7 +156,7 @@ class Session:
             if line == marker:
                 return lines
             lines.append(line)
-        raise AssertionError(f"duckdb exited mid-query; output so far: {lines}")
+        raise AssertionError(scrub(f"duckdb exited mid-query; output so far: {lines}"))
 
     def close(self) -> None:
         if self.proc.stdin:
