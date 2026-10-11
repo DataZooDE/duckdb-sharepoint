@@ -157,8 +157,14 @@ duckdb_httplib_openssl::Result SendWithRetry(TokenSource &tokens, duckdb_httplib
 		const auto kind = res ? ClassifyGraphError(res->status, ErrorCode(res->body)) : GraphErrorKind::OTHER;
 		if (kind == GraphErrorKind::UNAUTHENTICATED && !refreshed) {
 			refreshed = true;
+			IncrementCounter(Counter::AUTH_REFRESH);
+			string rejected;
+			auto auth_header = h.find("Authorization");
+			if (auth_header != h.end() && auth_header->second.size() > 7) {
+				rejected = auth_header->second.substr(7); // after "Bearer "
+			}
 			h.erase("Authorization");
-			h.emplace("Authorization", "Bearer " + tokens.Refresh());
+			h.emplace("Authorization", "Bearer " + tokens.Refresh(rejected));
 			attempt--; // a refresh is not a failed attempt
 			continue;
 		}

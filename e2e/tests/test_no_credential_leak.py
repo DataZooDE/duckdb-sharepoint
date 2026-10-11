@@ -18,14 +18,21 @@ JWT = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
 
 
 def _assert_clean(text: str, secret: str) -> None:
-    assert secret not in text, "client secret leaked"
-    assert not JWT.search(text), "a bearer token leaked"
-    assert "tempauth" not in text.lower(), "a signed download/upload URL leaked"
+    # pytest.fail with fixed text, not `assert x not in text`: a failing assert
+    # would print its operands -- the very secret it caught.
+    __tracebackhide__ = True
+    if secret in text:
+        pytest.fail("client secret leaked", pytrace=False)
+    if JWT.search(text):
+        pytest.fail("a bearer token leaked", pytrace=False)
+    if "tempauth" in text.lower():
+        pytest.fail("a signed download/upload URL leaked", pytrace=False)
 
 
 def test_failures_and_listings_leak_nothing(graph, scratch, sql, secret_sql):
     graph.upload(f"{scratch}/f.txt", b"abc")
-    bad_secret = secret_sql.replace(graph.client_secret, "wrong-" + graph.client_secret[:4])
+    bad_secret = secret_sql.replace("getenv('SHAREPOINT_CLIENT_SECRET')", "'definitely-not-the-secret'")
+    assert bad_secret != secret_sql
     outputs = [
         sql(f"{bad_secret} SELECT * FROM read_blob('sharepoint://{scratch}/f.txt');", expect_error=True),
         # read_csv, not read_blob: read_blob treats its path as a glob and
