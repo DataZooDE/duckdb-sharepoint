@@ -1,9 +1,6 @@
-// Microsoft Graph HTTP client.
-//
-// STATUS: network frontier of the scaffold (see sharepoint_auth.cpp's header).
-// Request shapes follow the Graph v1.0 driveItem docs; none has yet run against
-// a live tenant. The resumable upload-session path in PutContent is the least
-// exercised and is marked inline.
+// Microsoft Graph HTTP client. Every request shape here is proven against a
+// real tenant by the live SQL suite and the e2e harness; the non-obvious Graph
+// behaviours it works around are recorded in docs/hld.md section 7a.
 #include "sharepoint_client.hpp"
 #include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"
@@ -160,8 +157,14 @@ duckdb_httplib_openssl::Result SendWithRetry(TokenSource &tokens, duckdb_httplib
 		const auto kind = res ? ClassifyGraphError(res->status, ErrorCode(res->body)) : GraphErrorKind::OTHER;
 		if (kind == GraphErrorKind::UNAUTHENTICATED && !refreshed) {
 			refreshed = true;
+			IncrementCounter(Counter::AUTH_REFRESH);
+			string rejected;
+			auto auth_header = h.find("Authorization");
+			if (auth_header != h.end() && auth_header->second.size() > 7) {
+				rejected = auth_header->second.substr(7); // after "Bearer "
+			}
 			h.erase("Authorization");
-			h.emplace("Authorization", "Bearer " + tokens.Refresh());
+			h.emplace("Authorization", "Bearer " + tokens.Refresh(rejected));
 			attempt--; // a refresh is not a failed attempt
 			continue;
 		}

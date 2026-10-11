@@ -22,9 +22,9 @@ public:
 	//! A token valid for at least the next minute (served from the shared
 	//! token cache; minted when absent or about to expire).
 	virtual string Token() = 0;
-	//! Discard the cached token and mint a new one -- after a 401, when the
-	//! token was revoked or expired early. Returns the new token.
-	virtual string Refresh() = 0;
+	//! After a 401 on `rejected`: return a newer token if another thread has
+	//! already replaced it, else discard the cached one and mint a new one.
+	virtual string Refresh(const string &rejected) = 0;
 };
 
 // ---------------------------------------------------------------------------

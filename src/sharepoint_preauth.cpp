@@ -22,7 +22,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #else
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #endif
@@ -82,70 +82,103 @@ using BioPtr = std::unique_ptr<BIO, BioDeleter>;
 	throw IOException("sharepoint: %s with %s failed%s%s", what, host, err ? ": " : "", buf);
 }
 
-// Wait until `fd` is writable (a non-blocking connect finished) or the
-// deadline passes. Returns false on timeout or error.
-bool WaitWritable(int fd, std::chrono::steady_clock::time_point deadline) {
-	const auto now = std::chrono::steady_clock::now();
-	if (now >= deadline) {
-		return false;
-	}
-	const auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
-	fd_set wfds;
-	FD_ZERO(&wfds);
-#ifdef _WIN32
-	FD_SET(static_cast<SOCKET>(fd), &wfds);
-#else
-	FD_SET(fd, &wfds);
-#endif
-	struct timeval tv;
-	tv.tv_sec = static_cast<long>(left / 1000000);
-	tv.tv_usec = static_cast<long>(left % 1000000);
-	return select(fd + 1, nullptr, &wfds, nullptr, &tv) > 0;
+using Clock = std::chrono::steady_clock;
+
+int MillisLeft(Clock::time_point deadline) {
+	const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+	return left <= 0 ? 0 : static_cast<int>(std::min<long long>(left, 1LL << 30));
 }
 
-// Install receive/send timeouts. Fails CLOSED: a socket we cannot bound is a
-// socket that can hang a DuckDB thread forever.
-bool SetSocketTimeouts(int fd, int seconds) {
+// Wait until a non-blocking connect on `fd` finished (writable, or an error)
+// or the deadline passes, then report whether it SUCCEEDED (SO_ERROR == 0).
+// poll(), not select(): select's FD_SET writes out of bounds for a descriptor
+// >= FD_SETSIZE, and a busy DuckDB process can hold that many. On Windows a
+// refused connect is signalled as an error event, which poll reports too.
+bool WaitConnected(int fd, Clock::time_point deadline) {
+	const int ms = MillisLeft(deadline);
+	if (ms == 0) {
+		return false;
+	}
 #ifdef _WIN32
-	DWORD ms = static_cast<DWORD>(seconds) * 1000;
+	WSAPOLLFD pfd;
+	pfd.fd = static_cast<SOCKET>(fd);
+	pfd.events = POLLWRNORM;
+	pfd.revents = 0;
+	if (WSAPoll(&pfd, 1, ms) <= 0) {
+		return false;
+	}
+#else
+	struct pollfd pfd;
+	pfd.fd = fd;
+	pfd.events = POLLOUT;
+	pfd.revents = 0;
+	if (poll(&pfd, 1, ms) <= 0) {
+		return false;
+	}
+#endif
+	int so_error = 0;
+#ifdef _WIN32
+	int len = sizeof(so_error); // Winsock takes int*, not socklen_t*
+	if (getsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&so_error), &len) != 0) {
+		return false;
+	}
+#else
+	socklen_t len = sizeof(so_error);
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) != 0) {
+		return false;
+	}
+#endif
+	return so_error == 0;
+}
+
+// Install receive/send timeouts (milliseconds, at least 1). Fails CLOSED: a
+// socket we cannot bound is a socket that can hang a DuckDB thread forever.
+bool SetSocketTimeouts(int fd, int millis) {
+	millis = std::max(millis, 1);
+#ifdef _WIN32
+	DWORD ms = static_cast<DWORD>(millis);
 	return setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&ms),
 	                  sizeof(ms)) == 0 &&
 	       setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&ms),
 	                  sizeof(ms)) == 0;
 #else
 	struct timeval tv;
-	tv.tv_sec = seconds;
-	tv.tv_usec = 0;
+	tv.tv_sec = millis / 1000;
+	tv.tv_usec = (millis % 1000) * 1000;
 	return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0 &&
 	       setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) == 0;
 #endif
 }
 
-// TCP connect to host:port within `timeout_seconds`, then switch the socket
-// back to blocking with send/receive timeouts installed.
-BioPtr ConnectWithDeadline(const std::string &host, int port, int timeout_seconds) {
+//! Connecting gets at most this long, whatever the overall budget.
+constexpr int kConnectTimeoutSeconds = 30;
+
+// TCP connect to host:port by `deadline` (and within kConnectTimeoutSeconds),
+// then switch the socket back to blocking with timeouts bounded by `deadline`.
+BioPtr ConnectWithDeadline(const std::string &host, int port, Clock::time_point deadline, int &fd_out) {
 	const std::string hostport = host + ":" + std::to_string(port);
 	BioPtr conn(BIO_new_connect(hostport.c_str()));
 	if (!conn) {
 		ThrowTransport("socket setup", host);
 	}
 	BIO_set_nbio(conn.get(), 1);
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_seconds);
+	const auto connect_deadline = std::min(deadline, Clock::now() + std::chrono::seconds(kConnectTimeoutSeconds));
 	while (BIO_do_connect(conn.get()) <= 0) {
 		int fd = -1;
 		if (!BIO_should_retry(conn.get()) || BIO_get_fd(conn.get(), &fd) < 0 || fd < 0) {
 			ThrowTransport("connect", host);
 		}
-		if (!WaitWritable(fd, deadline)) {
-			ThrowTransport("connect (timed out)", host);
+		if (!WaitConnected(fd, connect_deadline)) {
+			ThrowTransport(Clock::now() >= connect_deadline ? "connect (timed out)" : "connect", host);
 		}
 	}
 	int fd = -1;
 	if (BIO_get_fd(conn.get(), &fd) < 0 || fd < 0 || !BIO_socket_nbio(fd, 0) ||
-	    !SetSocketTimeouts(fd, timeout_seconds)) {
+	    !SetSocketTimeouts(fd, MillisLeft(deadline))) {
 		ThrowTransport("socket timeout setup", host);
 	}
 	BIO_set_nbio(conn.get(), 0);
+	fd_out = fd;
 	return conn;
 }
 
@@ -173,9 +206,14 @@ RawHttpResponse PreauthenticatedRequest(const std::string &method, const std::st
 	if (!ctx) {
 		ThrowTransport("TLS setup", host);
 	}
-	// TCP first (bounded by a deadline, timeouts installed), THEN TLS on top, so
-	// the handshake itself is bounded too.
-	BioPtr conn = ConnectWithDeadline(host, port, timeout_seconds);
+	// One deadline for the whole exchange -- connect, handshake, send, receive
+	// -- so a peer that trickles bytes cannot hold a worker indefinitely (a
+	// per-read timeout alone resets on every byte).
+	const auto deadline = Clock::now() + std::chrono::seconds(timeout_seconds);
+	int fd = -1;
+	// TCP first (bounded, timeouts installed), THEN TLS on top, so the
+	// handshake itself is bounded too.
+	BioPtr conn = ConnectWithDeadline(host, port, deadline, fd);
 	BioPtr bio(BIO_new_ssl(ctx, 1));
 	if (!bio) {
 		ThrowTransport("TLS setup", host);
@@ -184,8 +222,11 @@ RawHttpResponse PreauthenticatedRequest(const std::string &method, const std::st
 	BIO_get_ssl(bio.get(), &ssl);
 	SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
 	// SNI, and verify the certificate is for THIS host (not merely trusted).
-	SSL_set_tlsext_host_name(ssl, host.c_str());
-	SSL_set1_host(ssl, host.c_str());
+	// Fail closed: if hostname verification cannot be armed, any trusted
+	// certificate would be accepted for any host.
+	if (!ssl || SSL_set_tlsext_host_name(ssl, host.c_str()) != 1 || SSL_set1_host(ssl, host.c_str()) != 1) {
+		ThrowTransport("TLS hostname verification setup", host);
+	}
 	BIO_push(bio.get(), conn.release()); // `bio` now owns the whole chain
 	if (BIO_do_handshake(bio.get()) <= 0 || SSL_get_verify_result(ssl) != X509_V_OK) {
 		ThrowTransport("TLS handshake / certificate verification", host);
@@ -212,6 +253,10 @@ RawHttpResponse PreauthenticatedRequest(const std::string &method, const std::st
 	bool clean_eof = false;
 	char buf[64 * 1024];
 	while (true) {
+		const int left = MillisLeft(deadline);
+		if (left == 0 || !SetSocketTimeouts(fd, left)) {
+			ThrowTransport("reading the response (timed out)", host);
+		}
 		const int n = BIO_read(bio.get(), buf, sizeof(buf));
 		if (n > 0) {
 			raw.append(buf, static_cast<std::size_t>(n));
@@ -237,12 +282,15 @@ RawHttpResponse PreauthenticatedRequest(const std::string &method, const std::st
 
 	RawHttpResponse response;
 	if (!ParseRawHttpResponse(raw, response)) {
-		throw IOException("sharepoint: malformed or truncated response from %s (%llu bytes)", host,
+		// Usually a connection that ended (reset, or timed out on Windows, where
+		// a receive timeout is not reported as "retry") mid-response.
+		throw IOException("sharepoint: incomplete or malformed response from %s (%llu bytes received)", host,
 		                  (unsigned long long)raw.size());
 	}
 	const bool framed = !response.Header("Content-Length").empty() || !response.Header("Transfer-Encoding").empty();
 	if (!framed && !clean_eof) {
-		throw IOException("sharepoint: connection to %s ended without a complete response", host);
+		throw IOException("sharepoint: connection to %s ended (or timed out) before the response completed",
+		                  host);
 	}
 	return response;
 }

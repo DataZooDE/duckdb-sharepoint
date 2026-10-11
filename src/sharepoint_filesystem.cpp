@@ -1,8 +1,6 @@
-// The sharepoint:// virtual filesystem.
-//
-// STATUS: network frontier of the scaffold (see sharepoint_auth.cpp's header).
-// The DuckDB FileSystem method surface is complete and the Graph mapping is
-// implemented, but nothing here has run against a live tenant yet.
+// The sharepoint:// virtual filesystem: DuckDB's FileSystem API mapped onto
+// Graph driveItems (GraphClient), with the shared block cache for reads and
+// the immutable-prefix metadata cache. Proven by the live SQL suite and e2e.
 #include "sharepoint_filesystem.hpp"
 #include "sharepoint_banner.hpp"
 #include "sharepoint_uri.hpp"
@@ -404,7 +402,7 @@ void SharepointFileSystem::RemoveDirectory(const string &directory, optional_ptr
 		// Graph deletes a folder and its contents).
 		auto uri = ParseOrThrow(directory);
 		auto context = RequireOpener(opener, "remove directory");
-		if (uri.kind != SharepointUriKind::PATH || uri.RootRelativePath().empty()) {
+		if (uri.kind != SharepointUriKind::PATH || IsDriveRoot(uri)) {
 			// The empty path is the drive root: a recursive delete of the whole
 			// library is never what `remove directory` on a URI typo should do.
 			throw IOException("sharepoint: refusing to remove '%s' (the drive root, or not a folder path)", directory);
@@ -467,7 +465,7 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 void SharepointFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		auto uri = ParseOrThrow(filename);
-		if (uri.kind == SharepointUriKind::PATH && uri.RootRelativePath().empty()) {
+		if (IsDriveRoot(uri)) {
 			throw IOException("sharepoint: refusing to remove '%s': it is the drive root", filename);
 		}
 		auto context = RequireOpener(opener, "remove");
