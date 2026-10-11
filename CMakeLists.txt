@@ -38,6 +38,23 @@ include_directories(${PICOJSON_INCLUDE_DIR})
 # deliberately do NOT get this include path.
 include_directories(./duckdb/third_party/httplib)
 
+# Anonymous usage telemetry and the feedback banner, shared with the sibling
+# DataZoo extensions (gdrive, erpl, anofox-*). Native only: telemetry uses
+# duckdb_httplib_openssl::SSLClient, which is not portable to wasm. Opt-out:
+# `SET sharepoint_telemetry_enabled = false` or DATAZOO_DISABLE_TELEMETRY=1.
+if(NOT EMSCRIPTEN)
+    set(DATAZOO_BANNER_TELEMETRY ON CACHE BOOL "" FORCE)
+    set(DATAZOO_BANNER_TELEMETRY_INCLUDE_DIR
+        ${CMAKE_CURRENT_SOURCE_DIR}/posthog-telemetry/include CACHE PATH "" FORCE)
+endif()
+add_subdirectory(datazoo-banner)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/datazoo-banner/include)
+
+if(NOT EMSCRIPTEN)
+    include_directories(posthog-telemetry/include)
+    add_subdirectory(posthog-telemetry)
+endif()
+
 # ---------------------------------------------------------------------------
 # Pure-logic sources: no `#include "duckdb.hpp"`, no I/O. Compiled into BOTH
 # the extension and the Catch2 unit-test binary. Because they do no I/O there
@@ -51,6 +68,8 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_upload.cpp
     src/sharepoint_blockcache.cpp
     src/sharepoint_rawhttp.cpp
+    src/sharepoint_identity.cpp
+    src/sharepoint_counters.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -63,6 +82,7 @@ file(GLOB DUCKDB_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_auth.cpp
     src/sharepoint_client.cpp
     src/sharepoint_preauth.cpp
+    src/sharepoint_stats.cpp
     src/sharepoint_filesystem.cpp
     src/sharepoint_vfs_functions.cpp
 )
@@ -77,6 +97,10 @@ target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
 
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
+if(NOT EMSCRIPTEN)
+  target_link_libraries(${EXTENSION_NAME} posthog_telemetry)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} posthog_telemetry)
+endif()
 
 install(
   TARGETS ${EXTENSION_NAME}

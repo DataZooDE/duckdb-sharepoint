@@ -27,18 +27,6 @@ bool HasNonEmptyOption(const CreateSecretInput &input, const char *key) {
 	return it != input.options.end() && !it->second.ToString().empty();
 }
 
-void ApplyDefaultScope(KeyValueSecret &result) {
-	// Named "graph_scope", NOT "scope", for the reason the sibling gdrive
-	// extension paid to learn: DuckDB's CREATE SECRET grammar hard-codes SCOPE
-	// as a top-level clause, so an option literally named `scope` is diverted
-	// into the secret's PATH-matching prefix list and never reaches
-	// input.options -- silently rescoping the secret so it matches no
-	// sharepoint:// path at all. `graph_scope` sidesteps the collision.
-	if (result.secret_map.find("graph_scope") == result.secret_map.end()) {
-		result.secret_map["graph_scope"] = Value(std::string(SCOPE_GRAPH_DEFAULT));
-	}
-}
-
 // ---------------------------------------------------------------------------
 // PROVIDER client_credentials -- unattended app-only auth (the default).
 //
@@ -56,6 +44,10 @@ unique_ptr<BaseSecret> CreateClientCredentialsSecret(ClientContext &, CreateSecr
 	CopyOption(input, *result, "client_secret");
 	CopyOption(input, *result, "drive_id");
 	CopyOption(input, *result, "site_id");
+	// Named GRAPH_SCOPE, NOT SCOPE: DuckDB's CREATE SECRET grammar hard-codes
+	// SCOPE as the secret's path-prefix list, so an option of that name never
+	// reaches input.options. Left unset, the scope defaults at use time to
+	// "<graph endpoint>/.default", i.e. the right cloud (DefaultGraphScope).
 	CopyOption(input, *result, "graph_scope");
 
 	for (const char *required : {"tenant_id", "client_id", "client_secret"}) {
@@ -70,7 +62,6 @@ unique_ptr<BaseSecret> CreateClientCredentialsSecret(ClientContext &, CreateSecr
 		}
 	}
 
-	ApplyDefaultScope(*result);
 	result->redact_keys.insert("client_secret");
 	return std::move(result);
 }
@@ -107,7 +98,6 @@ unique_ptr<BaseSecret> CreateConfigSecret(ClientContext &, CreateSecretInput &in
 		    "TENANT_ID, CLIENT_ID and CLIENT_SECRET too.");
 	}
 
-	ApplyDefaultScope(*result);
 	result->redact_keys.insert("access_token");
 	result->redact_keys.insert("refresh_token");
 	result->redact_keys.insert("client_secret");
