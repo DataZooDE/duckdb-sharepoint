@@ -54,12 +54,16 @@ POST {login}/{tenant}/oauth2/v2.0/token
   & scope=https://graph.microsoft.com/.default
 ```
 
-Tokens are cached in-process keyed by **secret identity + drive** (never by
-drive alone — one `FileSystem` object serves every `ClientContext`, so an
-identity-blind cache would leak one tenant's token to another; this is the same
-security note gdrive's `CacheKey` carries). A `config` secret with a bare
-`ACCESS_TOKEN` is used as-is; with a `REFRESH_TOKEN` it uses the
-`refresh_token` grant.
+Tokens are cached in-process keyed by a **SHA-256 fingerprint of the
+credential material** (provider, tenant, client id/secret, refresh token,
+scope, login endpoint) — never by the secret's name, which a recreated or
+per-connection secret can reuse with different credentials. The block cache
+and the move same-drive check key on a fingerprint of credentials + Graph cloud
++ drive. File handles hold a `TokenSource`, not a token, so a long scan or an
+ATTACHed database re-mints before expiry (and once on an unexpected 401). The
+Graph and login endpoints are session settings, so only Microsoft cloud hosts
+over https are accepted. A `config` secret with a bare `ACCESS_TOKEN` is used
+as-is; with a `REFRESH_TOKEN` it uses the `refresh_token` grant.
 
 ## 6. Read / write / mutate (`sharepoint_client.*`, `sharepoint_filesystem.*`)
 
@@ -99,7 +103,7 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
    aligned to the same pins (`duckdb_version: v1.4.5`, the reusable workflow ref
    and `ci_tools_version` both the v1.4-andium commit `1f04702`).
 2. ~~**Resumable upload session** (`PutContent`, large-file branch).~~
-   **Implemented (2026-08-05), pending live verification.** After
+   **Implemented (2026-08-05); verified live 2026-10-10.** After
    `createUploadSession`, the `uploadUrl` is split into origin + path
    (`SplitAbsoluteUrl`) and driven by its own httplib client with **no** auth
    header. Chunks are `NormalizeUploadChunkSize`d down to a 320-KiB multiple,
@@ -112,7 +116,7 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
    harness must upload a file **larger than one chunk** to exercise this branch
    end to end — nothing here has run against a tenant.
 3. ~~**Block cache** for reads (`sharepoint_block_size_bytes`), single-flight per
-   block, identity-keyed.~~ **Implemented (2026-08-05), pending live verification.**
+   block, identity-keyed.~~ **Implemented (2026-08-05); verified live 2026-10-10.**
    `SharepointBlockCache` (`sharepoint_blockcache.*`, pure — the byte fetch is
    injected) serves reads from fixed-size blocks: a ranged GET pays a round trip
    regardless of size, so a Parquet scan's many small adjacent reads collapse
@@ -127,7 +131,7 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
    synthetic fetcher; the concurrency is single-flight by construction but only
    single-thread-tested here, and no cache has run against a live tenant.
 4. ~~**Recursive `**` glob** across folders (currently one folder level).~~
-   **Implemented (2026-08-05), pending live verification.** `Glob()` now walks
+   **Implemented (2026-08-05); verified live 2026-10-10.** `Glob()` now walks
    the folder tree: `*`/`?` match within a segment, `**` matches zero or more
    whole levels, and only files are emitted (a trailing `**` yields every file
    beneath the folder). A fully literal path keeps its one-`Stat` fast path. The
@@ -156,7 +160,14 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
      the list to a never-matching sentinel (`set ignore_error_messages
      __sharepoint_never_ignore__`) so failures fail.
 6. **`authorization_code` / `device_code`** delegated providers via the
-   `datazoo-oauth2` submodule.
+   `datazoo-oauth2` submodule. *Still open.*
+6b. **DNS is not bounded by the pre-auth transport's deadline.** Connect,
+   handshake, send and receive are; `getaddrinfo` inside `BIO_do_connect`
+   blocks for the OS resolver timeout. Bounding it needs a resolver thread.
+   *Open (crew round 4, F8; low).*
+6a. **Streaming writes.** A write is buffered in memory and uploaded on
+   close (gdrive does the same); a multi-GB COPY needs that much RAM. Stream
+   full chunks into the upload session instead. *Open (crew round 3, F6).*
 7. **CI**: ~~wire `MainDistributionPipeline.yml` to the DuckDB extension-ci-tools
    reusable workflow~~ **done**, plus **erpl.io deployment wired (2026-08-06)** —
    `_extension_deploy.yml` + `scripts/extension-upload.sh` ported from the
@@ -168,6 +179,35 @@ security note gdrive's `CacheKey` carries). A `config` secret with a bare
    the trust policy of the `ErplGithubOicdRole` IAM role. Still open: the
    community-extensions submission, and a signing key (`DUCKDB_EXTENSION_SIGNING_PK`)
    if a signed build is ever wanted.
+
+## 7a. Discovered on the first live runs (2026-10-10)
+
+Things the Graph docs do not tell you, each found against a real tenant and
+each guarded by a test so it is not rediscovered:
+
+- **Signed URLs must be sent byte for byte.** `GET .../items/{id}/content`
+  302s to `https://<tenant>.sharepoint.com/.../download.aspx?UniqueId=..&
+  Translate=false&tempauth=..&ApiVersion=2.0`; the upload session's
+  `uploadUrl` has the same shape. SharePoint validates the query string AS
+  SENT: re-encoding it is fine, but **any reordering is a 401**. cpp-httplib
+  0.27 (bundled with DuckDB 1.5) parses every request query into a key-sorted
+  `std::multimap` and re-serialises it, with no option to opt out, so these
+  URLs go through `sharepoint_preauth.cpp` (raw TLS, verbatim target) instead.
+  DuckDB 1.4's httplib 0.14 sent paths verbatim. The download host also accepts
+  the request with or without the Graph bearer; we never send it there.
+- **The download host is not reachable with a Graph token directly** —
+  `/_api/v2.x/drives/.../content` on the tenant host is a 401 for a
+  `graph.microsoft.com` audience token, so the redirect is unavoidable.
+- **`Prefer: permanent-delete` is ignored** on SharePoint drives (the item goes
+  to the recycle bin). Permanent deletion is `POST .../items/{id}/permanentDelete`.
+- **DuckDB's COPY moves a `tmp_` file onto the final name**, so a move must send
+  `?@microsoft.graph.conflictBehavior=replace`, or every re-run of a COPY is a
+  409 `nameAlreadyExists`.
+- **SharePoint forbids `" * : < > ? / \ |` in names** (Graph answers 400). JSON
+  bodies are still built with picojson; the legal "hostile" set (`' # % + & ;
+  { }`, spaces, non-ASCII) round-trips and is in the live suite.
+- **DuckDB 1.5's Parquet reader calls `GetLastModifiedTime`**; it is served from
+  `lastModifiedDateTime` (RFC 3339).
 
 ## 8. Two-actor note
 

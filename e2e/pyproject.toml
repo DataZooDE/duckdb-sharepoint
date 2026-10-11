@@ -1,0 +1,18 @@
+[project]
+name = "duckdb-sharepoint-e2e"
+version = "0.1.0"
+description = "Live end-to-end harness for the duckdb-sharepoint extension. Talks to a real Microsoft Graph tenant; there is no fake and no replay. Ported from the sibling duckdb-gdrive's e2e/."
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.32.0",
+    "pytest>=8.0.0",
+    "pytest-timeout>=2.3.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 600
+markers = [
+    "live: requires real Microsoft Graph credentials",
+    "slow: large-file tests",
+]
