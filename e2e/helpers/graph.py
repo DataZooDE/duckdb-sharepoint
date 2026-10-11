@@ -72,11 +72,10 @@ class Graph:
         headers["Authorization"] = f"Bearer {self.token()}"
         for attempt in range(5):
             r = requests.request(method, url, headers=headers, timeout=120, **kw)
-            if r.status_code in (429, 503) and attempt < 4:
-                time.sleep(int(r.headers.get("Retry-After", "2")))
-                continue
-            return r
-        return r
+            if r.status_code not in (429, 503) or attempt == 4:
+                return r
+            time.sleep(int(r.headers.get("Retry-After", "2")))
+        raise AssertionError("unreachable")
 
     def _item(self, path: str) -> str:
         return f"{GRAPH}/drives/{self.drive_id}/root:/{_quote_path(path)}"

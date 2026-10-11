@@ -204,11 +204,25 @@ string MintToken(const MintRequest &req) {
 	return token;
 }
 
+//! One mint lock per credential fingerprint, shared by every source for it:
+//! N open handles on one credential must mint ONE token on expiry, not N.
+shared_ptr<mutex> MintLockFor(const string &credential_fp) {
+	static mutex locks_guard;
+	static unordered_map<string, shared_ptr<mutex>> locks;
+	lock_guard<mutex> guard(locks_guard);
+	auto &lock = locks[credential_fp];
+	if (!lock) {
+		lock = make_shared_ptr<mutex>();
+	}
+	return lock;
+}
+
 //! Client-credentials / refresh-token secrets: cached per credential
 //! fingerprint, re-minted a minute before expiry or on demand after a 401.
 class MintingTokenSource : public TokenSource {
 public:
-	explicit MintingTokenSource(MintRequest req_p) : req(std::move(req_p)) {
+	explicit MintingTokenSource(MintRequest req_p)
+	    : req(std::move(req_p)), mint_lock(MintLockFor(req.credential_fp)) {
 	}
 	string Token() override {
 		{
@@ -218,9 +232,9 @@ public:
 				return it->second.access_token;
 			}
 		}
-		// One mint at a time per source: concurrent block fetches of one handle
-		// share it instead of each POSTing to the token endpoint.
-		lock_guard<mutex> mint_guard(mint_lock);
+		// One mint at a time per credential: concurrent handles and block
+		// fetches share it instead of each POSTing to the token endpoint.
+		lock_guard<mutex> mint_guard(*mint_lock);
 		{
 			lock_guard<mutex> guard(g_token_lock);
 			auto it = g_tokens.find(req.credential_fp);
@@ -230,10 +244,16 @@ public:
 		}
 		return MintToken(req);
 	}
-	string Refresh() override {
-		lock_guard<mutex> mint_guard(mint_lock);
+	//! `rejected` is the token the server just refused. If another thread has
+	//! already replaced it, that newer token is used instead of minting again.
+	string Refresh(const string &rejected) override {
+		lock_guard<mutex> mint_guard(*mint_lock);
 		{
 			lock_guard<mutex> guard(g_token_lock);
+			auto it = g_tokens.find(req.credential_fp);
+			if (it != g_tokens.end() && it->second.access_token != rejected && Fresh(it->second)) {
+				return it->second.access_token;
+			}
 			g_tokens.erase(req.credential_fp);
 		}
 		return MintToken(req);
@@ -251,7 +271,7 @@ private:
 	}
 
 	MintRequest req;
-	mutex mint_lock;
+	shared_ptr<mutex> mint_lock;
 };
 
 //! PROVIDER config with a bare ACCESS_TOKEN: the caller owns its lifetime.
@@ -262,7 +282,7 @@ public:
 	string Token() override {
 		return token;
 	}
-	string Refresh() override {
+	string Refresh(const string &) override {
 		return token; // nothing to refresh with; the 401 will surface
 	}
 
@@ -408,9 +428,12 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 	const string configured_scope = SecretField(secret, "graph_scope");
 	const string scope = configured_scope.empty() ? DefaultGraphScope(graph_endpoint) : configured_scope;
 
-	// A config secret with a bare ACCESS_TOKEN is used as-is, no caching or
-	// refresh -- the caller owns its lifetime.
-	const string static_token = (provider == "config") ? SecretField(secret, "access_token") : string();
+	// A config secret with ONLY an ACCESS_TOKEN is used as-is -- the caller owns
+	// its lifetime. With a REFRESH_TOKEN as well, the refresh grant is used, so
+	// the secret keeps working past the pasted token's expiry.
+	const bool can_refresh =
+	    !refresh_token.empty() && !tenant.empty() && !client_id.empty() && !client_secret.empty();
+	const string static_token = (provider == "config" && !can_refresh) ? SecretField(secret, "access_token") : string();
 
 	// Everything that changes which token comes back -- and where it may be
 	// sent. Two secrets (or one name recreated) share a token only if all of
