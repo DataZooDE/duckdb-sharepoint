@@ -124,7 +124,7 @@ authenticates afresh. Interactive delegated flows (`authorization_code` /
 | `sharepoint_permanent_delete` | `false` | `remove_file` sends items to the site's recycle bin unless this is set. |
 | `sharepoint_immutable_prefixes` | *(empty)* | Comma-separated `sharepoint://` prefixes whose files are **never rewritten in place** (e.g. a DuckLake `DATA_PATH`). Their metadata is remembered, saving a Graph call per open. **Declaring a prefix whose files change causes stale reads.** |
 | `sharepoint_graph_endpoint` / `sharepoint_login_endpoint` | global cloud | National clouds: `https://graph.microsoft.us` / `https://login.microsoftonline.us` (GCC High), `https://dod-graph.microsoft.us`, or the China cloud. Only these Microsoft hosts are accepted, so credentials cannot be redirected elsewhere. |
-| `sharepoint_telemetry_enabled` | `true` | Anonymous usage telemetry, shared with the sibling DataZoo extensions. Also off with `DATAZOO_DISABLE_TELEMETRY=1`. |
+| `sharepoint_telemetry_enabled` | `true` | Anonymous usage telemetry, shared with the sibling DataZoo extensions. `false` stops it for the rest of the session; the one-time load event is sent before any setting can exist (DuckDB rejects a setting for an extension that is not loaded yet), so to suppress that too set the environment variable `DATAZOO_DISABLE_TELEMETRY=1`. |
 
 ## Diagnostics
 

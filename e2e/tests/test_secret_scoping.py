@@ -38,10 +38,12 @@ def site_scratch(graph):
 def test_scope_selects_the_drive_and_cross_drive_moves_are_refused(graph, scratch, site_scratch, sql):
     site, other, folder = site_scratch
     secrets = (
-        f"CREATE SECRET a (TYPE sharepoint, TENANT_ID '{graph.tenant}', CLIENT_ID '{graph.client_id}', "
-        f"CLIENT_SECRET '{graph.client_secret}', DRIVE_ID '{graph.drive_id}', SCOPE 'sharepoint://{scratch}');"
-        f"CREATE SECRET b (TYPE sharepoint, TENANT_ID '{graph.tenant}', CLIENT_ID '{graph.client_id}', "
-        f"CLIENT_SECRET '{graph.client_secret}', SITE_ID '{site}', SCOPE 'sharepoint://{folder}');"
+        "CREATE SECRET a (TYPE sharepoint, TENANT_ID getenv('SHAREPOINT_TENANT_ID'), "
+        "CLIENT_ID getenv('SHAREPOINT_CLIENT_ID'), CLIENT_SECRET getenv('SHAREPOINT_CLIENT_SECRET'), "
+        f"DRIVE_ID getenv('SHAREPOINT_DRIVE_ID'), SCOPE 'sharepoint://{scratch}');"
+        "CREATE SECRET b (TYPE sharepoint, TENANT_ID getenv('SHAREPOINT_TENANT_ID'), "
+        "CLIENT_ID getenv('SHAREPOINT_CLIENT_ID'), CLIENT_SECRET getenv('SHAREPOINT_CLIENT_SECRET'), "
+        f"SITE_ID '{site}', SCOPE 'sharepoint://{folder}');"
     )
     sql(f"{secrets} SELECT write_blob('sharepoint://{scratch}/in_a.txt', 'A'::BLOB);"
         f" SELECT write_blob('sharepoint://{folder}/in_b.txt', 'B'::BLOB);")
