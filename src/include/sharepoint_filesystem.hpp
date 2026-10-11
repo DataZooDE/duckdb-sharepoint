@@ -65,6 +65,16 @@ public:
 	~SharepointFileSystem() override = default;
 
 	bool CanHandleFile(const string &fpath) override;
+#ifndef SHAREPOINT_DUCKDB_LTS
+	//! sharepoint:// paths are already canonical. The base implementation
+	//! collapses "//" for any scheme missing from DuckDB's hard-coded list of
+	//! remote prefixes, which turned `ATTACH 'sharepoint://a/db.duckdb'` into
+	//! "sharepoint:/a/db.duckdb" and "database does not exist". (DuckDB 1.5+;
+	//! 1.4 does not canonicalize ATTACH paths.)
+	string CanonicalizePath(const string &path, optional_ptr<FileOpener> opener = nullptr) override {
+		return path;
+	}
+#endif
 	std::string GetName() const override {
 		return "SharepointFileSystem";
 	}
@@ -106,6 +116,9 @@ public:
 	//! Forget cached metadata for "<identity>|<root-relative path>" and everything
 	//! beneath it (a folder). Called after every write, move and delete we make.
 	void InvalidateMeta(const string &key);
+	//! Same, for every entry describing item `item_id` (a delete by id: form
+	//! does not know the path it was cached under).
+	void InvalidateMetaById(const string &item_id);
 
 	//! Graph cannot write at an offset or trim in place; both throw.
 	void Truncate(FileHandle &handle, int64_t new_size) override;
