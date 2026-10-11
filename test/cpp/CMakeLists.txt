@@ -23,7 +23,7 @@ if(NOT Catch2_FOUND)
     FetchContent_Declare(
         Catch2
         GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-        GIT_TAG v3.5.2
+        GIT_TAG 05e10dfccc28c7f973727c54f850237d07d5e10f # v3.5.2 (by commit: tags can be moved)
     )
     FetchContent_MakeAvailable(Catch2)
 endif()
