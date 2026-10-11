@@ -8,6 +8,7 @@
 // cache would serve one principal's token to another (the bug the sibling
 // gdrive documents and fixed the same way).
 #include "sharepoint_auth.hpp"
+#include "sharepoint_client.hpp"
 #include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_identity.hpp"
@@ -16,6 +17,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/unordered_map.hpp"
+#include "duckdb/common/file_opener.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
@@ -35,11 +37,13 @@ namespace sharepoint {
 
 namespace {
 
-// Cached bearer token, valid until `expires_at`. Keyed by the secret's
-// identity so one secret's token is never served to another.
+// Cached bearer token, valid until `expires_at`. Keyed by the credential
+// fingerprint (see Fingerprint), so one credential set's token is never
+// served to another -- whatever the secrets are named.
 struct CachedToken {
 	string access_token;
 	std::chrono::system_clock::time_point expires_at;
+	std::chrono::system_clock::time_point minted_at;
 };
 
 mutex g_token_lock;
@@ -96,7 +100,18 @@ picojson::object PostToken(const string &login_endpoint, const string &tenant,
 	IncrementCounter(Counter::TOKEN_REQUEST);
 	auto cli = MakeClient(login_endpoint);
 	string path = "/" + tenant + "/oauth2/v2.0/token";
-	auto res = cli.Post(path.c_str(), params);
+	// Throttling / 5xx / transport failures on the token endpoint are retried
+	// like Graph calls: a cold 16-thread scan is exactly when one shows up.
+	duckdb_httplib_openssl::Result res;
+	for (int attempt = 1;; attempt++) {
+		res = cli.Post(path.c_str(), params);
+		const bool retryable =
+		    !res || res->status == 429 || res->status >= 500;
+		if (!retryable || attempt >= kMaxGraphAttempts) {
+			break;
+		}
+		SleepBeforeRetry(attempt, res ? ParseRetryAfterSeconds(res->get_header_value("Retry-After")) : 0);
+	}
 	if (!res) {
 		throw IOException("sharepoint: token request to %s%s failed at the transport layer",
 		                  login_endpoint.c_str(), path.c_str());
@@ -133,6 +148,148 @@ picojson::object PostToken(const string &login_endpoint, const string &tenant,
 	return v.get<picojson::object>();
 }
 
+//! What it takes to mint a token for one credential set, and to cache it.
+struct MintRequest {
+	string credential_fp;
+	string login_endpoint;
+	string tenant;
+	string provider;
+	string client_id;
+	string client_secret;
+	string refresh_token;
+	string scope;
+	//! Test hook (sharepoint_debug_token_max_age_seconds): treat tokens as
+	//! expiring after at most this many seconds, so expiry can be exercised
+	//! without waiting an hour. 0 = Entra ID's own lifetime.
+	int64_t max_age_seconds = 0;
+};
+
+//! Mint a token and store it in the shared cache. Throttling and 5xx on the
+//! token endpoint are retried with the same backoff as Graph calls.
+string MintToken(const MintRequest &req) {
+	duckdb_httplib_openssl::Params params;
+	params.emplace("client_id", req.client_id);
+	params.emplace("client_secret", req.client_secret);
+	params.emplace("scope", req.scope);
+	if (req.provider == "config") {
+		params.emplace("grant_type", "refresh_token");
+		params.emplace("refresh_token", req.refresh_token);
+	} else {
+		params.emplace("grant_type", "client_credentials");
+	}
+	auto obj = PostToken(req.login_endpoint, req.tenant, params);
+	auto at = obj.find("access_token");
+	if (at == obj.end() || !at->second.is<string>()) {
+		throw IOException("sharepoint: token endpoint returned no access_token");
+	}
+	const string token = at->second.get<string>();
+	int64_t expires_in = 3600;
+	auto ei = obj.find("expires_in");
+	if (ei != obj.end() && ei->second.is<int64_t>()) {
+		expires_in = ei->second.get<int64_t>();
+	} else if (ei != obj.end() && ei->second.is<string>()) {
+		// Some Entra ID endpoints send it as a string.
+		char *end = nullptr;
+		const auto parsed = std::strtoll(ei->second.get<string>().c_str(), &end, 10);
+		if (end && *end == '\0' && parsed > 0) {
+			expires_in = parsed;
+		}
+	}
+	if (req.max_age_seconds > 0) {
+		expires_in = std::min<int64_t>(expires_in, req.max_age_seconds);
+	}
+	lock_guard<mutex> guard(g_token_lock);
+	const auto now = std::chrono::system_clock::now();
+	g_tokens[req.credential_fp] = CachedToken {token, now + std::chrono::seconds(expires_in), now};
+	return token;
+}
+
+//! One mint lock per credential fingerprint, shared by every source for it:
+//! N open handles on one credential must mint ONE token on expiry, not N.
+shared_ptr<mutex> MintLockFor(const string &credential_fp) {
+	static mutex locks_guard;
+	static unordered_map<string, shared_ptr<mutex>> locks;
+	lock_guard<mutex> guard(locks_guard);
+	auto &lock = locks[credential_fp];
+	if (!lock) {
+		lock = make_shared_ptr<mutex>();
+	}
+	return lock;
+}
+
+//! Client-credentials / refresh-token secrets: cached per credential
+//! fingerprint, re-minted a minute before expiry or on demand after a 401.
+class MintingTokenSource : public TokenSource {
+public:
+	explicit MintingTokenSource(MintRequest req_p)
+	    : req(std::move(req_p)), mint_lock(MintLockFor(req.credential_fp)) {
+	}
+	string Token() override {
+		{
+			lock_guard<mutex> guard(g_token_lock);
+			auto it = g_tokens.find(req.credential_fp);
+			if (it != g_tokens.end() && Fresh(it->second)) {
+				return it->second.access_token;
+			}
+		}
+		// One mint at a time per credential: concurrent handles and block
+		// fetches share it instead of each POSTing to the token endpoint.
+		lock_guard<mutex> mint_guard(*mint_lock);
+		{
+			lock_guard<mutex> guard(g_token_lock);
+			auto it = g_tokens.find(req.credential_fp);
+			if (it != g_tokens.end() && Fresh(it->second)) {
+				return it->second.access_token;
+			}
+		}
+		return MintToken(req);
+	}
+	//! `rejected` is the token the server just refused. If another thread has
+	//! already replaced it, that newer token is used instead of minting again.
+	string Refresh(const string &rejected) override {
+		lock_guard<mutex> mint_guard(*mint_lock);
+		{
+			lock_guard<mutex> guard(g_token_lock);
+			auto it = g_tokens.find(req.credential_fp);
+			if (it != g_tokens.end() && it->second.access_token != rejected && Fresh(it->second)) {
+				return it->second.access_token;
+			}
+			g_tokens.erase(req.credential_fp);
+		}
+		return MintToken(req);
+	}
+
+private:
+	//! Valid for at least another minute -- by Entra ID's expiry and, under
+	//! the test cap, by age (a token cached before the cap was set counts too).
+	bool Fresh(const CachedToken &t) const {
+		const auto horizon = std::chrono::system_clock::now() + std::chrono::seconds(60);
+		if (t.expires_at <= horizon) {
+			return false;
+		}
+		return req.max_age_seconds <= 0 || t.minted_at + std::chrono::seconds(req.max_age_seconds) > horizon;
+	}
+
+	MintRequest req;
+	shared_ptr<mutex> mint_lock;
+};
+
+//! PROVIDER config with a bare ACCESS_TOKEN: the caller owns its lifetime.
+class StaticTokenSource : public TokenSource {
+public:
+	explicit StaticTokenSource(string token_p) : token(std::move(token_p)) {
+	}
+	string Token() override {
+		return token;
+	}
+	string Refresh(const string &) override {
+		return token; // nothing to refresh with; the 401 will surface
+	}
+
+private:
+	string token;
+};
+
 // The `sharepoint` secret in scope for `path`, or throw a teaching error.
 //
 // Returns the SecretMatch BY VALUE and the caller must keep it alive while it
@@ -141,15 +298,32 @@ picojson::object PostToken(const string &login_endpoint, const string &tenant,
 // destroyed. Returning `const KeyValueSecret &` here was a use-after-free that
 // surfaced on the first live run as "the secret gives neither DRIVE_ID nor
 // SITE_ID" for a secret that plainly had one.
-SecretMatch LookupSecret(ClientContext &context, const string &path) {
-	auto &secret_manager = SecretManager::Get(context);
-	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-	auto match = secret_manager.LookupSecret(transaction, path, kSecretTypeName);
+SecretMatch LookupSecret(optional_ptr<FileOpener> opener, const string &path) {
+	auto secret_manager = FileOpener::TryGetSecretManager(opener);
+	auto transaction = FileOpener::TryGetCatalogTransaction(opener);
+	if (!secret_manager || !transaction) {
+		throw InvalidInputException("sharepoint: '%s' was opened without a database context, so no secret can be "
+		                            "looked up",
+		                            path);
+	}
+	auto match = secret_manager->LookupSecret(*transaction, path, kSecretTypeName);
 	if (!match.HasMatch()) {
+		// A secret may EXIST and still not apply: DuckDB's SCOPE clause limits
+		// which paths a secret covers, and SCOPE is easy to reach for when the
+		// OAuth scope (GRAPH_SCOPE) was meant. "No secret configured" would send
+		// that user off to create a second one that does not match either.
+		if (HasAnySharepointSecret(opener)) {
+			throw InvalidInputException(
+			    "sharepoint: a `sharepoint` secret exists, but none applies to '%s'. A secret's SCOPE clause "
+			    "limits which paths it covers (the OAuth scope option is GRAPH_SCOPE, not SCOPE). Check: "
+			    "SELECT name, scope FROM duckdb_secrets();",
+			    path);
+		}
 		throw InvalidInputException(
-		    "sharepoint: no `sharepoint` secret is configured. Create one, e.g.\n"
+		    "sharepoint: no `sharepoint` secret configured for '%s'. Create one, e.g.\n"
 		    "  CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,\n"
-		    "                    TENANT_ID '...', CLIENT_ID '...', CLIENT_SECRET '...', DRIVE_ID 'b!...');");
+		    "                    TENANT_ID '...', CLIENT_ID '...', CLIENT_SECRET '...', DRIVE_ID 'b!...');",
+		    path);
 	}
 	return match;
 }
@@ -182,7 +356,15 @@ string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint
 	auto cli = MakeClient(graph_endpoint);
 	duckdb_httplib_openssl::Headers headers = {{"Authorization", "Bearer " + token}};
 	string path = "/v1.0/sites/" + site_id + "/drive?$select=id";
-	auto res = cli.Get(path.c_str(), headers);
+	duckdb_httplib_openssl::Result res;
+	for (int attempt = 1;; attempt++) {
+		res = cli.Get(path.c_str(), headers);
+		const bool retryable = !res || res->status == 429 || res->status >= 500;
+		if (!retryable || attempt >= kMaxGraphAttempts) {
+			break;
+		}
+		SleepBeforeRetry(attempt, res ? ParseRetryAfterSeconds(res->get_header_value("Retry-After")) : 0);
+	}
 	if (!res || res->status < 200 || res->status >= 300) {
 		throw IOException("sharepoint: could not resolve the default document library for SITE_ID '%s' (HTTP "
 		                  "%d)",
@@ -203,18 +385,18 @@ string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint
 
 } // namespace
 
-AuthContext GetAuthContext(ClientContext &context, const string &path) {
-	const auto match = LookupSecret(context, path);
+AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) {
+	const auto match = LookupSecret(opener, path);
 	const auto &secret = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
 
 	string login_endpoint = "https://login.microsoftonline.com";
 	string graph_endpoint = "https://graph.microsoft.com";
 	{
 		Value v;
-		if (context.TryGetCurrentSetting("sharepoint_login_endpoint", v) && !v.IsNull()) {
+		if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_login_endpoint", v) && !v.IsNull()) {
 			login_endpoint = v.ToString();
 		}
-		if (context.TryGetCurrentSetting("sharepoint_graph_endpoint", v) && !v.IsNull()) {
+		if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_graph_endpoint", v) && !v.IsNull()) {
 			graph_endpoint = v.ToString();
 		}
 	}
@@ -246,9 +428,12 @@ AuthContext GetAuthContext(ClientContext &context, const string &path) {
 	const string configured_scope = SecretField(secret, "graph_scope");
 	const string scope = configured_scope.empty() ? DefaultGraphScope(graph_endpoint) : configured_scope;
 
-	// A config secret with a bare ACCESS_TOKEN is used as-is, no caching or
-	// refresh -- the caller owns its lifetime.
-	const string static_token = (provider == "config") ? SecretField(secret, "access_token") : string();
+	// A config secret with ONLY an ACCESS_TOKEN is used as-is -- the caller owns
+	// its lifetime. With a REFRESH_TOKEN as well, the refresh grant is used, so
+	// the secret keeps working past the pasted token's expiry.
+	const bool can_refresh =
+	    !refresh_token.empty() && !tenant.empty() && !client_id.empty() && !client_secret.empty();
+	const string static_token = (provider == "config" && !can_refresh) ? SecretField(secret, "access_token") : string();
 
 	// Everything that changes which token comes back -- and where it may be
 	// sent. Two secrets (or one name recreated) share a token only if all of
@@ -256,67 +441,54 @@ AuthContext GetAuthContext(ClientContext &context, const string &path) {
 	const string credential_fp = Fingerprint({provider, tenant, client_id, client_secret, refresh_token, scope,
 	                                          login_endpoint, static_token});
 
-	string token;
+	shared_ptr<TokenSource> tokens;
 	if (!static_token.empty()) {
-		token = static_token;
+		tokens = make_shared_ptr<StaticTokenSource>(static_token);
 	} else {
 		if (!IsValidTenantId(tenant)) {
 			throw InvalidInputException("sharepoint: TENANT_ID must be a tenant GUID or domain (letters, digits, "
 			                            "'-', '.')");
 		}
-		{
-			lock_guard<mutex> guard(g_token_lock);
-			auto it = g_tokens.find(credential_fp);
-			if (it != g_tokens.end() &&
-			    it->second.expires_at > std::chrono::system_clock::now() + std::chrono::seconds(60)) {
-				token = it->second.access_token;
-			}
+		MintRequest req;
+		req.credential_fp = credential_fp;
+		req.login_endpoint = login_endpoint;
+		req.tenant = tenant;
+		req.provider = provider;
+		req.client_id = client_id;
+		req.client_secret = client_secret;
+		req.refresh_token = refresh_token;
+		req.scope = scope;
+		Value max_age;
+		if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_debug_token_max_age_seconds", max_age) &&
+		    !max_age.IsNull()) {
+			req.max_age_seconds = max_age.GetValue<int64_t>();
 		}
-		if (token.empty()) {
-			duckdb_httplib_openssl::Params params;
-			params.emplace("client_id", client_id);
-			params.emplace("client_secret", client_secret);
-			params.emplace("scope", scope);
-			if (provider == "config") {
-				// refresh_token grant (config secret without a static token).
-				params.emplace("grant_type", "refresh_token");
-				params.emplace("refresh_token", refresh_token);
-			} else {
-				// client_credentials (the default provider).
-				params.emplace("grant_type", "client_credentials");
-			}
-			auto obj = PostToken(login_endpoint, tenant, params);
-			auto at = obj.find("access_token");
-			if (at == obj.end() || !at->second.is<string>()) {
-				throw IOException("sharepoint: token endpoint returned no access_token");
-			}
-			token = at->second.get<string>();
-			int64_t expires_in = 3600;
-			auto ei = obj.find("expires_in");
-			if (ei != obj.end() && ei->second.is<int64_t>()) {
-				expires_in = ei->second.get<int64_t>();
-			} else if (ei != obj.end() && ei->second.is<string>()) {
-				// Some Entra ID endpoints send it as a string.
-				char *end = nullptr;
-				const auto parsed = std::strtoll(ei->second.get<string>().c_str(), &end, 10);
-				if (end && *end == '\0' && parsed > 0) {
-					expires_in = parsed;
-				}
-			}
-			lock_guard<mutex> guard(g_token_lock);
-			g_tokens[credential_fp] =
-			    CachedToken {token, std::chrono::system_clock::now() + std::chrono::seconds(expires_in)};
-		}
+		tokens = make_shared_ptr<MintingTokenSource>(std::move(req));
 	}
+	const string token = tokens->Token();
 
 	AuthContext auth;
-	auth.access_token = token;
+	auth.tokens = tokens;
 	auth.graph_endpoint = graph_endpoint;
 	auth.drive_id = ResolveDriveId(secret, graph_endpoint, token, credential_fp);
 	// Keys every per-identity cache downstream (block cache) and the
 	// same-drive check on moves: credentials + cloud + drive.
 	auth.identity = Fingerprint({credential_fp, graph_endpoint, auth.drive_id});
 	return auth;
+}
+
+bool HasAnySharepointSecret(optional_ptr<FileOpener> opener) {
+	auto secret_manager = FileOpener::TryGetSecretManager(opener);
+	auto transaction = FileOpener::TryGetCatalogTransaction(opener);
+	if (!secret_manager || !transaction) {
+		return false;
+	}
+	for (const auto &entry : secret_manager->AllSecrets(*transaction)) {
+		if (entry.secret && entry.secret->GetType() == kSecretTypeName) {
+			return true;
+		}
+	}
+	return false;
 }
 
 } // namespace sharepoint

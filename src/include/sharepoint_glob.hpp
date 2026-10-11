@@ -8,23 +8,32 @@ namespace duckdb {
 namespace sharepoint {
 
 // ---------------------------------------------------------------------------
-// Pure glob matching for a single path segment. `*` matches any run of
-// characters (never crossing '/'), `?` matches exactly one. No I/O, so the
-// Catch2 binary exercises it directly.
-//
-// The FileSystem::Glob() implementation splits a pattern into its longest
-// literal parent prefix and a trailing wildcard segment, lists that ONE Graph
-// folder's children, and keeps the names this predicate accepts. Recursive
-// `**` across folders is a documented follow-up (see docs/hld.md).
+// Pure glob matching, the same syntax and matcher as the sibling gdrive:
+//   *        any run of characters within one path segment (never '/')
+//   ?        exactly one byte within one segment
+//   [abc]    character class, with [a-z] ranges and [!abc] / [^abc] negation
+//   **       any number of segments, including zero (GlobFiles below)
+//   {a,b}    alternation (ExpandBraces, applied to the whole pattern first)
+// No I/O, so the Catch2 binary exercises it directly (test/cpp/test_glob.cpp).
 // ---------------------------------------------------------------------------
 
-//! True iff `name` matches the wildcard `pattern` (`*` and `?`), matching the
-//! whole string. Case-sensitive: SharePoint item names are case-preserving.
-bool MatchGlob(const std::string &pattern, const std::string &name);
+//! True iff the single segment `name` matches `pattern` (whole string,
+//! case-sensitive: SharePoint names are case-preserving). An unclosed '['
+//! matches itself literally rather than failing a whole folder scan.
+bool MatchSegment(const std::string &pattern, const std::string &name);
 
-//! True iff the segment contains a `*` or `?` -- i.e. it is a wildcard rather
-//! than a literal name.
-bool HasGlobMeta(const std::string &segment);
+//! True iff the pattern contains any metacharacter (* ? [ {) -- i.e. it is not
+//! a literal path, which is the difference between one stat and a listing.
+bool HasGlobMetacharacters(const std::string &segment);
+
+//! Expand {a,b}{c,d} alternations into the concrete patterns they denote; a
+//! pattern without braces yields itself. Bounded (pattern length, total
+//! expansions, depth) because the cartesian product is otherwise exponential.
+//!
+//! CALLER OBLIGATION: an EMPTY result means "pattern rejected" (over a cap),
+//! NOT "zero matches" -- a normal expansion always has at least one element.
+//! FileSystem::Glob turns it into an error naming the pattern.
+std::vector<std::string> ExpandBraces(const std::string &pattern);
 
 // ---------------------------------------------------------------------------
 // Recursive glob across folders.
