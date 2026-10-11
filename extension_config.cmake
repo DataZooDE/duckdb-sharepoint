@@ -28,7 +28,10 @@ if(NOT _sp_ddb_ver)
 endif()
 if(_sp_ddb_ver MATCHES "^v?1\\.4\\.")
   add_compile_definitions(_HAS_STD_BYTE=0)
-  message(STATUS "sharepoint: DuckDB ${_sp_ddb_ver} (1.4 LTS) -- defining _HAS_STD_BYTE=0")
+  # FileSystem API that differs between the lines is guarded on this (e.g.
+  # CanonicalizePath, virtual only from 1.5).
+  add_compile_definitions(SHAREPOINT_DUCKDB_LTS=1)
+  message(STATUS "sharepoint: DuckDB ${_sp_ddb_ver} (1.4 LTS) -- defining _HAS_STD_BYTE=0, SHAREPOINT_DUCKDB_LTS")
 endif()
 
 # ---------------------------------------------------------------------------

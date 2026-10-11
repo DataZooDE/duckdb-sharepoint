@@ -102,6 +102,11 @@ bool IsFileIdFallbackGlobProbe(const std::string &uri);
 //! `sharepoint://lakehouse/x`. Used by `sharepoint_immutable_prefixes`.
 bool PathMatchesAnyPrefix(const std::string &path, const std::string &csv_prefixes);
 
+//! True for the drive root itself (`sharepoint://`, `sharepoint:///`): a
+//! recursive Graph DELETE of it would empty the whole library, so every
+//! delete path refuses it.
+bool IsDriveRoot(const SharepointUri &uri);
+
 //! The first character SharePoint forbids in an item name (" * : < > ? \ |),
 //! or '\0' if `name` (one path segment) has none. Checked on every path we
 //! CREATE, so the user gets "':' is not allowed" instead of Graph's 400 --
