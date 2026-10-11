@@ -1,0 +1,40 @@
+# name: test/sql/feedback.test
+# description: errors from the sharepoint:// filesystem carry the issue link,
+#              and the DataZoo banner can be switched off (ported from gdrive)
+# group: [sharepoint]
+
+require sharepoint
+
+# A user-facing filesystem error carries a link to where it can be reported...
+statement error
+SELECT * FROM read_csv('sharepoint://nonexistent/file.csv');
+----
+https://github.com/DataZooDE/duckdb-sharepoint/issues
+
+# ...and keeps its actual message.
+statement error
+SELECT * FROM read_csv('sharepoint://nonexistent/file.csv');
+----
+no `sharepoint` secret configured for
+
+statement ok
+SET datazoo_banner = false;
+
+statement ok
+SET datazoo_banner = true;
+
+# Telemetry has a SQL-level opt-out (the environment variable
+# DATAZOO_DISABLE_TELEMETRY works too).
+statement ok
+SET sharepoint_telemetry_enabled = false;
+
+query I
+SELECT current_setting('sharepoint_telemetry_enabled');
+----
+false
+
+# The version scalar is self-describing.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'sharepoint_version' AND description IS NOT NULL;
+----
+1

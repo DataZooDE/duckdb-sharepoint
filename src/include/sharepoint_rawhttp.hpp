@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,11 +24,13 @@ namespace sharepoint {
 using RawHeaders = std::vector<std::pair<std::string, std::string>>;
 
 //! Build a complete HTTP/1.1 request with `target` sent byte for byte. Always
-//! adds Host, `Connection: close` (the transport reads to EOF) and
+//! adds Host (with the port unless it is 443), `Connection: close` and
 //! Content-Length. Returns false -- refusing to build -- if the method, host,
 //! target or any header could inject into the request line or headers (CR,
-//! LF, space, control bytes; a target that does not start with '/').
-bool BuildRawHttpRequest(const std::string &method, const std::string &host, const std::string &target,
+//! LF, space, control or non-ASCII bytes; a target that does not start with
+//! '/'), if a caller passes one of the headers the builder owns (Host,
+//! Connection, Content-Length, Transfer-Encoding), or if the port is invalid.
+bool BuildRawHttpRequest(const std::string &method, const std::string &host, int port, const std::string &target,
                          const RawHeaders &headers, const std::string &body, std::string &out);
 
 struct RawHttpResponse {
@@ -45,8 +48,21 @@ struct RawHttpResponse {
 //! truncated response.
 bool ParseRawHttpResponse(const std::string &raw, RawHttpResponse &out);
 
+//! True once `raw` holds a whole response framed by Content-Length or chunked
+//! encoding, so the reader can stop without waiting for the peer to close.
+//! An unframed response (neither header) is only ever complete at EOF.
+bool RawHttpResponseComplete(const std::string &raw);
+
+//! Accept the reply to a ranged GET of [offset, offset+length): a 206 must be
+//! exactly `length` bytes and, if `content_range` is given, start at `offset`;
+//! a 200 carries the whole file and is sliced in place. Any other status, or a
+//! reply that does not cover the range, returns false.
+bool AcceptRangeReply(int status, const std::string &content_range, std::string &body, std::uint64_t offset,
+                      std::uint64_t length);
+
 //! Split "https://host[:port]" into host and port (default 443). False for any
-//! other scheme, an empty host, or a port outside 1..65535.
+//! other scheme, an empty host, userinfo, '?', '#', '/', an IPv6 literal, or a
+//! port outside 1..65535.
 bool SplitHttpsOrigin(const std::string &origin, std::string &host, int &port);
 
 } // namespace sharepoint

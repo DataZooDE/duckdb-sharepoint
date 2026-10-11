@@ -19,11 +19,11 @@ bool IsVisibleAscii(const std::string &s) {
 	return !s.empty();
 }
 
-// A header value may contain spaces and tabs, but never CR, LF or other
-// control bytes.
+// A header value may contain spaces and tabs, but never CR, LF, other control
+// bytes or non-ASCII (obs-text is legal but no caller needs it).
 bool IsSafeHeaderValue(const std::string &s) {
 	for (unsigned char c : s) {
-		if ((c < 0x20 && c != '\t') || c == 0x7F) {
+		if ((c < 0x20 && c != '\t') || c >= 0x7F) {
 			return false;
 		}
 	}
@@ -109,15 +109,24 @@ bool DecodeChunked(const std::string &raw, std::size_t pos, std::string &body) {
 
 } // namespace
 
-bool BuildRawHttpRequest(const std::string &method, const std::string &host, const std::string &target,
+bool BuildRawHttpRequest(const std::string &method, const std::string &host, int port, const std::string &target,
                          const RawHeaders &headers, const std::string &body, std::string &out) {
-	if (!IsVisibleAscii(method) || !IsVisibleAscii(host) || !IsVisibleAscii(target) || target[0] != '/') {
+	if (!IsVisibleAscii(method) || !IsVisibleAscii(host) || !IsVisibleAscii(target) || target[0] != '/' ||
+	    port < 1 || port > 65535) {
 		return false;
 	}
-	std::string req = method + " " + target + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n";
+	const std::string host_header = port == 443 ? host : host + ":" + std::to_string(port);
+	std::string req = method + " " + target + " HTTP/1.1\r\nHost: " + host_header + "\r\nConnection: close\r\n";
 	for (const auto &h : headers) {
 		if (!IsVisibleAscii(h.first) || h.first.find(':') != std::string::npos || !IsSafeHeaderValue(h.second)) {
 			return false;
+		}
+		// The builder owns framing and routing; a second copy from the caller
+		// would be request smuggling.
+		for (const char *owned : {"Host", "Connection", "Content-Length", "Transfer-Encoding"}) {
+			if (EqualsIgnoreCase(h.first, owned)) {
+				return false;
+			}
 		}
 		req += h.first + ": " + h.second + "\r\n";
 	}
@@ -136,12 +145,10 @@ std::string RawHttpResponse::Header(const std::string &name) const {
 	return std::string();
 }
 
-bool ParseRawHttpResponse(const std::string &raw, RawHttpResponse &out) {
+// Status line and headers of `raw`, whose head ends at `head_end` (the
+// "\r\n\r\n"). Body untouched.
+static bool ParseHead(const std::string &raw, std::size_t head_end, RawHttpResponse &out) {
 	out = RawHttpResponse();
-	auto head_end = raw.find("\r\n\r\n");
-	if (head_end == std::string::npos) {
-		return false;
-	}
 	// Status line: "HTTP/1.x NNN reason"
 	auto line_end = raw.find("\r\n");
 	const std::string status_line = raw.substr(0, line_end);
@@ -167,12 +174,35 @@ bool ParseRawHttpResponse(const std::string &raw, RawHttpResponse &out) {
 		out.headers.emplace_back(Trim(line.substr(0, colon)), Trim(line.substr(colon + 1)));
 		pos = eol + 2;
 	}
+	return true;
+}
+
+bool ParseRawHttpResponse(const std::string &raw, RawHttpResponse &out) {
+	out = RawHttpResponse();
+	auto head_end = raw.find("\r\n\r\n");
+	if (head_end == std::string::npos || !ParseHead(raw, head_end, out)) {
+		return false;
+	}
 
 	const std::size_t body_start = head_end + 4;
-	if (EqualsIgnoreCase(out.Header("Transfer-Encoding"), "chunked")) {
+	// Conflicting framing is refused, never guessed at (a classic smuggling
+	// vector): chunked together with Content-Length, or two different lengths.
+	std::string cl;
+	for (const auto &h : out.headers) {
+		if (EqualsIgnoreCase(h.first, "Content-Length")) {
+			if (!cl.empty() && cl != h.second) {
+				return false;
+			}
+			cl = h.second;
+		}
+	}
+	const std::string te = out.Header("Transfer-Encoding");
+	if (!te.empty()) {
+		if (!EqualsIgnoreCase(te, "chunked") || !cl.empty()) {
+			return false;
+		}
 		return DecodeChunked(raw, body_start, out.body);
 	}
-	const std::string cl = out.Header("Content-Length");
 	if (!cl.empty()) {
 		std::uint64_t len = 0;
 		if (!ParseNumber(cl, 10, len) || len > raw.size() - body_start) {
@@ -183,6 +213,63 @@ bool ParseRawHttpResponse(const std::string &raw, RawHttpResponse &out) {
 	}
 	out.body = raw.substr(body_start);
 	return true;
+}
+
+bool RawHttpResponseComplete(const std::string &raw) {
+	// Called after every read of a download, so it must not re-parse the body:
+	// look at the head only, then compare lengths (or, for chunked, check for
+	// the terminating chunk before decoding once).
+	const auto head_end = raw.find("\r\n\r\n");
+	if (head_end == std::string::npos) {
+		return false;
+	}
+	RawHttpResponse head;
+	if (!ParseHead(raw, head_end, head)) {
+		return false;
+	}
+	const std::string cl = head.Header("Content-Length");
+	if (!cl.empty()) {
+		std::uint64_t len = 0;
+		return ParseNumber(cl, 10, len) && raw.size() - (head_end + 4) >= len;
+	}
+	if (!head.Header("Transfer-Encoding").empty()) {
+		static const std::string kLastChunk = "0\r\n\r\n";
+		if (raw.size() < kLastChunk.size() ||
+		    raw.compare(raw.size() - kLastChunk.size(), kLastChunk.size(), kLastChunk) != 0) {
+			return false;
+		}
+		RawHttpResponse full;
+		return ParseRawHttpResponse(raw, full);
+	}
+	return false; // unframed: complete only at EOF
+}
+
+bool AcceptRangeReply(int status, const std::string &content_range, std::string &body, std::uint64_t offset,
+                      std::uint64_t length) {
+	if (status == 206) {
+		if (body.size() != length) {
+			return false;
+		}
+		if (!content_range.empty()) {
+			// "bytes <start>-<end>/<total>"
+			static const std::string kUnit = "bytes ";
+			auto dash = content_range.find('-');
+			std::uint64_t start = 0;
+			if (content_range.compare(0, kUnit.size(), kUnit) != 0 || dash == std::string::npos ||
+			    !ParseNumber(content_range.substr(kUnit.size(), dash - kUnit.size()), 10, start) || start != offset) {
+				return false;
+			}
+		}
+		return true;
+	}
+	if (status == 200) {
+		if (offset > body.size() || length > body.size() - offset) {
+			return false;
+		}
+		body = body.substr(offset, length);
+		return true;
+	}
+	return false;
 }
 
 bool SplitHttpsOrigin(const std::string &origin, std::string &host, int &port) {
@@ -203,7 +290,7 @@ bool SplitHttpsOrigin(const std::string &origin, std::string &host, int &port) {
 		host = authority.substr(0, colon);
 		port = static_cast<int>(p);
 	}
-	return IsVisibleAscii(host) && host.find('/') == std::string::npos;
+	return IsVisibleAscii(host) && host.find_first_of("/?#@[]") == std::string::npos;
 }
 
 } // namespace sharepoint

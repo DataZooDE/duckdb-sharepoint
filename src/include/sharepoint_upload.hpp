@@ -38,9 +38,11 @@ std::string UploadContentRange(std::uint64_t start, std::uint64_t length, std::u
 //! Split an absolute "scheme://host[:port]/path?query" into its origin
 //! ("scheme://host[:port]") and the remainder ("/path?query"). Returns false if
 //! `url` has no "://" scheme separator. For a URL with no path the remainder
-//! defaults to "/". The Graph uploadUrl is a pre-authenticated absolute URL,
-//! usually on a different host than the Graph endpoint, so it needs its own
-//! httplib client bound to this origin.
+//! defaults to "/" (and a query with no path keeps its query). Graph's
+//! pre-authenticated URLs (uploadUrl, the /content redirect) are absolute and
+//! usually on another host; PreauthenticatedRequest splits them with this and
+//! sends the remainder verbatim (never through httplib, which would re-sort
+//! the signed query).
 bool SplitAbsoluteUrl(const std::string &url, std::string &origin, std::string &path_and_query);
 
 //! True iff `url` is an absolute https:// URL (scheme case-insensitive). Graph
@@ -48,11 +50,6 @@ bool SplitAbsoluteUrl(const std::string &url, std::string &origin, std::string &
 //! redirect -- whose query string IS the credential, so they are only ever
 //! followed over TLS; a downgrade to http:// is refused.
 bool IsHttpsUrl(const std::string &url);
-
-//! A ranged GET answered 200 (Range ignored) carries the WHOLE file. Cut `body`
-//! down to [offset, offset+length) in place. Returns false, leaving `body`
-//! untouched, if the body is too short to contain that range.
-bool SliceRangeFromFullBody(std::string &body, std::uint64_t offset, std::uint64_t length);
 
 //! Parse the start offset of a Graph nextExpectedRanges entry:
 //!   "512-1023" -> 512 ; "655360-" -> 655360.
