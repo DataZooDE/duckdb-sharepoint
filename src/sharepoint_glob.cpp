@@ -1,41 +1,259 @@
 #include "sharepoint_glob.hpp"
 
+#include <cstddef>
+#include <cstdint>
+#include <string>
 #include <unordered_map>
 
 namespace duckdb {
 namespace sharepoint {
 
-bool HasGlobMeta(const std::string &segment) {
-	return segment.find('*') != std::string::npos || segment.find('?') != std::string::npos;
+bool HasGlobMetacharacters(const std::string &segment) {
+	return segment.find_first_of("*?[{") != std::string::npos;
 }
 
-// Iterative backtracking matcher -- O(n*m) worst case, no recursion, no
-// allocation. `*` never crosses a '/', but since this is only ever handed a
-// single segment (never a path), that is automatic.
-bool MatchGlob(const std::string &pattern, const std::string &name) {
-	std::size_t p = 0, n = 0;
-	std::size_t star = std::string::npos;
-	std::size_t match = 0;
-	while (n < name.size()) {
-		if (p < pattern.size() && (pattern[p] == '?' || pattern[p] == name[n])) {
-			p++;
-			n++;
-		} else if (p < pattern.size() && pattern[p] == '*') {
-			star = p;
-			match = n;
-			p++;
-		} else if (star != std::string::npos) {
-			p = star + 1;
-			match++;
-			n = match;
-		} else {
+namespace {
+
+// Ported from gdrive_glob.cpp, unchanged: both extensions must accept the
+// same patterns the same way.
+// ---------------------------------------------------------------------------
+// Character class matching: "[abc]", "[a-z]", "[!abc]"/"[^abc]", with the
+// classic glob carve-outs for a literal ']' as the first member and a
+// literal '-' at either end of the class.
+//
+// Returns whether the class starting at pattern[start] (the character right
+// after '[') is well-formed; on success `end` is set to the index one past
+// the closing ']', and `matched` reports whether `c` is a class member.
+// On failure (no closing ']' found) the class is not well-formed and the
+// caller falls back to treating '[' as a literal character -- see
+// the decision note below.
+// ---------------------------------------------------------------------------
+bool TryMatchClass(const std::string &pattern, size_t start, char c, size_t &end, bool &matched) {
+	size_t i = start;
+	const size_t n = pattern.size();
+	bool negate = false;
+	if (i < n && (pattern[i] == '!' || pattern[i] == '^')) {
+		negate = true;
+		i++;
+	}
+	bool found = false;
+	bool first = true;
+	while (true) {
+		if (i >= n) {
+			// unterminated class -- no closing ']'.
 			return false;
 		}
+		if (pattern[i] == ']' && !first) {
+			// closing bracket.
+			end = i + 1;
+			matched = negate ? !found : found;
+			return true;
+		}
+		first = false;
+		// a range like "a-z", but not when '-' is the last class member
+		// (immediately followed by ']') or when it starts the class body.
+		if (i + 2 < n && pattern[i + 1] == '-' && pattern[i + 2] != ']') {
+			char lo = pattern[i];
+			char hi = pattern[i + 2];
+			if (c >= lo && c <= hi) {
+				found = true;
+			}
+			i += 3;
+		} else {
+			if (pattern[i] == c) {
+				found = true;
+			}
+			i++;
+		}
 	}
-	while (p < pattern.size() && pattern[p] == '*') {
-		p++;
+}
+
+// ---------------------------------------------------------------------------
+// Two-pointer backtracking matcher, the same shape as DuckDB's own
+// scalar `Glob` (src/function/scalar/string/like.cpp): O(pattern * name)
+// worst case, never exponential, because a failed match only ever rewinds
+// to the most recent '*' and advances its start position by one -- it does
+// not re-explore already-failed suffixes.
+// ---------------------------------------------------------------------------
+bool MatchSegmentImpl(const std::string &pattern, const std::string &name) {
+	const size_t plen = pattern.size();
+	const size_t slen = name.size();
+	size_t pidx = 0, sidx = 0;
+	size_t star_pidx = std::string::npos, star_sidx = 0;
+
+	while (sidx < slen) {
+		bool matched = false;
+		size_t next_pidx = pidx;
+
+		if (pidx < plen) {
+			char p = pattern[pidx];
+			if (p == '*') {
+				pidx++;
+				while (pidx < plen && pattern[pidx] == '*') {
+					pidx++;
+				}
+				if (pidx == plen) {
+					return true; // trailing '*' matches the remainder unconditionally
+				}
+				star_pidx = pidx;
+				star_sidx = sidx;
+				continue;
+			} else if (p == '?') {
+				matched = true; // matches exactly one byte, whatever it is
+				next_pidx = pidx + 1;
+			} else if (p == '[') {
+				size_t class_end;
+				bool class_matched;
+				if (TryMatchClass(pattern, pidx + 1, name[sidx], class_end, class_matched)) {
+					matched = class_matched;
+					next_pidx = class_end;
+				} else {
+					// Decision: an unclosed '[' is not an error. It degrades
+					// to matching itself as a literal character. A thrown
+					// exception here would abort an entire folder scan
+					// because of one oddly-named file; staying total is
+					// worth more than being strict.
+					matched = (name[sidx] == '[');
+					next_pidx = pidx + 1;
+				}
+			} else {
+				matched = (name[sidx] == p);
+				next_pidx = pidx + 1;
+			}
+		}
+
+		if (matched) {
+			sidx++;
+			pidx = next_pidx;
+			continue;
+		}
+
+		if (star_pidx == std::string::npos) {
+			return false;
+		}
+		// backtrack: the last '*' consumes one more character and we retry.
+		star_sidx++;
+		sidx = star_sidx;
+		pidx = star_pidx;
 	}
-	return p == pattern.size();
+
+	// consume any trailing '*'s -- they match the empty remainder.
+	while (pidx < plen && pattern[pidx] == '*') {
+		pidx++;
+	}
+	return pidx == plen;
+}
+
+
+constexpr size_t kMaxBracePatternLength = 4096;
+constexpr size_t kMaxBraceExpansions = 1024;
+constexpr int kMaxBraceDepth = 64;
+
+//! Returns false the instant `budget` would be exceeded or `depth` runs past
+//! kMaxBraceDepth. On false, `out` is left in an unspecified partial state --
+//! callers must propagate the failure rather than use it.
+//! Returns false the instant `budget` would be exceeded or `depth` runs past
+//! kMaxBraceDepth. On false, `out` is left in an unspecified partial state --
+//! callers must propagate the failure rather than use it.
+bool ExpandBracesInto(const std::string &pattern, int depth, size_t &budget, std::vector<std::string> &out) {
+	if (depth > kMaxBraceDepth) {
+		return false;
+	}
+
+	// Find the first top-level (unnested) balanced brace group.
+	int brace_depth = 0;
+	size_t brace_start = std::string::npos;
+	size_t brace_end = std::string::npos;
+	for (size_t i = 0; i < pattern.size(); i++) {
+		if (pattern[i] == '{') {
+			if (brace_depth == 0) {
+				brace_start = i;
+			}
+			brace_depth++;
+		} else if (pattern[i] == '}') {
+			if (brace_depth > 0) {
+				brace_depth--;
+				if (brace_depth == 0 && brace_start != std::string::npos) {
+					brace_end = i;
+					break;
+				}
+			}
+		}
+	}
+
+	if (brace_start == std::string::npos || brace_end == std::string::npos) {
+		// No top-level brace group found (including an unmatched '{' or a
+		// stray '}'): left as a literal, no expansion performed.
+		if (budget == 0) {
+			return false;
+		}
+		budget--;
+		out.push_back(pattern);
+		return true;
+	}
+
+	std::string prefix = pattern.substr(0, brace_start);
+	std::string inner = pattern.substr(brace_start + 1, brace_end - brace_start - 1);
+	std::string suffix = pattern.substr(brace_end + 1);
+
+	// Split `inner` on top-level commas (commas inside a nested brace group
+	// do not separate alternatives at this level).
+	std::vector<std::string> alternatives;
+	int inner_depth = 0;
+	size_t start = 0;
+	for (size_t i = 0; i < inner.size(); i++) {
+		if (inner[i] == '{') {
+			inner_depth++;
+		} else if (inner[i] == '}') {
+			inner_depth--;
+		} else if (inner[i] == ',' && inner_depth == 0) {
+			alternatives.push_back(inner.substr(start, i - start));
+			start = i + 1;
+		}
+	}
+	alternatives.push_back(inner.substr(start));
+
+	std::vector<std::string> suffix_expansions;
+	if (!ExpandBracesInto(suffix, depth + 1, budget, suffix_expansions)) {
+		return false;
+	}
+
+	for (auto &alt : alternatives) {
+		std::vector<std::string> alt_expanded;
+		if (!ExpandBracesInto(alt, depth + 1, budget, alt_expanded)) {
+			return false;
+		}
+		for (auto &alt_str : alt_expanded) {
+			for (auto &suffix_str : suffix_expansions) {
+				if (budget == 0) {
+					return false;
+				}
+				budget--;
+				out.push_back(prefix + alt_str + suffix_str);
+			}
+		}
+	}
+	return true;
+}
+
+} // namespace
+
+bool MatchSegment(const std::string &pattern, const std::string &name) {
+	return MatchSegmentImpl(pattern, name);
+}
+
+std::vector<std::string> ExpandBraces(const std::string &pattern) {
+	if (pattern.size() > kMaxBracePatternLength) {
+		// See the overflow-signalling convention above: empty means
+		// rejected, not "matches nothing".
+		return {};
+	}
+	size_t budget = kMaxBraceExpansions;
+	std::vector<std::string> result;
+	if (!ExpandBracesInto(pattern, 0, budget, result)) {
+		return {};
+	}
+	return result;
 }
 
 namespace {
@@ -90,10 +308,10 @@ void GlobRecurse(const std::vector<std::string> &segs, std::size_t i, const std:
 
 	for (const auto &c : children) {
 		if (is_last) {
-			if (!c.is_folder && MatchGlob(seg, c.name)) {
+			if (!c.is_folder && MatchSegment(seg, c.name)) {
 				out.push_back(Join(folder, c.name));
 			}
-		} else if (c.is_folder && MatchGlob(seg, c.name)) {
+		} else if (c.is_folder && MatchSegment(seg, c.name)) {
 			GlobRecurse(segs, i + 1, Join(folder, c.name), list, cache, out);
 		}
 	}

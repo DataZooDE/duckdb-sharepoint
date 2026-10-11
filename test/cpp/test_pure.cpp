@@ -1,6 +1,7 @@
 // Catch2 pure-logic tests. No DuckDB linkage, no network, no credentials --
 // runnable by anyone who can build. `make unit_test`.
 #include "sharepoint_blockcache.hpp"
+#include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_glob.hpp"
 #include "sharepoint_identity.hpp"
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <atomic>
 #include <map>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -79,6 +81,25 @@ TEST_CASE("id: values are restricted to Graph's id alphabet", "[uri]") {
 	}
 }
 
+TEST_CASE("names SharePoint forbids are caught before Graph sees them", "[uri]") {
+	// ':' is also Graph's root:/path: delimiter -- sent through, it surfaced as
+	// "Resource not found for the segment 'root:'", which explains nothing.
+	REQUIRE(ForbiddenNameChar("report.csv") == '\0');
+	REQUIRE(ForbiddenNameChar("it's #1 %41+b & {x} ü.txt") == '\0');
+	for (char c : std::string("\"*:<>?\\|")) {
+		INFO(c);
+		REQUIRE(ForbiddenNameChar(std::string("a") + c + "b") == c);
+	}
+}
+
+TEST_CASE("the drive root is recognised in every spelling", "[uri]") {
+	REQUIRE(IsDriveRoot(ParseSharepointUri("sharepoint://").uri));
+	REQUIRE(IsDriveRoot(ParseSharepointUri("sharepoint:///").uri));
+	REQUIRE(IsDriveRoot(ParseSharepointUri("sharepoint:////").uri));
+	REQUIRE_FALSE(IsDriveRoot(ParseSharepointUri("sharepoint://a").uri));
+	REQUIRE_FALSE(IsDriveRoot(ParseSharepointUri("sharepoint://id:01ABC").uri));
+}
+
 TEST_CASE("non-sharepoint URIs are rejected", "[uri]") {
 	REQUIRE_FALSE(IsSharepointUri("s3://bucket/x"));
 	REQUIRE_FALSE(ParseSharepointUri("gdrive://a/b").ok);
@@ -101,13 +122,13 @@ TEST_CASE("immutable-prefix matching is per-segment", "[uri]") {
 }
 
 TEST_CASE("glob matches within a segment", "[glob]") {
-	REQUIRE(MatchGlob("*.parquet", "actuals.parquet"));
-	REQUIRE(MatchGlob("part-*.csv", "part-0001.csv"));
-	REQUIRE(MatchGlob("file-??.txt", "file-07.txt"));
-	REQUIRE_FALSE(MatchGlob("*.parquet", "actuals.csv"));
-	REQUIRE_FALSE(MatchGlob("file-??.txt", "file-7.txt"));
-	REQUIRE(HasGlobMeta("*.parquet"));
-	REQUIRE_FALSE(HasGlobMeta("actuals.parquet"));
+	REQUIRE(MatchSegment("*.parquet", "actuals.parquet"));
+	REQUIRE(MatchSegment("part-*.csv", "part-0001.csv"));
+	REQUIRE(MatchSegment("file-??.txt", "file-07.txt"));
+	REQUIRE_FALSE(MatchSegment("*.parquet", "actuals.csv"));
+	REQUIRE_FALSE(MatchSegment("file-??.txt", "file-7.txt"));
+	REQUIRE(HasGlobMetacharacters("*.parquet"));
+	REQUIRE_FALSE(HasGlobMetacharacters("actuals.parquet"));
 }
 
 // A synthetic drive tree for the recursive-glob tests. No Graph, no I/O: the
@@ -644,5 +665,27 @@ TEST_CASE("tenant ids are a GUID or a domain", "[identity]") {
 	for (const char *bad : {"", "a/b", "x?y", "x#y", "..", "a b", "contoso.com/../evil", "%2e%2e"}) {
 		INFO(bad);
 		REQUIRE_FALSE(IsValidTenantId(bad));
+	}
+}
+
+TEST_CASE("call counters count, snapshot by name and reset", "[counters]") {
+	ResetCounters();
+	IncrementCounter(Counter::STAT);
+	IncrementCounter(Counter::STAT);
+	IncrementCounter(Counter::BYTES_READ, 4096);
+	std::map<std::string, std::uint64_t> snap;
+	std::set<std::string> names;
+	for (const auto &kv : SnapshotCounters()) {
+		snap[kv.first] = kv.second;
+		names.insert(kv.first);
+		REQUIRE(std::string(kv.first) != "unknown"); // every counter is named
+	}
+	REQUIRE(names.size() == static_cast<std::size_t>(Counter::COUNT_)); // names are unique
+	REQUIRE(snap["stat"] == 2);
+	REQUIRE(snap["bytes_read"] == 4096);
+	REQUIRE(snap["read_range"] == 0);
+	ResetCounters();
+	for (const auto &kv : SnapshotCounters()) {
+		REQUIRE(kv.second == 0);
 	}
 }

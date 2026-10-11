@@ -18,6 +18,20 @@ WHERE function_name IN ('write_blob', 'remove_file', 'move_file', 'file_size');
 ----
 4
 
+# Call counters: registered, every metric present, resettable.
+query I
+SELECT count(*) FROM sharepoint_stats();
+----
+16
+
+statement ok
+CALL sharepoint_reset_stats();
+
+query I
+SELECT sum(value) FROM sharepoint_stats();
+----
+0
+
 # The `sharepoint` secret type exists (creating one needs no network).
 statement ok
 CREATE SECRET sp_test (

@@ -74,3 +74,25 @@ smoke_static: release
 .PHONY: smoke_loadable
 smoke_loadable: release
 	@./scripts/smoke_loadable.sh
+
+# ---------------------------------------------------------------------------
+# Live end-to-end harness (Python + uv), ported from duckdb-gdrive: what SQL
+# tests cannot express -- a change made OUTSIDE a running DuckDB process, a
+# restart, a multi-threaded scan. Needs SHAREPOINT_* credentials (environment
+# or a git-ignored .env.sharepoint). Every test works in its own scratch
+# folder under /_duckdb_sharepoint_e2e and deletes it on teardown.
+# ---------------------------------------------------------------------------
+.PHONY: e2e
+e2e: release
+	@cd e2e && uv run --locked pytest -v
+
+# Delete scratch folders crashed runs leaked (older than 24 h).
+.PHONY: sweep_orphans
+sweep_orphans:
+	@cd e2e && uv run python -m helpers.sweep
+
+# The shared VFS functions must stay identical to duckdb-gdrive's copy (both
+# register them; whichever loads first wins). Needs a sibling checkout.
+.PHONY: check_vfs_parity
+check_vfs_parity:
+	@./scripts/check_vfs_parity.sh
