@@ -167,6 +167,29 @@ bool IsFileIdFallbackGlobProbe(const std::string &uri) {
 	return !ext.empty() && ext.find('/') == std::string::npos && ext.find('*') == std::string::npos;
 }
 
+bool IsDriveRoot(const SharepointUri &uri) {
+	return uri.kind == SharepointUriKind::PATH && uri.segments.empty();
+}
+
+char ForbiddenNameChar(const std::string &name) {
+	for (char c : name) {
+		switch (c) {
+		case '"':
+		case '*':
+		case ':':
+		case '<':
+		case '>':
+		case '?':
+		case '\\':
+		case '|':
+			return c;
+		default:
+			break;
+		}
+	}
+	return '\0';
+}
+
 bool PathMatchesAnyPrefix(const std::string &path, const std::string &csv_prefixes) {
 	if (csv_prefixes.empty()) {
 		return false;

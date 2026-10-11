@@ -5,24 +5,18 @@ A DuckDB extension that registers a **`sharepoint://`** filesystem over
 SharePoint document library (or OneDrive) with no download or copy step.
 Because DuckDB dispatches file access through its virtual filesystem,
 everything layered on it inherits the scheme: `read_parquet`, `read_csv`,
-`COPY`, `glob`, and table formats such as DuckLake whose `DATA_PATH` lives on
-SharePoint.
+`COPY`, `glob`, `ATTACH` of a DuckDB database file, and table formats such as
+DuckLake whose `DATA_PATH` lives on SharePoint.
 
 It is the sibling of [`duckdb-gdrive`](https://github.com/DataZooDE/duckdb-gdrive)
-and shares its design and its scheme-generic `write_blob` / `remove_file` /
-`move_file` / `file_size` SQL functions. Its first consumer is
-[escurel](https://github.com/DataZooDE)'s DuckDB-VFS `LaneStore`, which needs a
-`sharepoint://` backing store with the same read/write/delete/rename surface it
-already drives on `gdrive://`.
+and shares its design, its glob syntax and its scheme-generic `write_blob` /
+`remove_file` / `move_file` / `file_size` SQL functions. Both extensions load
+into one database side by side.
 
-> **Status: scaffold.** The pure-logic layer (URI parsing, glob matching, error
-> classification) is implemented and unit-tested. The Graph-facing layer
-> (`sharepoint_auth.cpp`, `sharepoint_client.cpp`, `sharepoint_filesystem.cpp`)
-> is written against the documented Graph v1.0 API but **has not been compiled
-> or run against a live tenant** — there is no DuckDB submodule checked out yet.
-> The resumable upload-session path for files larger than the chunk size is a
-> marked TODO. See [`docs/hld.md`](docs/hld.md) for the design and the exact
-> remaining work.
+> **Status:** verified end to end against a real Microsoft 365 tenant —
+> the live SQL suite (`make test_live`) and the e2e harness (`make e2e`:
+> out-of-band changes, restarts, 16-thread scans, DuckLake, two drives) pass.
+> Built for DuckDB **v1.5.6** and the **v1.4.5 LTS** line.
 
 ## Why SharePoint is simpler than Drive
 
@@ -36,7 +30,7 @@ GET /drives/{drive-id}/root:/Finance/2026/actuals.parquet:/content
 
 So this extension needs **no path cache**, and because SharePoint forbids two
 items of the same name in one folder, it needs none of gdrive's
-duplicate-sibling-name (`R-4`) disambiguation either.
+duplicate-sibling-name disambiguation either.
 
 ## Installation
 
@@ -82,49 +76,99 @@ SELECT count(*) FROM 'sharepoint://Finance/2026/actuals.parquet';
 -- Or by driveItem id — stable across a rename.
 SELECT * FROM read_csv('sharepoint://id:01ABCDEF23456789');
 
--- Glob a folder.
-SELECT * FROM read_parquet('sharepoint://exports/parts/*.parquet');
+-- Glob: * ? [a-z] [!x] ** and {a,b} alternation, as in duckdb-gdrive.
+SELECT * FROM read_parquet('sharepoint://exports/**/part-[0-9]*.parquet');
 
--- Write a whole file. Writes are sequential; Graph replaces whole files, so a
--- positional write raises rather than corrupting.
+-- Write a whole file. Graph replaces whole files, so a positional write or an
+-- append raises rather than corrupting.
 COPY (SELECT * FROM t) TO 'sharepoint://reports/out.parquet' (FORMAT parquet);
+
+-- Attach a DuckDB database file stored in SharePoint, read-only.
+ATTACH 'sharepoint://warehouse/sales.duckdb' AS sales (READ_ONLY);
 
 -- Byte-exact round trip for any content, no CSV/Parquet in between.
 SELECT write_blob('sharepoint://notes/readme.md', '# Title'::BLOB);
-SELECT remove_file('sharepoint://notes/readme.md');
+SELECT remove_file('sharepoint://notes/readme.md');   -- true, then false
 ```
 
 ## Authentication
 
 | provider | use | fields |
 |---|---|---|
-| `client_credentials` *(default)* | headless daemon / escurel | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` |
+| `client_credentials` *(default)* | headless daemon | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` |
 | `config` | paste a pre-obtained token | `ACCESS_TOKEN` *(or `REFRESH_TOKEN` + `TENANT_ID`/`CLIENT_ID`/`CLIENT_SECRET`)* |
 
-Common to both: `DRIVE_ID` **or** `SITE_ID` (the drive the paths hang off), and
-optional `GRAPH_SCOPE` (defaults to `https://graph.microsoft.com/.default`).
-Interactive delegated flows (`authorization_code` / `device_code`) are a
-planned follow-up — they need the `datazoo-oauth2` submodule the sibling gdrive
-uses.
+Common to both: `DRIVE_ID` **or** `SITE_ID` (the drive the paths hang off;
+a `SITE_ID` is resolved to the site's default library once and cached), and an
+optional `GRAPH_SCOPE` (defaults to `<graph endpoint>/.default`, i.e. the right
+cloud). Several secrets can coexist; DuckDB picks the one whose `SCOPE` path
+prefix matches best, so different folders can map to different drives (moves
+between two drives are refused rather than silently landing in one of them).
+
+Tokens are cached per **fingerprint of the credentials** (never per secret
+name), so a secret recreated under the same name with different credentials
+authenticates afresh. Interactive delegated flows (`authorization_code` /
+`device_code`) are a planned follow-up.
 
 > The option is `GRAPH_SCOPE`, **not** `SCOPE`: DuckDB's `CREATE SECRET` grammar
 > reserves `SCOPE` for the secret's path-matching prefix list, so an OAuth scope
 > named `scope` would silently rescope the secret to match no path at all. This
 > is the same trap `duckdb-gdrive` documents for `DRIVE_SCOPE`.
 
-## Building
+## Settings
+
+| setting | default | meaning |
+|---|---|---|
+| `sharepoint_block_size_bytes` | 8 MiB | Reads are served from a shared, single-flight block cache (256 MiB, LRU, keyed by credentials + item + cTag). Capped at 64 MiB; `0` disables it. |
+| `sharepoint_upload_chunk_bytes` | 10 MiB | Files up to this size upload in one PUT; larger ones use a resumable upload session in chunks of this size (a multiple of 320 KiB, below 60 MiB). |
+| `sharepoint_permanent_delete` | `false` | `remove_file` sends items to the site's recycle bin unless this is set. |
+| `sharepoint_immutable_prefixes` | *(empty)* | Comma-separated `sharepoint://` prefixes whose files are **never rewritten in place** (e.g. a DuckLake `DATA_PATH`). Their metadata is remembered, saving a Graph call per open. **Declaring a prefix whose files change causes stale reads.** |
+| `sharepoint_graph_endpoint` / `sharepoint_login_endpoint` | global cloud | National clouds: `https://graph.microsoft.us` / `https://login.microsoftonline.us` (GCC High), `https://dod-graph.microsoft.us`, or the China cloud. Only these Microsoft hosts are accepted, so credentials cannot be redirected elsewhere. |
+| `sharepoint_telemetry_enabled` | `true` | Anonymous usage telemetry, shared with the sibling DataZoo extensions. `false` stops it for the rest of the session; the one-time load event is sent before any setting can exist (DuckDB rejects a setting for an extension that is not loaded yet), so to suppress that too set the environment variable `DATAZOO_DISABLE_TELEMETRY=1`. |
+
+## Diagnostics
+
+```sql
+CALL sharepoint_reset_stats();
+SELECT * FROM read_parquet('sharepoint://exports/**/*.parquet');
+SELECT * FROM sharepoint_stats();   -- token_request, stat, read_range, list_page,
+                                    -- upload_*, retries, throttled, bytes_read, ...
+```
+
+Graph throttles SharePoint aggressively; every call is retried with jittered
+exponential backoff (500 ms → 20 s, honouring `Retry-After`), and the
+`throttled` / `retries` counters show it happening. Errors carry Graph's error
+code (`HTTP 409 (conflict, nameAlreadyExists): ...`) and map to
+`PermissionException` (403) or `InvalidInputException` (400) where that is what
+they are.
+
+## Limitations
+
+- **Whole-file writes.** Graph replaces files; there is no positional write
+  or append. A write is buffered and uploaded on close.
+- **Names.** SharePoint forbids `" * : < > ? \ |` in file and folder names;
+  such writes are refused up front.
+- **ATTACH is read-only** (a DuckDB database file cannot be updated in place).
+- **Delegated (user) auth** is not implemented yet.
+- **Error class for a missing secret** is `InvalidInputException` here and
+  `IOException` in `duckdb-gdrive`.
+
+## Building and testing
 
 ```sh
 git clone --recursive https://github.com/DataZooDE/duckdb-sharepoint
 cd duckdb-sharepoint
-make            # builds the extension + runs the Catch2 pure-logic tests
-make test_live  # SQL round trip against a real tenant (needs env credentials)
+GEN=ninja make      # extension + Catch2 binary
+make test           # Catch2 pure-logic + credential-free SQL tests
+make test_live      # SQL round trip against a real tenant
+make e2e            # live end-to-end harness (Python + uv)
+make check_pin check_credentials check_cstdint check_stamp smoke_loadable
 ```
 
-## National clouds
-
-Set `sharepoint_graph_endpoint` and `sharepoint_login_endpoint` for GCC-High
-(`graph.microsoft.us` / `login.microsoftonline.us`) or 21Vianet.
+Live tests read `SHAREPOINT_TENANT_ID`, `SHAREPOINT_CLIENT_ID`,
+`SHAREPOINT_CLIENT_SECRET` and `SHAREPOINT_DRIVE_ID` from the environment (or a
+git-ignored `.env.sharepoint`, see `.env.sharepoint.example`). There are no
+mocks: everything Graph-facing is proven against a real tenant.
 
 ## License
 
