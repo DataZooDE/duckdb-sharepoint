@@ -1,33 +1,261 @@
-# Fast per-PR checks that need no DuckDB platform matrix: credential hygiene
-# and (once the duckdb submodule is pinned) the Catch2 pure-logic tests.
+#
+# Correctness gates that the reusable distribution workflow cannot host.
+# Mirrors the sibling duckdb-gdrive's Checks.yml.
+#
+# The live suite runs against a REAL Microsoft Graph tenant -- there is no fake
+# and no replay. A pull request from a FORK cannot access repository secrets,
+# so it runs the credential-free layers only; `live` is skipped there, visibly,
+# rather than passing vacuously.
+#
 name: Checks
 on:
+  # main only: a same-repo PR branch already runs via pull_request, and the
+  # live job must not hit the tenant twice per push.
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
+  schedule:
+    # Nightly: sweep the e2e scratch folders crashed runs leaked. 03:47 UTC,
+    # off the hour (gdrive sweeps at 03:17).
+    - cron: '47 3 * * *'
+
+concurrency:
+  # The nightly sweep gets its own group so it never cancels or queues
+  # behind a push run on main.
+  group: checks-${{ github.ref }}-${{ github.event_name == 'schedule' && 'nightly' || 'run' }}
+  # Never cancel a run on main mid-way: a cancelled live/e2e job leaks its
+  # scratch folders into the tenant.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Always runs. No credentials, no network. Anyone can reproduce this.
+  # ---------------------------------------------------------------------------
   hygiene:
+    timeout-minutes: 15
     name: Credential hygiene
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: No credentials committed
         run: ./scripts/check_no_credentials.sh
 
-  unit-tests:
-    name: Catch2 pure-logic tests
+  # A submodule that has drifted off the shipped tag makes every local green
+  # meaningless: DuckDB's C++ API differs between versions.
+  pin:
+    timeout-minutes: 15
+    name: duckdb submodule on the shipped tag
     runs-on: ubuntu-latest
     steps:
-      # No submodules and nothing to install: the pure layer builds standalone
-      # (test/cpp/CMakeLists.txt) needing only Catch2 -- no DuckDB, no OpenSSL,
-      # no vcpkg. Catch2 comes from the system if present, else FetchContent, so
-      # this stays a seconds-long gate instead of a full platform-matrix build.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+      - run: ./scripts/check_duckdb_pin.sh
+
+  # write_blob/remove_file/move_file/file_size are registered by this extension
+  # AND duckdb-gdrive with IGNORE_ON_CONFLICT; whichever loads first wins, so
+  # the two copies must stay identical. Compares against the sibling's main.
+  vfs-parity:
+    timeout-minutes: 15
+    name: Shared VFS functions identical to duckdb-gdrive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: DataZooDE/duckdb-gdrive
+          path: sibling
+      - run: ./scripts/check_vfs_parity.sh sibling
+
+  # Seconds-long gate. The pure layer builds standalone (test/cpp/CMakeLists.txt)
+  # needing only Catch2 -- no DuckDB, no OpenSSL, no vcpkg. Catch2 comes from
+  # the system if present, else FetchContent.
+  unit-fast:
+    timeout-minutes: 15
+    name: Catch2 pure-logic tests (standalone)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build + run the pure-logic tests
         run: |
           cmake -S test/cpp -B build/unit
           cmake --build build/unit -j
           ./build/unit/sharepoint_unit_tests --reporter console::out=-
+      # The block cache is process-wide and shared by every scan thread. A
+      # single-threaded green says nothing about it, and its accounting race
+      # was invisible to the stress test alone -- ThreadSanitizer caught it.
+      - name: Concurrency tests under ThreadSanitizer
+        run: |
+          cmake -S test/cpp -B build/unit-tsan -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -g -O1" -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+          cmake --build build/unit-tsan -j
+          TSAN_OPTIONS=halt_on_error=1 ./build/unit-tsan/sharepoint_unit_tests "[blockcache]"
+
+  # ---------------------------------------------------------------------------
+  # musl. The 1.4 LTS matrix builds linux_amd64_musl, whose headers do NOT
+  # pull in <cstdint> transitively the way glibc's do. A grep names the file in
+  # milliseconds; a real musl compile of the pure sources catches the rest.
+  # ---------------------------------------------------------------------------
+  musl:
+    timeout-minutes: 15
+    name: musl compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Fixed-width integer types include <cstdint>
+        run: ./scripts/check_cstdint.sh
+      - name: Compile pure sources against musl
+        run: |
+          docker run --rm -v "$PWD":/w -w /w alpine:3.20 sh -c '
+            set -e
+            apk add --no-cache g++ >/dev/null
+            fail=0
+            for f in src/sharepoint_uri.cpp src/sharepoint_errors.cpp src/sharepoint_glob.cpp \
+                     src/sharepoint_upload.cpp src/sharepoint_blockcache.cpp src/sharepoint_rawhttp.cpp src/sharepoint_identity.cpp src/sharepoint_counters.cpp \
+                     src/sharepoint_version.cpp; do
+              if g++ -std=c++17 -fsyntax-only -Isrc/include "$f"; then
+                echo "  ok   $f"
+              else
+                echo "  FAIL $f"; fail=1
+              fi
+            done
+            exit $fail
+          '
+
+  # The full extension build, outside the distribution matrix: both test layers
+  # plus the gates on the artifact users actually install.
+  unit:
+    timeout-minutes: 90
+    name: Full build + credential-free SQL + artifact gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+      # actions/checkout does not fetch submodule TAGS, and DuckDB derives its
+      # own version from `git describe --tags` inside duckdb/. Without them the
+      # artifact is stamped for a version that does not exist.
+      - name: Fetch duckdb tags (DuckDB versions itself from git describe)
+        run: git -C duckdb fetch --tags --force origin
+      # Pinned to the commit extension-ci-tools' v1.5 distribution uses, never
+      # HEAD: the live job holds tenant secrets, so nothing it runs may float.
+      - name: Install vcpkg (pinned)
+        run: |
+          git init -q "$HOME/vcpkg"
+          git -C "$HOME/vcpkg" fetch -q --depth 1 https://github.com/microsoft/vcpkg.git 84bab45d415d22042bd0b9081aea57f362da3f35
+          git -C "$HOME/vcpkg" checkout -q FETCH_HEAD
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
+          echo "VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
+      - name: Install ninja
+        run: sudo apt-get install -y ninja-build
+      - name: Build
+        run: GEN=ninja make
+      - name: Catch2 + SQL tests (live ones skip without credentials)
+        run: make test
+      - name: Static linkage allowlist
+        run: make smoke_static
+      - name: Extension stamped for the target DuckDB
+        run: make check_stamp
+      # A stock CLI of the EXACT target version, so smoke_loadable really runs;
+      # under CI a skip there is fatal.
+      - name: Install stock duckdb v1.5.6
+        run: |
+          curl -sSLo /tmp/duckdb.zip \
+            https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
+          echo "6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f  /tmp/duckdb.zip" | sha256sum -c -
+          unzip -q -o /tmp/duckdb.zip -d /tmp/duckdb-cli
+          sudo install -m 0755 /tmp/duckdb-cli/duckdb /usr/local/bin/duckdb
+          duckdb -noheader -list -c "SELECT version();"
+      - name: Shipped artifact loads in a stock duckdb
+        run: make smoke_loadable
+
+  # ---------------------------------------------------------------------------
+  # The real thing. Needs secrets, so it cannot run on fork PRs.
+  # ---------------------------------------------------------------------------
+  live:
+    timeout-minutes: 120
+    name: Live tests against a real Graph tenant
+    runs-on: ubuntu-latest
+    # `secrets` is not available in job-level `if`, so gate on the event:
+    # fork PRs have a head repo different from the base repo.
+    # Not on the nightly schedule (that only sweeps), and not for fork PRs,
+    # which cannot read secrets.
+    if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+      - name: Fetch duckdb tags (DuckDB versions itself from git describe)
+        run: git -C duckdb fetch --tags --force origin
+      # Pinned to the commit extension-ci-tools' v1.5 distribution uses, never
+      # HEAD: the live job holds tenant secrets, so nothing it runs may float.
+      - name: Install vcpkg (pinned)
+        run: |
+          git init -q "$HOME/vcpkg"
+          git -C "$HOME/vcpkg" fetch -q --depth 1 https://github.com/microsoft/vcpkg.git 84bab45d415d22042bd0b9081aea57f362da3f35
+          git -C "$HOME/vcpkg" checkout -q FETCH_HEAD
+          "$HOME/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+          echo "VCPKG_ROOT=$HOME/vcpkg" >> "$GITHUB_ENV"
+          echo "VCPKG_TOOLCHAIN_PATH=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake" >> "$GITHUB_ENV"
+      - name: Install ninja
+        run: sudo apt-get install -y ninja-build
+      - name: Build
+        run: GEN=ninja make
+      # Fails loudly when the secrets are absent -- a missing secret must not
+      # look like a passing live suite.
+      - name: Live SQL tests
+        env:
+          # Step-scoped, not job-wide: the build steps above never see them.
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
+        run: make test_live
+      - name: Install stock duckdb v1.5.6
+        run: |
+          curl -sSLo /tmp/duckdb.zip \
+            https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
+          echo "6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f  /tmp/duckdb.zip" | sha256sum -c -
+          unzip -q -o /tmp/duckdb.zip -d /tmp/duckdb-cli
+          sudo install -m 0755 /tmp/duckdb-cli/duckdb /usr/local/bin/duckdb
+      - name: Shipped artifact reaches real Graph from a stock duckdb
+        env:
+          # Step-scoped, not job-wide: the build steps above never see them.
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
+        run: make smoke_loadable
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+      # process, restarts, multi-threaded scans, DuckLake, two drives.
+      - name: E2E harness
+        env:
+          # Step-scoped, not job-wide: the build steps above never see them.
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
+          SHAREPOINT_SITE_ID: ${{ secrets.SHAREPOINT_SITE_ID }}
+          DATAZOO_DISABLE_TELEMETRY: '1'
+        run: cd e2e && uv run --locked pytest -v
+
+  # Crashed runs leak /_duckdb_sharepoint_e2e/run-* folders into a REAL
+  # document library. Not `make sweep_orphans`: the Makefile includes the
+  # extension-ci-tools submodule, which this job does not check out.
+  sweep:
+    timeout-minutes: 30
+    name: Sweep orphaned e2e scratch folders
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+      - env:
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
+          SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
+          SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
+          SHAREPOINT_SITE_ID: ${{ secrets.SHAREPOINT_SITE_ID }}
+        run: cd e2e && uv run --locked python -m helpers.sweep

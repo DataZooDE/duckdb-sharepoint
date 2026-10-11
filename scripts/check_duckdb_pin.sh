@@ -1,27 +1,74 @@
 #!/usr/bin/env bash
-# The duckdb submodule must sit on the tag we ship against. A drifted submodule
-# makes every local green meaningless. We pin to the 1.4 LTS line: the
-# extension_config.cmake special-casing (_HAS_STD_BYTE=0, the sqlite3 wrapper
-# note) is written for it, and it is the current DuckDB long-term-support
-# release (see docs/hld.md §7.1).
+# The duckdb submodule must sit exactly on the tag we ship against.
+#
+# Why this exists. In the sibling duckdb-gdrive the submodule had drifted ~9,600 commits past its pinned
+# tag onto DuckDB main. Everything was green locally and every release build
+# was red, because `BaseSecret::GetName()` returns `const string &` on every
+# released 1.4/1.5 version and `const Identifier &` on main. Code written
+# against main compiles for the developer and cannot compile for a single
+# shipping platform.
+#
+# That failure mode is silent and expensive: a local green looks exactly as
+# convincing as a real one. The only fix is to make the drift itself loud.
+#
+# Local development builds against the LATEST STABLE. CI additionally builds
+# the 1.4 LTS line (see .github/workflows/MainDistributionPipeline.yml) --
+# the API differs between the lines, so stable-only local coverage is not
+# proof the LTS job will pass.
 set -euo pipefail
+
 cd "$(dirname "$0")/.."
 
-# The exact tag this repo builds and ships against. Bump deliberately, together
-# with the matching extension-ci-tools branch (v1.4-andium) and a rebuild.
-PINNED_DUCKDB_TAG="v1.4.5"
+# Latest stable. Keep WANT_SHA in step with CLAUDE.md and the `duckdb_version`
+# of the stable job in .github/workflows/MainDistributionPipeline.yml.
+#
+# Pinned by SHA, not by tag name. CI checks submodules out WITHOUT tags, so
+# `git rev-parse v1.5.6^{commit}` fails there and the tag-based check failed
+# on a perfectly correct tree. The tag is kept only to make messages readable.
+# shellcheck source=duckdb_version.env
+source scripts/duckdb_version.env
+WANT_TAG="$DUCKDB_TAG"
+WANT_SHA="$DUCKDB_SHA"
 
-if [ ! -f duckdb/CMakeLists.txt ]; then
-	echo "check_duckdb_pin: duckdb submodule not checked out yet — nothing to verify."
-	echo "  run: git submodule update --init --recursive"
-	exit 0
+if [[ ! -e duckdb/.git ]]; then
+    echo "FAIL: duckdb submodule is not checked out. Run:" >&2
+    echo "    git submodule update --init --recursive" >&2
+    exit 1
 fi
 
-ver=$(git -C duckdb describe --tags 2>/dev/null || echo "unknown")
-if [ "${ver}" != "${PINNED_DUCKDB_TAG}" ]; then
-	echo "check_duckdb_pin: FAIL — duckdb submodule is at '${ver}', expected '${PINNED_DUCKDB_TAG}'."
-	echo "  A drifted submodule makes every local green meaningless. To move the pin,"
-	echo "  edit PINNED_DUCKDB_TAG in this script and check the submodule out to match."
-	exit 1
+have="$(git -C duckdb rev-parse HEAD)"
+
+if [[ "$have" != "$WANT_SHA" ]]; then
+    described="$(git -C duckdb describe --tags 2>/dev/null || echo '<no tags available>')"
+    cat >&2 <<MSG
+FAIL: duckdb submodule is not on $WANT_TAG.
+
+    want:  $WANT_SHA  ($WANT_TAG)
+    have:  $have  ($described)
+
+Build against anything else and a local green proves nothing about the
+release matrix -- DuckDB's C++ API changes between versions, so code can
+compile here and fail for every shipping platform. Fix with:
+
+    git -C duckdb fetch --tags
+    git -C duckdb checkout $WANT_TAG
+    git add duckdb
+
+If you are INTENTIONALLY moving to a new DuckDB, update WANT_TAG and WANT_SHA
+here, the workflow, and CLAUDE.md together -- and rebuild, because the API
+does change between versions.
+MSG
+    exit 1
 fi
-echo "check_duckdb_pin: OK — duckdb submodule at ${ver} (pinned ${PINNED_DUCKDB_TAG})."
+
+# The tag is only checked when it happens to be available (it is not, in CI).
+# A mismatch here means WANT_SHA and WANT_TAG have drifted apart in THIS file.
+if tag_sha="$(git -C duckdb rev-parse --verify -q "$WANT_TAG^{commit}" 2>/dev/null)"; then
+    if [[ "$tag_sha" != "$WANT_SHA" ]]; then
+        echo "FAIL: $WANT_TAG resolves to $tag_sha but WANT_SHA says $WANT_SHA." >&2
+        echo "      The two constants in this script disagree; fix them together." >&2
+        exit 1
+    fi
+fi
+
+echo "OK: duckdb submodule on $WANT_TAG"

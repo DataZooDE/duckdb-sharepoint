@@ -49,3 +49,50 @@ check_pin:
 .PHONY: check_credentials
 check_credentials:
 	@./scripts/check_no_credentials.sh
+
+# ---------------------------------------------------------------------------
+# musl (a 1.4 LTS distribution target) does not pull <cstdint> in
+# transitively the way glibc does; a missing include breaks only that target.
+# ---------------------------------------------------------------------------
+.PHONY: check_cstdint
+check_cstdint:
+	@./scripts/check_cstdint.sh
+
+# ---------------------------------------------------------------------------
+# The SHIPPED artifact, not the statically linked shell: it must be stamped
+# for the pinned DuckDB, link only platform libs, and load into a stock CLI.
+# ---------------------------------------------------------------------------
+.PHONY: check_stamp
+check_stamp: release
+	@./scripts/check_extension_stamp.sh
+
+.PHONY: smoke_static
+smoke_static: release
+	@./scripts/check_static_linkage.sh \
+		build/release/extension/sharepoint/sharepoint.duckdb_extension
+
+.PHONY: smoke_loadable
+smoke_loadable: release
+	@./scripts/smoke_loadable.sh
+
+# ---------------------------------------------------------------------------
+# Live end-to-end harness (Python + uv), ported from duckdb-gdrive: what SQL
+# tests cannot express -- a change made OUTSIDE a running DuckDB process, a
+# restart, a multi-threaded scan. Needs SHAREPOINT_* credentials (environment
+# or a git-ignored .env.sharepoint). Every test works in its own scratch
+# folder under /_duckdb_sharepoint_e2e and deletes it on teardown.
+# ---------------------------------------------------------------------------
+.PHONY: e2e
+e2e: release
+	@cd e2e && uv run --locked pytest -v
+
+# Delete scratch folders crashed runs leaked (older than 24 h).
+.PHONY: sweep_orphans
+sweep_orphans:
+	@cd e2e && uv run python -m helpers.sweep
+
+# The shared VFS functions must stay identical to duckdb-gdrive's copy (both
+# register them; whichever loads first wins). Needs a sibling checkout.
+.PHONY: check_vfs_parity
+check_vfs_parity:
+	@./scripts/check_vfs_parity.sh

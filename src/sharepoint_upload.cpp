@@ -1,11 +1,15 @@
 #include "sharepoint_upload.hpp"
 
+#include <cstdint>
 #include <cstdlib>
 
 namespace duckdb {
 namespace sharepoint {
 
 std::uint64_t NormalizeUploadChunkSize(std::uint64_t requested) {
+	if (requested > kGraphUploadChunkMax) {
+		return kGraphUploadChunkMax;
+	}
 	std::uint64_t rounded = (requested / kGraphUploadChunkMultiple) * kGraphUploadChunkMultiple;
 	return rounded == 0 ? kGraphUploadChunkMultiple : rounded;
 }
@@ -20,13 +24,33 @@ bool SplitAbsoluteUrl(const std::string &url, std::string &origin, std::string &
 	if (scheme == std::string::npos) {
 		return false;
 	}
-	auto slash = url.find('/', scheme + 3);
-	if (slash == std::string::npos) {
+	// The authority ends at the first '/', '?' or '#'. A query with no path
+	// ("https://h?a=1") keeps its query behind an implied "/".
+	auto end = url.find_first_of("/?#", scheme + 3);
+	if (end == std::string::npos) {
 		origin = url;
 		path_and_query = "/";
 	} else {
-		origin = url.substr(0, slash);
-		path_and_query = url.substr(slash);
+		origin = url.substr(0, end);
+		path_and_query = url[end] == '/' ? url.substr(end) : "/" + url.substr(end);
+	}
+	return true;
+}
+
+bool IsHttpsUrl(const std::string &url) {
+	static const char kScheme[] = "https://";
+	const std::size_t n = sizeof(kScheme) - 1;
+	if (url.size() <= n) {
+		return false;
+	}
+	for (std::size_t i = 0; i < n; i++) {
+		char c = url[i];
+		if (c >= 'A' && c <= 'Z') {
+			c = static_cast<char>(c - 'A' + 'a');
+		}
+		if (c != kScheme[i]) {
+			return false;
+		}
 	}
 	return true;
 }
