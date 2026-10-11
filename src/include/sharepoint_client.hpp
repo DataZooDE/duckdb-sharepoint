@@ -42,6 +42,11 @@ struct ChildEntry {
 //   root-relative path  ->  /drives/{drive}/root:/{path}
 //   item id             ->  /drives/{drive}/items/{id}
 // ---------------------------------------------------------------------------
+//! Sleep before retry number `failed_attempt` per the shared policy
+//! (BackoffDelayMs: 500 ms doubling to 20 s, +/-25% per-thread jitter,
+//! Retry-After as a floor). Used by every retry loop that talks to Microsoft.
+void SleepBeforeRetry(int failed_attempt, int retry_after_seconds);
+
 class GraphClient {
 public:
 	explicit GraphClient(const AuthContext &auth) : auth(auth) {
@@ -53,8 +58,9 @@ public:
 	DriveItemMeta StatById(const string &item_id);
 
 	//! Read [offset, offset+length) of an item's content into `out`. Sends a
-	//! Range header; Graph 302-redirects /content to a pre-authed download URL
-	//! and httplib follows it.
+	//! Range header; Graph 302-redirects /content to a pre-authenticated
+	//! download URL, which is fetched verbatim by PreauthenticatedRequest
+	//! (never by httplib, which would re-sort its signed query -> 401).
 	void ReadRange(const string &item_id, int64_t offset, int64_t length, string &out);
 
 	//! Upload the whole of `bytes` to a root-relative path, replacing any

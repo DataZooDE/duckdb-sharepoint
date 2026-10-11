@@ -22,7 +22,7 @@ constexpr const char *kSecretTypeName = "sharepoint";
 //!
 //! The interactive delegated flows (authorization_code / device_code) are a
 //! documented follow-up: they need the datazoo-oauth2 submodule the sibling
-//! gdrive uses, which this scaffold does not yet wire in.
+//! gdrive uses, which is not wired in here yet.
 void RegisterSharepointSecrets(ExtensionLoader &loader);
 
 } // namespace sharepoint

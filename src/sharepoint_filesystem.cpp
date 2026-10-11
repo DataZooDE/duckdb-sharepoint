@@ -1,8 +1,6 @@
-// The sharepoint:// virtual filesystem.
-//
-// STATUS: network frontier of the scaffold (see sharepoint_auth.cpp's header).
-// The DuckDB FileSystem method surface is complete and the Graph mapping is
-// implemented, but nothing here has run against a live tenant yet.
+// The sharepoint:// virtual filesystem: DuckDB's FileSystem API mapped onto
+// Graph driveItems (GraphClient), with the shared block cache for reads and
+// the immutable-prefix metadata cache. Proven by the live SQL suite and e2e.
 #include "sharepoint_filesystem.hpp"
 #include "sharepoint_banner.hpp"
 #include "sharepoint_uri.hpp"
@@ -53,9 +51,14 @@ idx_t UploadChunkBytes(optional_ptr<FileOpener> opener) {
 idx_t BlockSizeBytes(optional_ptr<FileOpener> opener) {
 	Value v;
 	if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_block_size_bytes", v) && !v.IsNull()) {
-		// Capped: each block is one ranged GET held in memory, so an unbounded
-		// value would turn every small read into a whole-file download.
-		return MinValue<idx_t>(v.GetValue<idx_t>(), 64ULL * 1024 * 1024);
+		const auto requested = v.GetValue<idx_t>();
+		if (requested == 0) {
+			return 0; // cache disabled: exact ranges
+		}
+		// Clamped to [64 KiB, 64 MiB]: each block is one ranged GET held in
+		// memory, so an unbounded value turns small reads into whole-file
+		// downloads, and a tiny one costs a redirect + TLS handshake per block.
+		return MaxValue<idx_t>(64ULL * 1024, MinValue<idx_t>(requested, 64ULL * 1024 * 1024));
 	}
 	return 8ULL * 1024 * 1024;
 }
@@ -129,6 +132,17 @@ void SharepointFileSystem::MetaCachePut(const string &key, const DriveItemMeta &
 		meta_cache.clear(); // crude but bounded; a miss only costs one stat
 	}
 	meta_cache[key] = meta;
+}
+
+void SharepointFileSystem::InvalidateMetaById(const string &item_id) {
+	lock_guard<mutex> guard(meta_cache_lock);
+	for (auto it = meta_cache.begin(); it != meta_cache.end();) {
+		if (it->second.id == item_id) {
+			it = meta_cache.erase(it);
+		} else {
+			++it;
+		}
+	}
 }
 
 void SharepointFileSystem::InvalidateMeta(const string &key) {
@@ -388,7 +402,7 @@ void SharepointFileSystem::RemoveDirectory(const string &directory, optional_ptr
 		// Graph deletes a folder and its contents).
 		auto uri = ParseOrThrow(directory);
 		auto context = RequireOpener(opener, "remove directory");
-		if (uri.kind != SharepointUriKind::PATH || uri.RootRelativePath().empty()) {
+		if (uri.kind != SharepointUriKind::PATH || IsDriveRoot(uri)) {
 			// The empty path is the drive root: a recursive delete of the whole
 			// library is never what `remove directory` on a URI typo should do.
 			throw IOException("sharepoint: refusing to remove '%s' (the drive root, or not a folder path)", directory);
@@ -451,22 +465,29 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 void SharepointFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		auto uri = ParseOrThrow(filename);
+		if (IsDriveRoot(uri)) {
+			throw IOException("sharepoint: refusing to remove '%s': it is the drive root", filename);
+		}
 		auto context = RequireOpener(opener, "remove");
 		auto auth = GetAuthContext(context, filename);
 		GraphClient client(auth);
-		string id;
-		if (uri.kind == SharepointUriKind::FILE_ID) {
-			id = uri.item_id;
-		} else {
-			auto meta = client.StatByPath(uri.RootRelativePath());
-			if (!meta.found) {
-				return; // already gone
-			}
-			id = meta.id;
+		// RemoveFile removes FILES. Graph's DELETE on a folder is recursive, so
+		// any caller of the FileSystem API (not only remove_file, which checks)
+		// could otherwise delete a whole subtree -- permanently, with
+		// sharepoint_permanent_delete.
+		auto meta = uri.kind == SharepointUriKind::FILE_ID ? client.StatById(uri.item_id)
+		                                                   : client.StatByPath(uri.RootRelativePath());
+		if (!meta.found) {
+			return; // already gone
 		}
-		client.DeleteItem(id, PermanentDelete(context));
+		if (meta.is_folder) {
+			throw IOException("sharepoint: '%s' is a directory, not a file", filename);
+		}
+		client.DeleteItem(meta.id, PermanentDelete(context));
 		if (uri.kind == SharepointUriKind::PATH) {
 			InvalidateMeta(auth.identity + "|" + uri.RootRelativePath());
+		} else {
+			InvalidateMetaById(meta.id);
 		}
 	});
 }
@@ -520,7 +541,10 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 				}
 			}
 			if (!has_meta) {
-				if (client.StatByPath(parsed.uri.RootRelativePath()).found) {
+				// Files only, as on every other filesystem (and gdrive): a
+				// folder is not a glob match.
+				auto meta = client.StatByPath(parsed.uri.RootRelativePath());
+				if (meta.found && !meta.is_folder) {
 					emit(parsed.uri.RootRelativePath());
 				}
 				continue;
@@ -547,7 +571,15 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 		// "{draft}.txt"). When a pattern matched nothing, try it as a literal path,
 		// as DuckDB's local filesystem does -- otherwise such a file could never be
 		// read by its own name. Costs one stat, only on an empty match.
-		if (result.empty() && HasGlobMetacharacters(uri.RootRelativePath())) {
+		// Only for names that could exist: SharePoint forbids '*' and '?', so a
+		// pattern containing them (e.g. core's synthesized "<path>/**/*.csv"
+		// probe after a literal miss) is never stat-ed -- Graph rejects such a
+		// path with 400 "potentially dangerous Request.Path value".
+		bool could_exist = true;
+		for (const auto &segment : uri.segments) {
+			could_exist = could_exist && ForbiddenNameChar(segment) == '\0';
+		}
+		if (result.empty() && could_exist && HasGlobMetacharacters(uri.RootRelativePath())) {
 			auto meta = client.StatByPath(uri.RootRelativePath());
 			if (meta.found && !meta.is_folder) {
 				emit(uri.RootRelativePath());
