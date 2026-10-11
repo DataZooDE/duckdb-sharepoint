@@ -62,41 +62,45 @@ void MoveFileScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	                                                  });
 }
 
-// Create every missing directory above `target`, shallowest first. Walks
-// DOWNWARD from the scheme, which is scheme-agnostic -- FileSystem::
-// CreateDirectoriesRecursive walks upward with Path::Parent(), which does not
-// understand a URL-form path and stops after one level.
+// Create every missing directory above `target`, shallowest first. Splits on
+// '/' after the scheme, which is scheme-agnostic -- FileSystem::
+// CreateDirectoriesRecursive uses Path::Parent(), which does not understand a
+// URL-form path and stops after one level.
 void EnsureParentDirectories(FileSystem &fs, const string &target) {
-	auto last_sep = target.find_last_of('/');
-	if (last_sep == string::npos) {
-		return;
-	}
-	size_t start = 0;
+	// Walk UP from the target's parent to the nearest folder that exists, then
+	// create the missing ones top-down. Usually that is one existence check
+	// (the parent is there), not one per path level -- and it never touches an
+	// ancestor ABOVE an existing folder, which may lie outside the path prefix
+	// (SCOPE) the only applicable secret covers: walking top-down from the
+	// root asked for a secret for `scheme://top` and failed there.
+	size_t root_end = 0;
 	auto scheme = target.find("://");
 	if (scheme != string::npos) {
-		start = scheme + 3;
+		root_end = scheme + 3;
 	} else if (!target.empty() && target.front() == '/') {
-		start = 1;
+		root_end = 1;
 	}
-	for (auto i = target.find('/', start); i != string::npos && i <= last_sep; i = target.find('/', i + 1)) {
-		auto dir = target.substr(0, i);
-		if (dir.empty()) {
-			continue;
+	vector<string> missing;
+	auto sep = target.find_last_of('/');
+	while (sep != string::npos && sep > root_end) {
+		auto dir = target.substr(0, sep);
+		if (fs.DirectoryExists(dir)) {
+			break;
 		}
-		if (!fs.DirectoryExists(dir)) {
-			if (fs.FileExists(dir)) {
-				throw IOException("sharepoint: cannot create directory '%s': a file of that name already "
-				                  "exists.",
-				                  dir);
-			}
-			fs.CreateDirectory(dir);
+		if (fs.FileExists(dir)) {
+			throw IOException("cannot create directory '%s': a file of that name already exists.", dir);
 		}
+		missing.push_back(dir);
+		sep = target.find_last_of('/', sep - 1);
+	}
+	for (auto it = missing.rbegin(); it != missing.rend(); ++it) {
+		fs.CreateDirectory(*it);
 	}
 }
 
 // The inverse of core's read_blob(). FILE_CREATE_NEW gives overwrite
 // semantics; FILE_CREATE would leave a tail of longer previous content behind.
-// A single Write() call matters on sharepoint://, whose handle uploads on
+// A single Write() call matters on remote filesystems whose handle uploads on
 // close: one call is one upload, so the file appears complete or not at all.
 void WriteBlobScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &fs = FileSystem::GetFileSystem(state.GetContext());
@@ -125,29 +129,38 @@ void FileSizeScalar(DataChunk &args, ExpressionState &state, Vector &result) {
 	UnaryExecutor::ExecuteWithNulls<string_t, int64_t>(
 	    args.data[0], result, args.size(), [&](string_t path, ValidityMask &mask, idx_t idx) -> int64_t {
 		    auto p = path.GetString();
-		    if (!fs.FileExists(p)) {
-			    if (fs.DirectoryExists(p)) {
-				    throw IOException("'%s' is a directory, not a file; it has no byte size", p);
-			    }
-			    if (ConfirmedAbsent(fs, p)) {
-				    mask.SetInvalid(idx);
-				    return 0;
-			    }
-			    throw IOException("'%s' exists but its size cannot be read as a file", p);
+		    // Open first: a handle answers "exists, and this big" in one
+		    // remote call, and NULL_IF_NOT_EXISTS is the strict absence test
+		    // (a missing secret still throws, never reads as NULL). Asking
+		    // FileExists and DirectoryExists up front cost three remote stats
+		    // for an absent file and two for a present one -- measured with
+		    // sharepoint_stats() under a throttling burst.
+		    //
+		    // A LOCAL directory is asked first: POSIX opens it and reports its
+		    // inode size, Windows refuses it with "Access is denied". Remote
+		    // filesystems refuse folders in OpenFile, so they are only asked
+		    // DirectoryExists after an absent open -- no extra round trip.
+		    if (p.find("://") == string::npos && fs.DirectoryExists(p)) {
+			    throw IOException("'%s' is a directory, not a file; it has no byte size", p);
 		    }
-		    auto handle = fs.OpenFile(p, FileFlags::FILE_FLAGS_READ);
-		    if (!handle) {
-			    mask.SetInvalid(idx);
-			    return 0;
+		    auto handle = fs.OpenFile(p, FileFlags::FILE_FLAGS_READ | FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS);
+		    if (handle) {
+			    return NumericCast<int64_t>(handle->GetFileSize());
 		    }
-		    return NumericCast<int64_t>(handle->GetFileSize());
+		    if (fs.DirectoryExists(p)) {
+			    throw IOException("'%s' is a directory, not a file; it has no byte size", p);
+		    }
+		    mask.SetInvalid(idx);
+		    return 0;
 	    });
 }
 
 } // namespace
 
-// The four functions are scheme-generic and shared, byte for byte in
-// behaviour, with the sibling gdrive extension, which registers them too.
+// The four functions are scheme-generic and shared with the sibling gdrive
+// extension, which registers them too: KEEP THIS FILE IDENTICAL to
+// duckdb-gdrive/src/gdrive_vfs_functions.cpp up to the namespace and include
+// names (scripts/check_vfs_parity.sh compares them).
 // Registering with IGNORE_ON_CONFLICT lets both extensions load into one
 // database in either order: whichever loads second keeps the first's
 // (identical) definitions. Without it the second LOAD failed with
@@ -163,13 +176,14 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		desc.description =
 		    "Delete the file at `path`, returning true if it existed and was removed and false if it did "
 		    "not exist. Dispatches on the path's scheme through DuckDB's virtual filesystem, so it works "
-		    "for sharepoint://, s3://, gs:// and local paths alike. For a sharepoint:// path the item is "
-		    "moved to the recycle bin unless sharepoint_permanent_delete is set. Errors other than "
+		    "for local paths and for every remote scheme an extension registers (gdrive://, "
+		    "sharepoint://, s3://, ...). Remote stores may keep a deleted file in a trash or recycle bin "
+		    "(see the extension's *_permanent_delete setting). Folders are refused. Errors other than "
 		    "not-found are raised, not returned as false.";
 		desc.parameter_names = {"path"};
 		desc.parameter_types = {LogicalType::VARCHAR};
-		desc.examples = {"SELECT remove_file('sharepoint://reports/old.parquet')"};
-		desc.categories = {"sharepoint"};
+		desc.examples = {"SELECT remove_file('reports/old.parquet')"};
+		desc.categories = {"filesystem"};
 		info.descriptions.push_back(std::move(desc));
 		info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(info));
@@ -187,8 +201,8 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		    "fully-written temporary file under its final name.";
 		desc.parameter_names = {"source", "target"};
 		desc.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
-		desc.examples = {"SELECT move_file('sharepoint://staging/part.tmp', 'sharepoint://data/part.parquet')"};
-		desc.categories = {"sharepoint"};
+		desc.examples = {"SELECT move_file('staging/part.tmp', 'data/part.parquet')"};
+		desc.categories = {"filesystem"};
 		info.descriptions.push_back(std::move(desc));
 		info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(info));
@@ -203,12 +217,12 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		write_desc.description =
 		    "Write `content` to `path`, replacing any existing file, and return the number of bytes "
 		    "written. The inverse of read_blob(): together they give SQL a byte-exact round trip for any "
-		    "filesystem DuckDB can reach, including sharepoint://. Accepts arbitrary binary content -- a "
+		    "filesystem DuckDB can reach, local or remote. Accepts arbitrary binary content -- a "
 		    "BLOB, not a VARCHAR.";
 		write_desc.parameter_names = {"path", "content"};
 		write_desc.parameter_types = {LogicalType::VARCHAR, LogicalType::BLOB};
-		write_desc.examples = {"SELECT write_blob('sharepoint://notes/readme.md', '# Title'::BLOB)"};
-		write_desc.categories = {"sharepoint"};
+		write_desc.examples = {"SELECT write_blob('notes/readme.md', '# Title'::BLOB)"};
+		write_desc.categories = {"filesystem"};
 		write_info.descriptions.push_back(std::move(write_desc));
 		write_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(write_info));
@@ -224,8 +238,8 @@ void RegisterVfsFunctions(ExtensionLoader &loader) {
 		    "read_blob, which downloads the body.";
 		size_desc.parameter_names = {"path"};
 		size_desc.parameter_types = {LogicalType::VARCHAR};
-		size_desc.examples = {"SELECT file_size('sharepoint://data/part.parquet')"};
-		size_desc.categories = {"sharepoint"};
+		size_desc.examples = {"SELECT file_size('data/part.parquet')"};
+		size_desc.categories = {"filesystem"};
 		size_info.descriptions.push_back(std::move(size_desc));
 		size_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 		loader.RegisterFunction(std::move(size_info));

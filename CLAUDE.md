@@ -45,8 +45,11 @@ reserves `SCOPE` for the secret's path-prefix list).
 
 ## Current status
 
-Scaffold. Pure layer implemented + tested; Graph layer written against the docs
-but uncompiled and unrun. See `docs/hld.md` §7 for the remaining work in order.
-The first thing any contributor must do is check out the `duckdb` submodule at
-the pinned tag and get it to compile — expect to reconcile exact DuckDB API
-signatures (`FileSystem`, `SecretManager`, `FileOpener`).
+Verified end to end against a real tenant (2026-10-10): `make test`,
+`make test_live` and `make e2e` (out-of-band changes, restarts, 16-thread
+scans, DuckLake, ATTACH, two drives) are green on DuckDB v1.5.6; CI also
+builds v1.4.5 LTS. Structurally aligned with duckdb-gdrive (CI/pin gates,
+stats, banner/telemetry, glob syntax, shared VFS functions, e2e harness).
+`docs/hld.md` §7/§7a has the remaining work and the Graph behaviours found
+live; `docs/exploratory-testing.md` the exploratory findings. Repo secrets
+`SHAREPOINT_*` must be set for the CI live job.
