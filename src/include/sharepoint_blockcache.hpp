@@ -74,8 +74,9 @@ private:
 	//! readers of the same block share a single fetch.
 	struct Block {
 		std::mutex load_mtx;
-		bool loaded = false;
-		std::string data;
+		bool loaded = false; // guarded by load_mtx
+		std::string data;    // written once under load_mtx, then read-only
+		bool accounted = false; // guarded by the cache's mtx: counted in resident_bytes, evictable
 	};
 
 	std::shared_ptr<Block> AcquireBlock(const std::string &key);

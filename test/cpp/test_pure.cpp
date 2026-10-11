@@ -1,8 +1,10 @@
 // Catch2 pure-logic tests. No DuckDB linkage, no network, no credentials --
 // runnable by anyone who can build. `make unit_test`.
 #include "sharepoint_blockcache.hpp"
+#include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_glob.hpp"
+#include "sharepoint_identity.hpp"
 #include "sharepoint_rawhttp.hpp"
 #include "sharepoint_upload.hpp"
 #include "sharepoint_uri.hpp"
@@ -11,7 +13,10 @@
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
 #include <cstdint>
+#include <atomic>
 #include <map>
+#include <set>
+#include <thread>
 #include <vector>
 
 using namespace duckdb::sharepoint;
@@ -76,6 +81,25 @@ TEST_CASE("id: values are restricted to Graph's id alphabet", "[uri]") {
 	}
 }
 
+TEST_CASE("names SharePoint forbids are caught before Graph sees them", "[uri]") {
+	// ':' is also Graph's root:/path: delimiter -- sent through, it surfaced as
+	// "Resource not found for the segment 'root:'", which explains nothing.
+	REQUIRE(ForbiddenNameChar("report.csv") == '\0');
+	REQUIRE(ForbiddenNameChar("it's #1 %41+b & {x} ü.txt") == '\0');
+	for (char c : std::string("\"*:<>?\\|")) {
+		INFO(c);
+		REQUIRE(ForbiddenNameChar(std::string("a") + c + "b") == c);
+	}
+}
+
+TEST_CASE("the drive root is recognised in every spelling", "[uri]") {
+	REQUIRE(IsDriveRoot(ParseSharepointUri("sharepoint://").uri));
+	REQUIRE(IsDriveRoot(ParseSharepointUri("sharepoint:///").uri));
+	REQUIRE(IsDriveRoot(ParseSharepointUri("sharepoint:////").uri));
+	REQUIRE_FALSE(IsDriveRoot(ParseSharepointUri("sharepoint://a").uri));
+	REQUIRE_FALSE(IsDriveRoot(ParseSharepointUri("sharepoint://id:01ABC").uri));
+}
+
 TEST_CASE("non-sharepoint URIs are rejected", "[uri]") {
 	REQUIRE_FALSE(IsSharepointUri("s3://bucket/x"));
 	REQUIRE_FALSE(ParseSharepointUri("gdrive://a/b").ok);
@@ -98,13 +122,13 @@ TEST_CASE("immutable-prefix matching is per-segment", "[uri]") {
 }
 
 TEST_CASE("glob matches within a segment", "[glob]") {
-	REQUIRE(MatchGlob("*.parquet", "actuals.parquet"));
-	REQUIRE(MatchGlob("part-*.csv", "part-0001.csv"));
-	REQUIRE(MatchGlob("file-??.txt", "file-07.txt"));
-	REQUIRE_FALSE(MatchGlob("*.parquet", "actuals.csv"));
-	REQUIRE_FALSE(MatchGlob("file-??.txt", "file-7.txt"));
-	REQUIRE(HasGlobMeta("*.parquet"));
-	REQUIRE_FALSE(HasGlobMeta("actuals.parquet"));
+	REQUIRE(MatchSegment("*.parquet", "actuals.parquet"));
+	REQUIRE(MatchSegment("part-*.csv", "part-0001.csv"));
+	REQUIRE(MatchSegment("file-??.txt", "file-07.txt"));
+	REQUIRE_FALSE(MatchSegment("*.parquet", "actuals.csv"));
+	REQUIRE_FALSE(MatchSegment("file-??.txt", "file-7.txt"));
+	REQUIRE(HasGlobMetacharacters("*.parquet"));
+	REQUIRE_FALSE(HasGlobMetacharacters("actuals.parquet"));
 }
 
 // A synthetic drive tree for the recursive-glob tests. No Graph, no I/O: the
@@ -166,6 +190,12 @@ TEST_CASE("upload chunk size rounds down to a 320 KiB multiple", "[upload]") {
 	// Below one multiple clamps up, never to zero -- the loop must progress.
 	REQUIRE(NormalizeUploadChunkSize(1) == kGraphUploadChunkMultiple);
 	REQUIRE(NormalizeUploadChunkSize(0) == kGraphUploadChunkMultiple);
+	// Graph rejects any single request of 60 MiB or more: clamp to the largest
+	// 320-KiB multiple below that, so one SET cannot make every upload fail.
+	REQUIRE(kGraphUploadChunkMax < 60ull * 1024 * 1024);
+	REQUIRE(kGraphUploadChunkMax % kGraphUploadChunkMultiple == 0);
+	REQUIRE(NormalizeUploadChunkSize(1ull << 40) == kGraphUploadChunkMax);
+	REQUIRE(NormalizeUploadChunkSize(60ull * 1024 * 1024) == kGraphUploadChunkMax);
 }
 
 TEST_CASE("content-range header is byte-inclusive", "[upload]") {
@@ -202,24 +232,6 @@ TEST_CASE("only https URLs are followed or uploaded to", "[upload]") {
 	REQUIRE_FALSE(IsHttpsUrl("/relative/path"));
 	REQUIRE_FALSE(IsHttpsUrl("https:/missing-slash"));
 	REQUIRE_FALSE(IsHttpsUrl(""));
-}
-
-TEST_CASE("a 200 full-body reply is sliced to the requested range", "[upload]") {
-	// A server that ignores Range returns 200 with the WHOLE file; returning it
-	// as-is would hand a Parquet footer read the file's header bytes.
-	std::string body = "0123456789";
-	REQUIRE(SliceRangeFromFullBody(body, 3, 4));
-	REQUIRE(body == "3456");
-
-	body = "0123456789";
-	REQUIRE(SliceRangeFromFullBody(body, 0, 10));
-	REQUIRE(body == "0123456789");
-
-	// Too short to contain the range: refuse rather than return short bytes.
-	body = "0123";
-	REQUIRE_FALSE(SliceRangeFromFullBody(body, 2, 5));
-	body = "0123";
-	REQUIRE_FALSE(SliceRangeFromFullBody(body, 10, 1));
 }
 
 TEST_CASE("nextExpectedRanges start offset parses", "[upload]") {
@@ -331,6 +343,44 @@ TEST_CASE("a failed block fetch is not cached and does not wedge eviction", "[bl
 	REQUIRE(cache.ResidentBytes() <= 150);
 }
 
+TEST_CASE("block cache accounting stays exact under concurrent loads", "[blockcache][concurrency]") {
+	// Many threads load and evict blocks of several files through a cache that
+	// holds only two blocks. Accounting and eviction must agree exactly: a
+	// block evicted before its own bytes were counted used to drive the
+	// unsigned resident counter below zero (wrapping) or past the budget.
+	const std::uint64_t kBlock = 64;
+	const std::string file(kBlock * 4, 'b');
+	auto fetch = [&](std::uint64_t off, std::uint64_t len) {
+		std::this_thread::yield();
+		return file.substr(off, len);
+	};
+	SharepointBlockCache cache(2 * kBlock);
+	std::atomic<bool> bad {false};
+	std::vector<std::thread> threads;
+	for (int t = 0; t < 8; t++) {
+		threads.emplace_back([&, t] {
+			std::string out(kBlock, '\0');
+			for (int i = 0; i < 3000; i++) {
+				const std::string key = "f" + std::to_string((t + i) % 5);
+				const std::uint64_t block = static_cast<std::uint64_t>((i * 7 + t) % 4);
+				cache.Read(key, kBlock, file.size(), block * kBlock, kBlock, &out[0], fetch);
+				if (out != file.substr(block * kBlock, kBlock)) {
+					bad = true;
+				}
+				const auto resident = cache.ResidentBytes();
+				if (resident > 4 * kBlock || resident % kBlock != 0) {
+					bad = true; // wrapped, or over budget by more than in-flight loads
+				}
+			}
+		});
+	}
+	for (auto &th : threads) {
+		th.join();
+	}
+	REQUIRE_FALSE(bad);
+	REQUIRE(cache.ResidentBytes() <= 2 * kBlock);
+}
+
 TEST_CASE("block cache evicts LRU when over budget", "[blockcache]") {
 	const std::string file(300, 'z'); // 3 blocks of 100
 	int fetches = 0;
@@ -368,6 +418,58 @@ TEST_CASE("graph errors classify by status and code", "[errors]") {
 	REQUIRE_FALSE(IsRetryable(GraphErrorKind::UNAUTHENTICATED));
 }
 
+TEST_CASE("a plain 400 is the caller's bad request, not 'error'", "[errors]") {
+	REQUIRE(ClassifyGraphError(400, "invalidRequest") == GraphErrorKind::BAD_REQUEST);
+	REQUIRE(ClassifyGraphError(400, "") == GraphErrorKind::BAD_REQUEST);
+	REQUIRE_FALSE(IsRetryable(GraphErrorKind::BAD_REQUEST));
+	REQUIRE(ClassifyGraphError(418, "") == GraphErrorKind::OTHER);
+}
+
+TEST_CASE("errors map to DuckDB exception types", "[errors]") {
+	REQUIRE(ExceptionTypeFor(GraphErrorKind::FORBIDDEN) == GraphExceptionType::PERMISSION);
+	REQUIRE(ExceptionTypeFor(GraphErrorKind::BAD_REQUEST) == GraphExceptionType::INVALID_INPUT);
+	REQUIRE(ExceptionTypeFor(GraphErrorKind::THROTTLED) == GraphExceptionType::IO);
+	REQUIRE(ExceptionTypeFor(GraphErrorKind::SERVER) == GraphExceptionType::IO);
+	REQUIRE(ExceptionTypeFor(GraphErrorKind::UNAUTHENTICATED) == GraphExceptionType::IO);
+}
+
+TEST_CASE("Retry-After is honoured in its seconds form only", "[errors]") {
+	REQUIRE(ParseRetryAfterSeconds("") == 0);
+	REQUIRE(ParseRetryAfterSeconds("7") == 7);
+	REQUIRE(ParseRetryAfterSeconds(" 12 ") == 12);
+	REQUIRE(ParseRetryAfterSeconds("Wed, 21 Oct 2026 07:28:00 GMT") == 0); // HTTP-date: not trusted
+	REQUIRE(ParseRetryAfterSeconds("-3") == 0);
+	REQUIRE(ParseRetryAfterSeconds("99999999999999999999") == kMaxRetryAfterSeconds); // clamped, no overflow
+	REQUIRE(ParseRetryAfterSeconds("100000") == kMaxRetryAfterSeconds);
+}
+
+TEST_CASE("backoff doubles from 500 ms, caps at 20 s, honours Retry-After", "[errors]") {
+	// jitter 1.0 = the nominal schedule.
+	REQUIRE(BackoffDelayMs(1, 0, 1.0) == 500);
+	REQUIRE(BackoffDelayMs(2, 0, 1.0) == 1000);
+	REQUIRE(BackoffDelayMs(3, 0, 1.0) == 2000);
+	REQUIRE(BackoffDelayMs(10, 0, 1.0) == 20000);
+	REQUIRE(BackoffDelayMs(64, 0, 1.0) == 20000); // no shift overflow
+	// +/-25% jitter, clamped to that band whatever the caller passes.
+	REQUIRE(BackoffDelayMs(1, 0, 0.75) == 375);
+	REQUIRE(BackoffDelayMs(1, 0, 1.25) == 625);
+	REQUIRE(BackoffDelayMs(1, 0, 9.0) == 625);
+	REQUIRE(BackoffDelayMs(1, 0, 0.0) == 375);
+	// The server's Retry-After is a floor, never shortened by jitter.
+	REQUIRE(BackoffDelayMs(1, 3, 0.75) == 3000);
+	REQUIRE(BackoffDelayMs(5, 1, 1.0) == 8000);
+}
+
+TEST_CASE("graph error messages carry the code and stay one line", "[errors]") {
+	const auto msg = FormatGraphError("move 'a' -> 'b'", 409, "nameAlreadyExists", "Name already exists");
+	REQUIRE(msg == "sharepoint: move 'a' -> 'b' failed: HTTP 409 (conflict, nameAlreadyExists): Name already exists");
+	REQUIRE(FormatGraphError("stat 'x'", 503, "", "") == "sharepoint: stat 'x' failed: HTTP 503 (throttled)");
+	// Graph's message is truncated and newline-free.
+	const auto long_msg = FormatGraphError("op", 400, "invalidRequest", std::string(1000, 'm') + "\nsecond line");
+	REQUIRE(long_msg.size() < 400);
+	REQUIRE(long_msg.find('\n') == std::string::npos);
+}
+
 // ---------------------------------------------------------------------------
 // Verbatim HTTP/1.1 for Graph's pre-authenticated URLs. httplib 0.27 (DuckDB
 // 1.5) re-sorts a request's query parameters, and SharePoint's signed
@@ -376,12 +478,12 @@ TEST_CASE("graph errors classify by status and code", "[errors]") {
 TEST_CASE("raw request keeps the target byte for byte", "[rawhttp]") {
 	std::string req;
 	const std::string target = "/_layouts/15/download.aspx?UniqueId=abc&Translate=false&tempauth=v1.x&ApiVersion=2.0";
-	REQUIRE(BuildRawHttpRequest("GET", "tenant.sharepoint.com", target, {{"Range", "bytes=0-4"}}, "", req));
+	REQUIRE(BuildRawHttpRequest("GET", "tenant.sharepoint.com", 443, target, {{"Range", "bytes=0-4"}}, "", req));
 	REQUIRE(req == "GET " + target +
 	                   " HTTP/1.1\r\nHost: tenant.sharepoint.com\r\nConnection: close\r\nRange: bytes=0-4\r\n"
 	                   "Content-Length: 0\r\n\r\n");
 
-	REQUIRE(BuildRawHttpRequest("PUT", "h", "/u?a=1", {}, "xyz", req));
+	REQUIRE(BuildRawHttpRequest("PUT", "h", 443, "/u?a=1", {}, "xyz", req));
 	REQUIRE(req.size() >= 3);
 	REQUIRE(req.substr(req.size() - 3) == "xyz");
 	REQUIRE(req.find("Content-Length: 3\r\n") != std::string::npos);
@@ -389,13 +491,13 @@ TEST_CASE("raw request keeps the target byte for byte", "[rawhttp]") {
 
 TEST_CASE("raw request refuses header and request-line injection", "[rawhttp]") {
 	std::string req;
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/a b", {}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/a\r\nX: y", {}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "no-leading-slash", {}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h\r\nX: y", "/", {}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/", {{"Range", "bytes=0-1\r\nEvil: 1"}}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", "/", {{"Bad Name", "v"}}, "", req));
-	REQUIRE_FALSE(BuildRawHttpRequest("G T", "h", "/", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/a b", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/a\r\nX: y", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "no-leading-slash", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h\r\nX: y", 443, "/", {}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/", {{"Range", "bytes=0-1\r\nEvil: 1"}}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/", {{"Bad Name", "v"}}, "", req));
+	REQUIRE_FALSE(BuildRawHttpRequest("G T", "h", 443, "/", {}, "", req));
 }
 
 TEST_CASE("raw response parses content-length, chunked and EOF bodies", "[rawhttp]") {
@@ -439,4 +541,151 @@ TEST_CASE("https origin splits into host and port", "[rawhttp]") {
 	REQUIRE_FALSE(SplitHttpsOrigin("https://h:0", host, port));
 	REQUIRE_FALSE(SplitHttpsOrigin("https://h:99999", host, port));
 	REQUIRE_FALSE(SplitHttpsOrigin("https://h:x", host, port));
+}
+
+TEST_CASE("raw request: reserved headers, non-ASCII values, Host port", "[rawhttp]") {
+	std::string req;
+	// The builder owns framing and routing headers; a caller copy would smuggle.
+	for (const char *h : {"Content-Length", "transfer-encoding", "Host", "Connection"}) {
+		INFO(h);
+		REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/", {{h, "1"}}, "", req));
+	}
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 443, "/", {{"X", "caf\xc3\xa9"}}, "", req));
+	REQUIRE(BuildRawHttpRequest("GET", "h", 8443, "/", {}, "", req));
+	REQUIRE(req.find("Host: h:8443\r\n") != std::string::npos);
+	REQUIRE_FALSE(BuildRawHttpRequest("GET", "h", 0, "/", {}, "", req));
+}
+
+TEST_CASE("raw response framing is strict", "[rawhttp]") {
+	RawHttpResponse r;
+	// Conflicting framing is refused rather than guessed at.
+	REQUIRE_FALSE(ParseRawHttpResponse("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\nab", r));
+	REQUIRE_FALSE(ParseRawHttpResponse(
+	    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", r));
+	REQUIRE_FALSE(
+	    ParseRawHttpResponse("HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999999\r\n\r\n", r));
+	// Identical duplicates are harmless.
+	REQUIRE(ParseRawHttpResponse("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nab", r));
+	REQUIRE(r.body == "ab");
+}
+
+TEST_CASE("raw response completeness lets the reader stop before EOF", "[rawhttp]") {
+	// A peer that ignores `Connection: close` must not make every request wait
+	// for the socket timeout: a framed response is done when its body is.
+	REQUIRE_FALSE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"));
+	REQUIRE_FALSE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel"));
+	REQUIRE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"));
+	REQUIRE_FALSE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"));
+	REQUIRE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"));
+	// Unframed: only EOF ends it.
+	REQUIRE_FALSE(RawHttpResponseComplete("HTTP/1.1 200 OK\r\n\r\nabc"));
+}
+
+TEST_CASE("https origin and absolute URL edge cases", "[rawhttp]") {
+	std::string host;
+	int port = 0;
+	for (const char *bad : {"https://user@h", "https://h?x", "https://h#x", "https://[::1]", "https://h/p"}) {
+		INFO(bad);
+		REQUIRE_FALSE(SplitHttpsOrigin(bad, host, port));
+	}
+	std::string origin, rest;
+	// A query with no path keeps its query.
+	REQUIRE(SplitAbsoluteUrl("https://h?a=1&b=2", origin, rest));
+	REQUIRE(origin == "https://h");
+	REQUIRE(rest == "/?a=1&b=2");
+}
+
+TEST_CASE("ranged reply acceptance", "[rawhttp]") {
+	std::string body = "hello";
+	REQUIRE(AcceptRangeReply(206, "bytes 10-14/100", body, 10, 5));
+	REQUIRE(body == "hello");
+	// 206 of the wrong length or for the wrong start is not our range.
+	body = "hell";
+	REQUIRE_FALSE(AcceptRangeReply(206, "", body, 10, 5));
+	body = "hello";
+	REQUIRE_FALSE(AcceptRangeReply(206, "bytes 0-4/100", body, 10, 5));
+	// 200 = whole file: sliced, or refused if too short.
+	body = "0123456789abcdef";
+	REQUIRE(AcceptRangeReply(200, "", body, 10, 5));
+	REQUIRE(body == "abcde");
+	body = "0123";
+	REQUIRE_FALSE(AcceptRangeReply(200, "", body, 10, 5));
+	body = "x";
+	REQUIRE_FALSE(AcceptRangeReply(404, "", body, 0, 1));
+}
+
+// ---------------------------------------------------------------------------
+// Identity: which endpoints may receive credentials, and how credential
+// material is framed before it is hashed into a cache key.
+// ---------------------------------------------------------------------------
+TEST_CASE("only Microsoft cloud endpoints may receive credentials", "[identity]") {
+	// sharepoint_graph_endpoint / sharepoint_login_endpoint are session
+	// settings: without an allowlist any SQL user could point them at a host
+	// they control and receive bearer tokens -- or the client secret itself.
+	for (const char *ok : {"https://graph.microsoft.com", "https://graph.microsoft.com/", "https://graph.microsoft.us",
+	                       "https://dod-graph.microsoft.us", "https://microsoftgraph.chinacloudapi.cn",
+	                       "HTTPS://Graph.Microsoft.com"}) {
+		INFO(ok);
+		REQUIRE(IsAllowedGraphEndpoint(ok));
+	}
+	for (const char *ok : {"https://login.microsoftonline.com", "https://login.microsoftonline.us",
+	                       "https://login.partner.microsoftonline.cn", "https://login.chinacloudapi.cn"}) {
+		INFO(ok);
+		REQUIRE(IsAllowedLoginEndpoint(ok));
+	}
+	for (const char *bad :
+	     {"http://graph.microsoft.com", "https://graph.microsoft.com.evil.example", "https://evil.example",
+	      "https://graph.microsoft.com:8443", "https://graph.microsoft.com/v1.0", "https://user@graph.microsoft.com",
+	      "https://login.microsoftonline.com", ""}) {
+		INFO(bad);
+		REQUIRE_FALSE(IsAllowedGraphEndpoint(bad));
+	}
+	REQUIRE_FALSE(IsAllowedLoginEndpoint("https://graph.microsoft.com"));
+	REQUIRE_FALSE(IsAllowedLoginEndpoint("http://login.microsoftonline.com"));
+}
+
+TEST_CASE("credential material framing is unambiguous", "[identity]") {
+	// "a|b" + "c" and "a" + "b|c" must never frame to the same key material.
+	REQUIRE(FrameCredentialMaterial({"a|b", "c"}) != FrameCredentialMaterial({"a", "b|c"}));
+	REQUIRE(FrameCredentialMaterial({"ab", ""}) != FrameCredentialMaterial({"a", "b"}));
+	REQUIRE(FrameCredentialMaterial({"", ""}) != FrameCredentialMaterial({""}));
+	REQUIRE(FrameCredentialMaterial({"x", "y"}) == FrameCredentialMaterial({"x", "y"}));
+}
+
+TEST_CASE("the default scope follows the Graph cloud", "[identity]") {
+	REQUIRE(DefaultGraphScope("https://graph.microsoft.com") == "https://graph.microsoft.com/.default");
+	REQUIRE(DefaultGraphScope("https://graph.microsoft.us/") == "https://graph.microsoft.us/.default");
+}
+
+TEST_CASE("tenant ids are a GUID or a domain", "[identity]") {
+	// The tenant is spliced into the token URL path: "/<tenant>/oauth2/...".
+	REQUIRE(IsValidTenantId("72f988bf-86f1-41af-91ab-2d7cd011db47"));
+	REQUIRE(IsValidTenantId("contoso.onmicrosoft.com"));
+	REQUIRE(IsValidTenantId("organizations"));
+	for (const char *bad : {"", "a/b", "x?y", "x#y", "..", "a b", "contoso.com/../evil", "%2e%2e"}) {
+		INFO(bad);
+		REQUIRE_FALSE(IsValidTenantId(bad));
+	}
+}
+
+TEST_CASE("call counters count, snapshot by name and reset", "[counters]") {
+	ResetCounters();
+	IncrementCounter(Counter::STAT);
+	IncrementCounter(Counter::STAT);
+	IncrementCounter(Counter::BYTES_READ, 4096);
+	std::map<std::string, std::uint64_t> snap;
+	std::set<std::string> names;
+	for (const auto &kv : SnapshotCounters()) {
+		snap[kv.first] = kv.second;
+		names.insert(kv.first);
+		REQUIRE(std::string(kv.first) != "unknown"); // every counter is named
+	}
+	REQUIRE(names.size() == static_cast<std::size_t>(Counter::COUNT_)); // names are unique
+	REQUIRE(snap["stat"] == 2);
+	REQUIRE(snap["bytes_read"] == 4096);
+	REQUIRE(snap["read_range"] == 0);
+	ResetCounters();
+	for (const auto &kv : SnapshotCounters()) {
+		REQUIRE(kv.second == 0);
+	}
 }

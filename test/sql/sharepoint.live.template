@@ -178,6 +178,42 @@ SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree/*.parquet')
 ----
 1
 
+# Character classes and {a,b} alternation -- the same pattern syntax as the
+# sibling gdrive. An alternative may span folders.
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree/**/[xyz].parquet');
+----
+3
+
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree/**/[!x].parquet');
+----
+2
+
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree/{x,nothere}.parquet');
+----
+1
+
+query I
+SELECT sum(a) FROM read_parquet('sharepoint://_duckdb_sharepoint_live/tree/{sub/y,sub/deep/z}.parquet');
+----
+5
+
+# Cross-check with gdrive (same scenario script on both backends): glob yields
+# FILES only -- a literal folder path is no match -- and reading an absent
+# file is DuckDB's "No files found", not a Graph error from the literal
+# fallback stat-ing core's synthesized "<path>/**/*.csv" probe.
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/tree');
+----
+0
+
+statement error
+SELECT * FROM read_csv('sharepoint://_duckdb_sharepoint_live/tree/absent.csv');
+----
+No files found
+
 # ---------------------------------------------------------------------------
 # 6. move_file: write a staging file, publish it under its final name.
 # ---------------------------------------------------------------------------
@@ -229,12 +265,16 @@ SELECT move_file('sharepoint://_duckdb_sharepoint_live/odd/staging.tmp',
 ----
 true
 
+# '{x}' is also glob alternation; a pattern that matches nothing falls back to
+# the literal name, as DuckDB's local filesystem does.
 query I
 SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live/odd/it''s #1 %41+b & ünï;{x}.txt');
 ----
 odd
 
-# A name SharePoint forbids is Graph's clean 400, not a malformed request.
+# A name SharePoint forbids is refused up front with a message that says so
+# (it used to reach Graph: '"' came back as a bare 400, and ':' -- Graph's own
+# root:/path: delimiter -- as "Resource not found for the segment 'root:'").
 statement ok
 SELECT write_blob('sharepoint://_duckdb_sharepoint_live/odd/staging2.tmp', 'odd'::BLOB);
 
@@ -242,7 +282,12 @@ statement error
 SELECT move_file('sharepoint://_duckdb_sharepoint_live/odd/staging2.tmp',
                  'sharepoint://_duckdb_sharepoint_live/odd/q"uote.txt');
 ----
-HTTP 400
+SharePoint does not allow '"'
+
+statement error
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/odd/colon:name.txt', 'x'::BLOB);
+----
+SharePoint does not allow ':'
 
 statement ok
 SELECT remove_file('sharepoint://_duckdb_sharepoint_live/odd/staging2.tmp');
@@ -278,6 +323,221 @@ RESET sharepoint_permanent_delete;
 
 statement ok
 SELECT remove_file('sharepoint://_duckdb_sharepoint_live/odd/it''s #1 %41+b & ünï;{x}.txt');
+
+# ---------------------------------------------------------------------------
+# 10. Token cache identity (crew finding F5). The cache used to be keyed by
+#     the secret's NAME: recreating `sp_live` with a wrong client secret was
+#     still served the token minted for the right one. Keyed by a fingerprint
+#     of the credentials, the wrong secret must authenticate on its own -- and
+#     fail.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE SECRET sp_live (
+    TYPE sharepoint,
+    PROVIDER client_credentials,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_CLIENT_ID@',
+    CLIENT_SECRET 'definitely-not-the-secret',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@'
+);
+
+statement error
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/data/nums.parquet');
+----
+invalid_client
+
+statement ok
+CREATE OR REPLACE SECRET sp_live (
+    TYPE sharepoint,
+    PROVIDER client_credentials,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_CLIENT_ID@',
+    CLIENT_SECRET '@SHAREPOINT_CLIENT_SECRET@',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@'
+);
+
+# ---------------------------------------------------------------------------
+# 11. sharepoint_stats() and sharepoint_immutable_prefixes. A read costs a stat
+#     for the glob and one for the open; under a declared-immutable prefix the
+#     open's stat is served from the metadata cache. Our own rewrite
+#     invalidates it, so the new content is read.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/imm/a.txt', 'abc'::BLOB);
+
+statement ok
+SET sharepoint_immutable_prefixes = 'sharepoint://_duckdb_sharepoint_live/imm';
+
+# First read under the prefix: both stats go to Graph, and fill the cache.
+statement ok
+SELECT content FROM read_blob('sharepoint://_duckdb_sharepoint_live/imm/a.txt');
+
+statement ok
+CALL sharepoint_reset_stats();
+
+query T
+SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live/imm/a.txt');
+----
+abc
+
+query II
+SELECT (SELECT value FROM sharepoint_stats() WHERE metric = 'stat'),
+       (SELECT value FROM sharepoint_stats() WHERE metric = 'meta_cache_hits');
+----
+1	1
+
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/imm/a.txt', 'abcdef'::BLOB);
+
+query I
+SELECT octet_length(content) FROM read_blob('sharepoint://_duckdb_sharepoint_live/imm/a.txt');
+----
+6
+
+# file_size opens first: one stat for a present file (it used to ask
+# FileExists, then open -- two; three for an absent file).
+statement ok
+CALL sharepoint_reset_stats();
+
+statement ok
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/data/nums.parquet');
+
+query I
+SELECT value FROM sharepoint_stats() WHERE metric = 'stat';
+----
+1
+
+statement ok
+RESET sharepoint_immutable_prefixes;
+
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/imm/a.txt');
+
+# ---------------------------------------------------------------------------
+# 12. Folders are not files, and not absent (crew finding F10): an existing
+#     folder used to make remove_file return false and file_size NULL.
+# ---------------------------------------------------------------------------
+statement error
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/tree');
+----
+is a directory
+
+statement error
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/tree');
+----
+is a directory
+
+# ---------------------------------------------------------------------------
+# 13. ATTACH a DuckDB database file stored on SharePoint, read-only. Found by
+#     exploratory testing: DuckDB 1.5 canonicalized the path to
+#     "sharepoint:/..." ("database does not exist"), and then opened the file
+#     with a database-level opener that has no client connection, which the
+#     secret lookup required.
+# ---------------------------------------------------------------------------
+statement ok
+ATTACH '__TEST_DIR__/sp_attach.duckdb' AS loc;
+
+statement ok
+CREATE TABLE loc.t AS SELECT i, 'row ' || i AS s FROM range(100000) t(i);
+
+statement ok
+DETACH loc;
+
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/attach/db.duckdb', content)
+FROM read_blob('__TEST_DIR__/sp_attach.duckdb');
+
+statement ok
+ATTACH 'sharepoint://_duckdb_sharepoint_live/attach/db.duckdb' AS remote (READ_ONLY);
+
+query II
+SELECT count(*), sum(i) FROM remote.t;
+----
+100000	4999950000
+
+# 14. A handle outlives its token (crew round 3, F1): handles hold a token
+#     SOURCE, not a token, and re-mint before expiry. Cap the token lifetime
+#     to 61 s (stale after 1 s given the 60 s refresh margin), keep the ATTACH
+#     open past it, and read again: a new token is minted, the read succeeds.
+statement ok
+DETACH remote;
+
+statement ok
+SET GLOBAL sharepoint_debug_token_max_age_seconds = 61;
+
+# A fresh copy, with the block cache off (the handle captures the size at
+# open): section 13's reads of db.duckdb are cached -- by our block cache and
+# by DuckDB itself -- and would be served without any request, so without
+# ever needing a token.
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/attach/db2.duckdb', content)
+FROM read_blob('__TEST_DIR__/sp_attach.duckdb');
+
+# Session AND global: section 4's SET/RESET left a session-level value, which
+# shadows a global one.
+statement ok
+SET sharepoint_block_size_bytes = 0;
+
+statement ok
+SET GLOBAL sharepoint_block_size_bytes = 0;
+
+statement ok
+ATTACH 'sharepoint://_duckdb_sharepoint_live/attach/db2.duckdb' AS remote (READ_ONLY);
+
+statement ok
+CALL sharepoint_reset_stats();
+
+# ATTACH read only the header/metadata; the column data is first read after
+# the token went stale.
+sleep 3 seconds
+
+query I
+SELECT sum(i) FROM remote.t;
+----
+4999950000
+
+query II
+SELECT (SELECT value >= 1 FROM sharepoint_stats() WHERE metric = 'token_request'),
+       (SELECT value >= 1 FROM sharepoint_stats() WHERE metric = 'read_range');
+----
+true	true
+
+statement ok
+DETACH remote;
+
+statement ok
+RESET GLOBAL sharepoint_debug_token_max_age_seconds;
+
+statement ok
+RESET GLOBAL sharepoint_block_size_bytes;
+
+statement ok
+RESET sharepoint_block_size_bytes;
+
+# ---------------------------------------------------------------------------
+# 15. A 401 is answered by ONE fresh token and one re-send -- and when that
+#     cannot help (a pasted, garbage ACCESS_TOKEN has nothing to refresh
+#     with), the failure is a clean authentication error, not a loop.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE SECRET sp_bogus (TYPE sharepoint, PROVIDER config, ACCESS_TOKEN 'not-a-token',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@', SCOPE 'sharepoint://_duckdb_sharepoint_live/bogus');
+
+statement ok
+CALL sharepoint_reset_stats();
+
+statement error
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/bogus/x.txt');
+----
+unauthenticated
+
+query I
+SELECT value FROM sharepoint_stats() WHERE metric = 'auth_refresh';
+----
+1
+
+statement ok
+DROP SECRET sp_bogus;
 
 # ---------------------------------------------------------------------------
 # Best-effort teardown of the leaf files. Empty fixture folders may remain; the
