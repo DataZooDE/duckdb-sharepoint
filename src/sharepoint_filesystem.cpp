@@ -102,17 +102,47 @@ SharepointFileHandle::SharepointFileHandle(FileSystem &fs, string path, FileOpen
     : FileHandle(fs, std::move(path), flags), auth(std::move(auth)) {
 }
 
+SharepointFileHandle::~SharepointFileHandle() {
+	// A handle destroyed with an upload session still open was never
+	// successfully closed (an exception unwound through the writer, e.g. a
+	// COPY whose query failed mid-stream). Discard the session so nothing is
+	// published -- not even SharePoint's 0-byte placeholder. Never throws.
+	if (session.IsOpen()) {
+		GraphClient client(auth);
+		client.AbortUploadSession(session);
+	}
+}
+
 void SharepointFileHandle::Close() {
-	if (!is_write || write_failed) {
+	if (!is_write) {
 		return;
 	}
-	// Publish the buffered bytes as one upload. A zero-length write still
-	// creates an empty file, matching local-fs semantics. PutContent chooses a
-	// single PUT vs. a resumable session by comparing the buffer to
-	// upload_chunk_bytes (captured at open time).
-	is_write = false;
+	is_write = false; // a second Close() must not publish twice
 	GraphClient client(auth);
-	client.PutContent(write_root_relative, write_buffer, upload_chunk_bytes);
+	if (write_failed || !upload) {
+		// A write already failed: never publish a truncated file.
+		client.AbortUploadSession(session);
+		return;
+	}
+	try {
+		if (upload->OnClose() == ChunkedUploadBuffer::CloseAction::SINGLE_REQUEST) {
+			// Never outgrew one chunk: one PUT. A zero-length write still
+			// creates an empty file, matching local-fs semantics.
+			client.PutContent(write_root_relative, upload->Pending());
+		} else {
+			// The last chunk carries the total; the commit publishes the file.
+			client.SendUploadChunk(session, *upload, /*final=*/true);
+			client.CommitUploadSession(session, upload->Total());
+		}
+	} catch (...) {
+		// A failed close is a failed write: discard the session (nothing is
+		// published) and let the error surface.
+		write_failed = true;
+		client.AbortUploadSession(session);
+		static_cast<SharepointFileSystem &>(file_system).InvalidateMeta(auth.identity + "|" + write_root_relative);
+		throw;
+	}
+	upload.reset();
 	static_cast<SharepointFileSystem &>(file_system).InvalidateMeta(auth.identity + "|" + write_root_relative);
 }
 
@@ -183,7 +213,7 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 			auto handle = make_uniq<SharepointFileHandle>(*this, path, flags, std::move(auth));
 			handle->is_write = true;
 			handle->write_root_relative = uri.RootRelativePath();
-			handle->upload_chunk_bytes = UploadChunkBytes(context);
+			handle->upload = make_uniq<ChunkedUploadBuffer>(UploadChunkBytes(context));
 			return std::move(handle);
 		}
 
@@ -289,29 +319,54 @@ void SharepointFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_by
 	// Positional write: Graph replaces whole files and cannot write at an
 	// offset. Fail loudly rather than silently drop or corrupt.
 	throw IOException("sharepoint: cannot write at a byte offset -- Graph replaces whole files. Write "
-	                  "sequentially (the file is uploaded in full on close).");
+	                  "sequentially (the file is streamed in chunks and published on close).");
 }
 
 int64_t SharepointFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &h = handle.Cast<SharepointFileHandle>();
-	if (!h.is_write) {
+	if (!h.is_write || !h.upload) {
 		throw IOException("sharepoint: '%s' was not opened for writing", handle.path.c_str());
 	}
+	if (h.write_failed) {
+		throw IOException("sharepoint: a previous write to '%s' already failed; this handle can only be closed",
+		                  handle.path.c_str());
+	}
+	auto &buf = *h.upload;
+	const char *data = static_cast<const char *>(buffer);
+	idx_t left = static_cast<idx_t>(nr_bytes);
 	try {
-		h.write_buffer.append(static_cast<const char *>(buffer), static_cast<size_t>(nr_bytes));
+		while (left > 0) {
+			// A full chunk goes up only once MORE bytes arrive: until then it
+			// may be the whole file (one PUT) or the final chunk (which must
+			// carry the total). So the buffer never exceeds one chunk.
+			if (buf.Full()) {
+				GraphClient client(h.auth);
+				if (!h.session.IsOpen()) {
+					client.OpenUploadSession(h.write_root_relative, h.session);
+				}
+				client.SendUploadChunk(h.session, buf, /*final=*/false);
+				buf.MarkChunkSent();
+			}
+			const auto took = buf.Fill(data, left);
+			data += took;
+			left -= took;
+		}
 	} catch (...) {
-		// Never publish what we have so far as if it were the whole file: Close()
-		// skips the upload once a write failed (gdrive does the same).
+		// Never publish what we have so far as if it were the whole file:
+		// discard the session now, and Close() then publishes nothing.
 		h.write_failed = true;
+		GraphClient client(h.auth);
+		client.AbortUploadSession(h.session);
 		throw;
 	}
+	RecordMaxCounter(Counter::UPLOAD_BUFFER_PEAK, buf.Peak());
 	h.position += nr_bytes;
 	return nr_bytes;
 }
 
 int64_t SharepointFileSystem::GetFileSize(FileHandle &handle) {
 	auto &h = handle.Cast<SharepointFileHandle>();
-	return h.is_write ? static_cast<int64_t>(h.write_buffer.size()) : h.meta.size;
+	return h.is_write ? static_cast<int64_t>(h.position) : h.meta.size;
 }
 
 namespace {
@@ -590,8 +645,11 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 }
 
 void SharepointFileSystem::FileSync(FileHandle &handle) {
-	// Nothing to flush before Close(): the upload happens on Close(). Present
-	// so write_blob's handle->Sync() is a no-op rather than unsupported.
+	// Nothing to flush before Close(): full chunks already went up as they
+	// filled, and the partial one cannot (every non-final chunk must be a
+	// 320-KiB multiple, and the file is published only by the commit in
+	// Close()). Present so write_blob's handle->Sync() is a no-op rather than
+	// unsupported.
 }
 
 void SharepointFileSystem::Seek(FileHandle &handle, idx_t location) {

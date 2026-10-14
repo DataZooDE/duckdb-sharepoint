@@ -213,12 +213,13 @@ constexpr int kPreauthTimeoutSeconds = 300;
 //! expected ranges).
 constexpr std::size_t kUploadReplyMaxBytes = 1 << 20;
 
-//! GET an upload session and return the first byte Graph still expects, parsed
-//! from nextExpectedRanges. Sent verbatim, without an Authorization header --
-//! the uploadUrl is pre-authenticated. Returns false if the session advertises
-//! no range (e.g. it is already complete), the body is unexpected, or the
-//! request fails, leaving `resume_at` untouched.
-bool QueryUploadResumeOffset(const string &upload_url, idx_t &resume_at) {
+//! GET an upload session's state. Sent verbatim, without an Authorization
+//! header -- the uploadUrl is pre-authenticated. On success `complete` says
+//! the session holds every byte (nextExpectedRanges is empty, as after the
+//! final chunk of a deferCommit session), else `next` is the first byte Graph
+//! still expects. Returns false if the request fails or the body is
+//! unexpected, leaving both untouched.
+bool QueryUploadSession(const string &upload_url, uint64_t &next, bool &complete) {
 	RawHttpResponse res;
 	try {
 		res = PreauthenticatedRequest("GET", upload_url, {}, "", kPreauthTimeoutSeconds, kUploadReplyMaxBytes);
@@ -238,14 +239,16 @@ bool QueryUploadResumeOffset(const string &upload_url, idx_t &resume_at) {
 		return false;
 	}
 	auto &arr = it->second.get<picojson::array>();
-	if (arr.empty() || !arr[0].is<string>()) {
-		return false;
+	if (arr.empty()) {
+		complete = true;
+		return true;
 	}
 	uint64_t start = 0;
-	if (!ParseRangeStart(arr[0].get<string>(), start)) {
+	if (!arr[0].is<string>() || !ParseRangeStart(arr[0].get<string>(), start)) {
 		return false;
 	}
-	resume_at = static_cast<idx_t>(start);
+	complete = false;
+	next = start;
 	return true;
 }
 
@@ -403,159 +406,218 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 	ThrowGraph("read id '" + item_id + "'", status, body);
 }
 
-DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const string &bytes, idx_t chunk_bytes) {
+DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const string &bytes) {
+	// A file no larger than one upload chunk: a single PUT to the content
+	// endpoint. Larger files never get here -- the write handle streams them
+	// through an upload session chunk by chunk (sharepoint_filesystem.cpp), so
+	// `bytes` is at most sharepoint_upload_chunk_bytes, itself normalised under
+	// Graph's 60 MiB request cap.
 	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.tokens->Token()}};
-
-	// Small file: a single PUT to the content endpoint. Graph permits up to
-	// 250 MiB this way, but the resumable session is more robust past a few
-	// MiB, so switch at the configured chunk size.
-	// The threshold is the NORMALIZED chunk size (a 320-KiB multiple under 60
-	// MiB): the raw setting could send a file far beyond Graph's single-PUT
-	// limit in one request (413, after five full-body attempts).
-	if (bytes.size() <= NormalizeUploadChunkSize(chunk_bytes)) {
-		string path = "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) + ":/content";
-		IncrementCounter(Counter::UPLOAD_PUT);
-		IncrementCounter(Counter::BYTES_WRITTEN, bytes.size());
-		auto res = SendWithRetry(*auth.tokens, h, [&] { return cli.Put(path.c_str(), h, bytes, "application/octet-stream"); });
-		if (!res) {
-			throw IOException("sharepoint: upload of '%s' failed at the transport layer",
-			                  root_relative_path.c_str());
-		}
-		if (res->status < 200 || res->status >= 300) {
-			ThrowGraph("upload '" + root_relative_path + "'", res->status, res->body);
-		}
-		picojson::value v;
-		if (!picojson::parse(v, res->body).empty() || !v.is<picojson::object>()) {
-			throw IOException("sharepoint: upload of '%s' returned no item metadata",
-			                  root_relative_path.c_str());
-		}
-		return ParseMeta(v.get<picojson::object>());
+	string path = "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) + ":/content";
+	IncrementCounter(Counter::UPLOAD_PUT);
+	IncrementCounter(Counter::BYTES_WRITTEN, bytes.size());
+	auto res = SendWithRetry(*auth.tokens, h, [&] { return cli.Put(path.c_str(), h, bytes, "application/octet-stream"); });
+	if (!res) {
+		throw IOException("sharepoint: upload of '%s' failed at the transport layer", root_relative_path.c_str());
 	}
+	if (res->status < 200 || res->status >= 300) {
+		ThrowGraph("upload '" + root_relative_path + "'", res->status, res->body);
+	}
+	picojson::value v;
+	if (!picojson::parse(v, res->body).empty() || !v.is<picojson::object>()) {
+		throw IOException("sharepoint: upload of '%s' returned no item metadata", root_relative_path.c_str());
+	}
+	return ParseMeta(v.get<picojson::object>());
+}
 
-	// Large file: resumable upload session.
-	//   POST .../root:/{path}:/createUploadSession  -> { uploadUrl }
-	//   then PUT each chunk to uploadUrl with a Content-Range header; the final
-	//   chunk's response carries the driveItem.
-	// Chunks MUST be a multiple of 320 KiB except the last (Graph contract).
-	// What was there before, so a lost reply to the FINAL chunk can be told
-	// apart from a failed upload (see VerifyCommitted below).
-	const DriveItemMeta before = StatByPath(root_relative_path);
-	// The final chunk's reply can be lost after Graph committed the file; the
-	// session is then gone, so resuming fails and a re-PUT is rejected. If the
-	// item now has our size and a different eTag than before, it is ours.
-	// (A concurrent writer of exactly the same size is the residual ambiguity.)
-	auto verify_committed = [&](idx_t total_size, DriveItemMeta &out) -> bool {
-		auto now = StatByPath(root_relative_path);
-		if (now.found && !now.is_folder && static_cast<idx_t>(now.size) == total_size &&
-		    (!before.found || now.etag != before.etag)) {
-			out = now;
-			return true;
-		}
-		return false;
-	};
+void GraphClient::OpenUploadSession(const string &root_relative_path, GraphUploadSession &session) {
+	// What was there before, so a lost reply to the COMMIT can be told apart
+	// from a failed upload (see CommitUploadSession).
+	session.before = StatByPath(root_relative_path);
+	session.root_relative_path = root_relative_path;
 
+	// deferCommit: Graph stores the chunks but publishes NOTHING until an
+	// explicit commit POST. That is what lets a streaming write (whose total
+	// size is unknown until close) send its non-final chunks with a
+	// "bytes a-b/*" Content-Range -- WITHOUT deferCommit Graph refuses "*"
+	// ("Content-Range must include a total length"), verified 2026-10-14 --
+	// and it keeps an overwritten file's OLD content visible until the commit.
+	auto &cli = GraphConnection(auth.graph_endpoint);
+	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.tokens->Token()}};
 	string session_path =
 	    "/v1.0/drives/" + auth.drive_id + "/root:/" + EncodePath(root_relative_path) + ":/createUploadSession";
-	string session_body = "{\"item\":{\"@microsoft.graph.conflictBehavior\":\"replace\"}}";
+	string session_body = "{\"item\":{\"@microsoft.graph.conflictBehavior\":\"replace\"},\"deferCommit\":true}";
 	IncrementCounter(Counter::UPLOAD_SESSION);
-	auto sres = SendWithRetry(*auth.tokens, h, [&] { return cli.Post(session_path.c_str(), h, session_body, "application/json"); });
+	auto sres = SendWithRetry(*auth.tokens, h,
+	                          [&] { return cli.Post(session_path.c_str(), h, session_body, "application/json"); });
 	if (!sres || sres->status < 200 || sres->status >= 300) {
 		ThrowGraph("createUploadSession '" + root_relative_path + "'", sres ? sres->status : 0,
 		           sres ? sres->body : string());
 	}
-	string upload_url;
-	{
-		picojson::value v;
-		if (!picojson::parse(v, sres->body).empty() || !v.is<picojson::object>()) {
-			throw IOException("sharepoint: createUploadSession returned no uploadUrl");
-		}
-		auto &o = v.get<picojson::object>();
-		auto url_it = o.find("uploadUrl");
-		if (url_it == o.end() || !url_it->second.is<string>()) {
-			throw IOException("sharepoint: createUploadSession returned no uploadUrl");
-		}
-		upload_url = url_it->second.get<string>();
+	picojson::value v;
+	if (!picojson::parse(v, sres->body).empty() || !v.is<picojson::object>()) {
+		throw IOException("sharepoint: createUploadSession returned no uploadUrl");
 	}
-
+	auto &o = v.get<picojson::object>();
+	auto url_it = o.find("uploadUrl");
+	if (url_it == o.end() || !url_it->second.is<string>()) {
+		throw IOException("sharepoint: createUploadSession returned no uploadUrl");
+	}
 	// The uploadUrl is a pre-authenticated absolute URL, typically on a
 	// DIFFERENT host than graph_endpoint. It carries NO Authorization header --
 	// the URL itself is the credential -- and is sent verbatim
 	// (PreauthenticatedRequest): it is signed over its exact query string.
+	const string upload_url = url_it->second.get<string>();
 	if (!IsHttpsUrl(upload_url)) {
 		throw IOException("sharepoint: createUploadSession returned a non-https uploadUrl");
 	}
+	session.upload_url = upload_url;
+}
 
-	const idx_t total = bytes.size();
-	const idx_t chunk = NormalizeUploadChunkSize(chunk_bytes);
-	idx_t offset = 0;
+void GraphClient::SendUploadChunk(GraphUploadSession &session, const ChunkedUploadBuffer &buf, bool final) {
+	const string &pending = buf.Pending();
+	const string &path = session.root_relative_path;
+	std::size_t skip = 0;
 	int failures = 0;
 	string last_transport_error;
-	while (offset < total) {
-		idx_t len = std::min<idx_t>(chunk, total - offset);
+	for (;;) {
+		if (skip == pending.size()) {
+			return; // the session already holds every byte of this chunk
+		}
 		RawHttpResponse res;
 		bool transport_ok = true;
 		IncrementCounter(Counter::UPLOAD_CHUNK);
 		try {
-			res = PreauthenticatedRequest("PUT", upload_url,
-			                              {{"Content-Range", UploadContentRange(offset, len, total)},
-			                               {"Content-Type", "application/octet-stream"}},
-			                              bytes.substr(offset, len), kPreauthTimeoutSeconds, kUploadReplyMaxBytes);
+			// Non-final chunks say "/*": the total is unknown until close
+			// (allowed because the session was opened with deferCommit).
+			res = PreauthenticatedRequest(
+			    "PUT", session.upload_url,
+			    {{"Content-Range", buf.ContentRange(final, skip)}, {"Content-Type", "application/octet-stream"}},
+			    skip == 0 ? pending : pending.substr(skip), kPreauthTimeoutSeconds, kUploadReplyMaxBytes);
 		} catch (IOException &e) {
 			// Transport failures are retried below. A REFUSAL (InvalidInputException:
 			// bad URL or request shape) is not caught here: retrying cannot fix it.
 			transport_ok = false;
 			last_transport_error = e.what();
 		}
+		// 202 Accepted: stored. With deferCommit even the FINAL chunk answers
+		// 202 (nextExpectedRanges: []); the item appears only on the commit.
+		// 200/201 would mean Graph committed anyway -- also fine.
+		if (transport_ok && res.status >= 200 && res.status < 300) {
+			IncrementCounter(Counter::BYTES_WRITTEN, pending.size() - skip);
+			return;
+		}
 
-		// 200/201 come back only on the FINAL chunk, and carry the driveItem.
+		// Transport failure, 5xx, 429 -- or 416, which is what a re-sent range
+		// gets after a LOST 202: ask the session which byte it expects next
+		// and resend from there, bounded. Only bytes of THIS chunk are still in
+		// memory; a resume point outside it is unrecoverable.
+		const bool range_conflict = transport_ok && res.status == 416;
+		const bool retryable =
+		    !transport_ok || range_conflict || IsRetryable(ClassifyGraphError(res.status, ErrorCode(res.body)));
+		if (retryable && ++failures <= kMaxUploadChunkRetries) {
+			IncrementCounter(Counter::RETRY);
+			if (!range_conflict) {
+				SleepBeforeRetry(failures, transport_ok ? ParseRetryAfterSeconds(res.Header("Retry-After")) : 0);
+			}
+			uint64_t next = 0;
+			bool complete = false;
+			if (QueryUploadSession(session.upload_url, next, complete)) {
+				if (complete) {
+					next = buf.Offset() + pending.size(); // it holds everything, this chunk included
+				}
+				if (!buf.ResumeSkip(next, skip)) {
+					throw IOException("sharepoint: upload session of '%s' expects byte %llu, outside the chunk "
+					                  "still in memory (%llu-%llu); the upload cannot be resumed",
+					                  path.c_str(), (unsigned long long)next, (unsigned long long)buf.Offset(),
+					                  (unsigned long long)(buf.Offset() + pending.size()));
+				}
+			}
+			continue;
+		}
+		if (!transport_ok) {
+			throw IOException("sharepoint: upload chunk of '%s' failed after %d attempts: %s", path.c_str(), failures,
+			                  last_transport_error.c_str());
+		}
+		ThrowGraph("upload chunk of '" + path + "'", res.status, res.body);
+	}
+}
+
+DriveItemMeta GraphClient::CommitUploadSession(GraphUploadSession &session, uint64_t total) {
+	const string &path = session.root_relative_path;
+	// The commit's reply can be lost after Graph committed the file; the
+	// session is then gone, so a re-POST 404s. If the item now has our size
+	// and a different eTag than before, it is ours. (A concurrent writer of
+	// exactly the same size is the residual ambiguity.)
+	auto verify_committed = [&](DriveItemMeta &out) -> bool {
+		auto now = StatByPath(path);
+		if (now.found && !now.is_folder && static_cast<uint64_t>(now.size) == total &&
+		    (!session.before.found || now.etag != session.before.etag)) {
+			out = now;
+			return true;
+		}
+		return false;
+	};
+	int failures = 0;
+	string last_error;
+	for (;;) {
+		RawHttpResponse res;
+		bool transport_ok = true;
+		IncrementCounter(Counter::UPLOAD_COMMIT);
+		try {
+			res = PreauthenticatedRequest("POST", session.upload_url, {}, "", kPreauthTimeoutSeconds,
+			                              kUploadReplyMaxBytes);
+		} catch (IOException &e) {
+			transport_ok = false;
+			last_error = e.what();
+		}
 		if (transport_ok && (res.status == 200 || res.status == 201)) {
-			IncrementCounter(Counter::BYTES_WRITTEN, len);
+			session.upload_url.clear(); // consumed: nothing left to abort
 			picojson::value v;
 			if (!picojson::parse(v, res.body).empty() || !v.is<picojson::object>()) {
-				throw IOException("sharepoint: resumable upload of '%s' returned no item metadata",
-				                  root_relative_path.c_str());
+				throw IOException("sharepoint: committing the upload of '%s' returned no item metadata",
+				                  path.c_str());
 			}
 			return ParseMeta(v.get<picojson::object>());
 		}
-		// 202 Accepted: this chunk landed and Graph now expects the next range.
-		if (transport_ok && res.status == 202) {
-			IncrementCounter(Counter::BYTES_WRITTEN, len);
-			offset += len;
-			failures = 0;
-			continue;
-		}
-
-		// Transport failure, 5xx or 429: ask the session where to resume from and
-		// retry, up to a bounded number of attempts. Re-PUTting a range Graph has
-		// already stored is safe, so a resume that returns the same offset is fine.
-		bool retryable = !transport_ok || IsRetryable(ClassifyGraphError(res.status, ErrorCode(res.body)));
+		const bool retryable = !transport_ok || IsRetryable(ClassifyGraphError(res.status, ErrorCode(res.body)));
 		if (retryable && ++failures <= kMaxUploadChunkRetries) {
 			IncrementCounter(Counter::RETRY);
 			SleepBeforeRetry(failures, transport_ok ? ParseRetryAfterSeconds(res.Header("Retry-After")) : 0);
-			idx_t resume_at = offset;
-			if (QueryUploadResumeOffset(upload_url, resume_at) && resume_at <= total) {
-				offset = resume_at;
-			}
 			continue;
 		}
-		if (offset + len == total) {
-			DriveItemMeta committed;
-			if (verify_committed(total, committed)) {
-				return committed;
-			}
+		// A lost reply to an earlier commit attempt leaves the session gone
+		// (404) while the file is in place.
+		DriveItemMeta committed;
+		if (failures > 0 && verify_committed(committed)) {
+			session.upload_url.clear();
+			return committed;
 		}
 		if (!transport_ok) {
-			throw IOException("sharepoint: upload chunk of '%s' failed after %d attempts: %s",
-			                  root_relative_path.c_str(), failures, last_transport_error.c_str());
+			throw IOException("sharepoint: committing the upload of '%s' failed after %d attempts: %s", path.c_str(),
+			                  failures, last_error.c_str());
 		}
-		ThrowGraph("upload chunk of '" + root_relative_path + "'", res.status, res.body);
+		ThrowGraph("commit upload of '" + path + "'", res.status, res.body);
 	}
-	// A non-empty file always returns from the 200/201 branch above; reaching
-	// here means the loop advanced past the end with no final response, which
-	// Graph's contract should never produce.
-	throw IOException("sharepoint: resumable upload of '%s' finished without a final response",
-	                  root_relative_path.c_str());
+}
+
+void GraphClient::AbortUploadSession(GraphUploadSession &session) noexcept {
+	if (session.upload_url.empty()) {
+		return;
+	}
+	// DELETE on the uploadUrl discards the stored chunks AND the 0-byte
+	// placeholder SharePoint shows for a NEW file while its session is open;
+	// an overwritten file keeps its old content (verified 2026-10-14).
+	// Best effort: this runs on error paths and from a destructor, so it must
+	// never throw. An abandoned session also expires on its own.
+	const string url = std::move(session.upload_url);
+	session.upload_url.clear();
+	IncrementCounter(Counter::UPLOAD_ABORT);
+	try {
+		PreauthenticatedRequest("DELETE", url, {}, "", 30, kUploadReplyMaxBytes);
+	} catch (...) {
+	}
 }
 
 bool GraphClient::DeleteItem(const string &item_id, bool permanent) {

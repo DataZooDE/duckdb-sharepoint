@@ -26,7 +26,7 @@ four mutation SQL functions, which ship here verbatim from gdrive.
 | duplicate names | allowed; needs `R-4` disambiguation to an `id:` form | **forbidden** by SharePoint; `R-4` does not arise |
 | content addressing | `files/{id}?alt=media` | `/items/{id}/content` (302 → pre-authed URL), honours `Range` |
 | version tag | `headRevisionId` | `cTag` (content tag; `eTag` also moves on metadata edits) |
-| write | buffered whole-file upload on close | same — plus a resumable **upload session** for large files |
+| write | streamed through a resumable session, published on close | same, over a `deferCommit` **upload session** |
 
 The net effect: this filesystem is materially smaller than gdrive's. There is
 no `sharepoint_path_cache.*`, no `DisambiguatePath`, and `Glob`/`ListFiles` map
@@ -71,9 +71,11 @@ as-is; with a `REFRESH_TOKEN` it uses the `refresh_token` grant.
   gdrive, amortising per-request latency over larger blocks) is *declared*
   (`sharepoint_block_size_bytes`) but not yet implemented; reads are exact
   ranges for now.
-- **Write** — bytes buffer in the handle and upload on `Close()`. Positional
-  writes and `Truncate`/`Trim` throw (Graph replaces whole files). A single
-  `PUT .../content` for files ≤ `sharepoint_upload_chunk_bytes`.
+- **Write** — streamed (see §7 item 6a): the handle holds at most one chunk;
+  a single `PUT .../content` on `Close()` for files ≤
+  `sharepoint_upload_chunk_bytes`, a `deferCommit` upload session fed chunk
+  by chunk for larger ones. Positional writes and `Truncate`/`Trim` throw
+  (Graph replaces whole files).
 - **Delete** — `DELETE /items/{id}` (recycle bin; `Prefer: permanent-delete`
   behind `sharepoint_permanent_delete`).
 - **Move** — `PATCH /items/{id}` with `parentReference` + `name`. Not atomic —
@@ -107,14 +109,12 @@ as-is; with a `REFRESH_TOKEN` it uses the `refresh_token` grant.
    `createUploadSession`, the `uploadUrl` is split into origin + path
    (`SplitAbsoluteUrl`) and driven by its own httplib client with **no** auth
    header. Chunks are `NormalizeUploadChunkSize`d down to a 320-KiB multiple,
-   each PUT carries a `Content-Range` (`UploadContentRange`); 202 advances,
-   200/201 on the final chunk returns the driveItem, and a transport/5xx/429
+   each PUT carries a `Content-Range`; 202 advances, and a transport/5xx/429
    failure resumes from the session's `nextExpectedRanges` (`ParseRangeStart`,
-   `QueryUploadResumeOffset`) for up to `kMaxUploadChunkRetries` attempts. The
+   `QueryUploadSession`) for up to `kMaxUploadChunkRetries` attempts. The
    four pure helpers live in `sharepoint_upload.*` and are Catch2-tested; the
-   PUT loop is in `sharepoint_client.cpp`. **Live proof still owed:** the §7.5
-   harness must upload a file **larger than one chunk** to exercise this branch
-   end to end — nothing here has run against a tenant.
+   PUT loop is in `sharepoint_client.cpp`. Since 2026-10-14 the session is fed
+   by the streaming write path (6a), not by a whole-file buffer.
 3. ~~**Block cache** for reads (`sharepoint_block_size_bytes`), single-flight per
    block, identity-keyed.~~ **Implemented (2026-08-05); verified live 2026-10-10.**
    `SharepointBlockCache` (`sharepoint_blockcache.*`, pure — the byte fetch is
@@ -165,9 +165,26 @@ as-is; with a `REFRESH_TOKEN` it uses the `refresh_token` grant.
    handshake, send and receive are; `getaddrinfo` inside `BIO_do_connect`
    blocks for the OS resolver timeout. Bounding it needs a resolver thread.
    *Open (crew round 4, F8; low).*
-6a. **Streaming writes.** A write is buffered in memory and uploaded on
-   close (gdrive does the same); a multi-GB COPY needs that much RAM. Stream
-   full chunks into the upload session instead. *Open (crew round 3, F6).*
+6a. ~~**Streaming writes.**~~ **Implemented and verified live 2026-10-14**
+   (crew round 3, F6). The write handle holds a pure `ChunkedUploadBuffer`
+   (`sharepoint_upload.*`, Catch2-tested) of at most one chunk. A file that
+   never outgrows it is one `PUT` on close. The first byte past one chunk opens
+   an upload session with **`deferCommit: true`** and every full chunk is `PUT`
+   to the verbatim `uploadUrl` with `Content-Range: bytes a-b/*` as it fills;
+   close sends the last chunk with the total, then `POST`s the empty-body
+   commit, which is what publishes the file. A full chunk is sent only once
+   MORE bytes arrive, so the final chunk is never empty and a file of exactly
+   one chunk never opens a session. Per-chunk retry with the shared backoff,
+   resuming from `nextExpectedRanges` (a `416` after a lost `202` is resynced
+   the same way); a lost commit reply is recognised by size + changed eTag. A
+   failed chunk or close, or a handle destroyed without a successful close (a
+   `COPY` whose query errored mid-stream), `DELETE`s the session; a failed
+   close throws. Counters: `upload_chunk`, `upload_commit`, `upload_abort`,
+   high-water mark `upload_buffer_peak`. Measured: a 373 MiB `COPY` peaks at
+   ~135 MiB RSS (local-disk `COPY` of the same: ~105 MiB), against ~520 MiB
+   buffered. Live: `sharepoint.live.template` §4b, e2e
+   `test_streaming_writes.py` (incl. the destination folder deleted
+   mid-stream: the `COPY` fails with a 404 and nothing is left).
 7. **CI**: ~~wire `MainDistributionPipeline.yml` to the DuckDB extension-ci-tools
    reusable workflow~~ **done**, plus **erpl.io deployment wired (2026-08-06)** —
    `_extension_deploy.yml` + `scripts/extension-upload.sh` ported from the
@@ -208,6 +225,27 @@ each guarded by a test so it is not rediscovered:
   { }`, spaces, non-ASCII) round-trips and is in the live suite.
 - **DuckDB 1.5's Parquet reader calls `GetLastModifiedTime`**; it is served from
   `lastModifiedDateTime` (RFC 3339).
+
+Found while building streaming writes (2026-10-14):
+
+- **An upload session refuses an unknown total — unless it is `deferCommit`.**
+  `Content-Range: bytes 0-327679/*` is a `400 invalidRequest` ("Content-Range
+  must include a total length") on a normal session, and accepted (`202`) on a
+  session created with `"deferCommit": true`. With `deferCommit`, even the
+  final chunk answers `202` with `nextExpectedRanges: []`; the item appears
+  only on `POST <uploadUrl>` (empty body), which answers `201` (new) / `200`
+  (replaced) with the driveItem. Non-final chunks need not even be 320-KiB
+  multiples under `/*`, but we keep the rule.
+- **A NEW file shows a 0-byte placeholder while its session is open** — `GET
+  /root:/path` finds it (size 0) from `createUploadSession` on; a folder
+  listing does not. `DELETE <uploadUrl>` (`204`) removes it. An EXISTING file
+  keeps its old content and size until the commit, and is untouched by a
+  discarded session.
+- **DuckDB's own failure cleanup removes the COPY target.** A `COPY` that fails
+  calls `TryRemoveFile` on every file it created; with `USE_TMP_FILE false`
+  that is the real target, so an overwrite that fails mid-stream deletes the
+  old file — exactly as on local disk. With the default tmp-file staging, the
+  old file survives.
 
 ## 8. Two-actor note
 

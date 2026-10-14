@@ -1,5 +1,7 @@
 #include "sharepoint_upload.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 
@@ -64,6 +66,47 @@ bool ParseRangeStart(const std::string &range, std::uint64_t &start) {
 		return false;
 	}
 	start = std::strtoull(range.substr(0, i).c_str(), nullptr, 10);
+	return true;
+}
+
+ChunkedUploadBuffer::ChunkedUploadBuffer(std::uint64_t chunk_bytes) : chunk(NormalizeUploadChunkSize(chunk_bytes)) {
+}
+
+std::size_t ChunkedUploadBuffer::Fill(const char *data, std::size_t len) {
+	const std::size_t room = static_cast<std::size_t>(chunk - std::min<std::uint64_t>(chunk, pending.size()));
+	const std::size_t take = std::min(room, len);
+	if (take > 0) {
+		if (pending.capacity() < chunk) {
+			// One allocation of exactly one chunk, never grown past it.
+			pending.reserve(static_cast<std::size_t>(chunk));
+		}
+		pending.append(data, take);
+		peak = std::max<std::uint64_t>(peak, pending.size());
+	}
+	return take;
+}
+
+void ChunkedUploadBuffer::MarkChunkSent() {
+	offset += pending.size();
+	pending.clear(); // keeps its capacity: the next chunk reuses the allocation
+	sent_any = true;
+}
+
+std::string ChunkedUploadBuffer::ContentRange(bool final, std::size_t skip) const {
+	const std::uint64_t start = offset + skip;
+	const std::uint64_t length = pending.size() - skip;
+	if (final) {
+		return UploadContentRange(start, length, Total());
+	}
+	// Total unknown until close: "/*" (accepted on a deferCommit session).
+	return "bytes " + std::to_string(start) + "-" + std::to_string(start + length - 1) + "/*";
+}
+
+bool ChunkedUploadBuffer::ResumeSkip(std::uint64_t next_expected, std::size_t &skip) const {
+	if (next_expected < offset || next_expected > Total()) {
+		return false;
+	}
+	skip = static_cast<std::size_t>(next_expected - offset);
 	return true;
 }
 

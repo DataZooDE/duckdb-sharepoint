@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sharepoint_auth.hpp"
+#include "sharepoint_upload.hpp"
 
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/vector.hpp"
@@ -47,6 +48,19 @@ struct ChildEntry {
 //! Retry-After as a floor). Used by every retry loop that talks to Microsoft.
 void SleepBeforeRetry(int failed_attempt, int retry_after_seconds);
 
+//! One open upload session. `upload_url` is a credential (pre-authenticated)
+//! and is empty once the session is committed or aborted.
+struct GraphUploadSession {
+	string root_relative_path;
+	string upload_url;
+	//! The item before the session opened: tells a lost commit reply apart
+	//! from a failed commit.
+	DriveItemMeta before;
+	bool IsOpen() const {
+		return !upload_url.empty();
+	}
+};
+
 class GraphClient {
 public:
 	explicit GraphClient(const AuthContext &auth) : auth(auth) {
@@ -63,11 +77,21 @@ public:
 	//! (never by httplib, which would re-sort its signed query -> 401).
 	void ReadRange(const string &item_id, int64_t offset, int64_t length, string &out);
 
-	//! Upload the whole of `bytes` to a root-relative path, replacing any
-	//! existing file. Chooses a single PUT for small files and a resumable
-	//! upload session for large ones (threshold/chunk from
-	//! sharepoint_upload_chunk_bytes). Returns the new item's metadata.
-	DriveItemMeta PutContent(const string &root_relative_path, const string &bytes, idx_t chunk_bytes);
+	//! Upload `bytes` -- at most one upload chunk -- to a root-relative path
+	//! in a single PUT, replacing any existing file. Returns the new item's
+	//! metadata. Anything larger streams through an upload session instead.
+	DriveItemMeta PutContent(const string &root_relative_path, const string &bytes);
+
+	//! Streaming upload, driven by a write handle (sharepoint_filesystem.cpp):
+	//! Open a deferCommit upload session; Send each full chunk as it fills
+	//! (and the last one, `final`, carrying the total); Commit to publish the
+	//! file atomically. Abort discards the session -- nothing is published --
+	//! and never throws. Each chunk is retried with the shared backoff and
+	//! resumed from the session's nextExpectedRanges.
+	void OpenUploadSession(const string &root_relative_path, GraphUploadSession &session);
+	void SendUploadChunk(GraphUploadSession &session, const ChunkedUploadBuffer &buf, bool final);
+	DriveItemMeta CommitUploadSession(GraphUploadSession &session, uint64_t total);
+	void AbortUploadSession(GraphUploadSession &session) noexcept;
 
 	//! DELETE an item (recycle bin unless `permanent`). Returns false if it
 	//! was already absent.
