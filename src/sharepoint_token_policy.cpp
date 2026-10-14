@@ -1,5 +1,6 @@
 #include "sharepoint_token_policy.hpp"
 
+#include <cstdint>
 #include <limits>
 
 namespace duckdb {
