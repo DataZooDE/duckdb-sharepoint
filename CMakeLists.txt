@@ -70,6 +70,7 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_rawhttp.cpp
     src/sharepoint_identity.cpp
     src/sharepoint_counters.cpp
+    src/sharepoint_token_policy.cpp
 )
 
 # ---------------------------------------------------------------------------
