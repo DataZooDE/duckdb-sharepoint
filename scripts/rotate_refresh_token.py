@@ -11,7 +11,9 @@ weekly by .github/workflows/RotateRefreshToken.yml:
   2. masks the rotated token for GitHub Actions (`::add-mask::`) before
      anything else is printed;
   3. writes it back with `gh secret set SHAREPOINT_USER_REFRESH_TOKEN`, the
-     token on stdin (never argv), authenticated by SECRETS_ROTATION_TOKEN.
+     token on stdin (never argv), authenticated by SECRETS_ROTATION_TOKEN
+     (an environment secret of `secrets-rotation`, main only), with an
+     allowlisted child environment.
 
     python3 scripts/rotate_refresh_token.py --dry-run   # redeem + validate only
     python3 scripts/rotate_refresh_token.py             # also write the secret
@@ -48,8 +50,14 @@ RELOGIN = (f"the stored refresh token is no longer valid. Run `make delegated_lo
            f"update the repo secret: gh secret set {SECRET_NAME} --repo {DEFAULT_REPO} "
            f"< <(. ./.env.sharepoint.delegated; printf %s \"${SECRET_NAME}\")")
 PAT_HELP = ("SECRETS_ROTATION_TOKEN is not set: create a fine-grained PAT (or GitHub App token) limited to "
-            f"{DEFAULT_REPO} with repository permission 'Secrets: Read and write', and store it as the repo "
-            "secret SECRETS_ROTATION_TOKEN (see docs/hld.md, 'Refresh-token rotation')")
+            f"{DEFAULT_REPO} with repository permission 'Secrets: Read and write', and store it as "
+            "SECRETS_ROTATION_TOKEN in the 'secrets-rotation' environment (main only), not as a repo secret "
+            "(see docs/hld.md §5.2)")
+
+# The only variables the `gh` child inherits (plus GH_TOKEN, GH_PROMPT_DISABLED):
+# no runner token, OIDC request token or tenant credential gets through.
+CHILD_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR",
+                       "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy")
 
 GhFn = Callable[[list, str, dict], tuple[int, str]]
 
@@ -104,7 +112,9 @@ def rotate(env: dict[str, str], dry_run: bool, repo: str = DEFAULT_REPO,
         "refresh_token": old,
         "scope": scope,
     })
-    new = body.get("refresh_token") if isinstance(body, dict) else None
+    if not isinstance(body, dict):
+        body = {}
+    new = body.get("refresh_token")
     # Mask FIRST, before any other line can be printed: whatever the shape, the
     # runner must never show it. Only under Actions -- in a terminal the
     # workflow command would itself print the token.
@@ -135,8 +145,7 @@ def rotate(env: dict[str, str], dry_run: bool, repo: str = DEFAULT_REPO,
         return
 
     # The child sees the PAT as GH_TOKEN and no other credential.
-    child = {k: v for k, v in env.items()
-             if not k.startswith(("SHAREPOINT_", "SECRETS_", "GH_", "GITHUB_TOKEN"))}
+    child = {k: env[k] for k in CHILD_ENV_ALLOWLIST if k in env}
     child.update({"GH_TOKEN": pat, "GH_PROMPT_DISABLED": "1"})
     code, err = gh_fn(["gh", "secret", "set", SECRET_NAME, "--repo", repo], new, child)
     if code != 0:

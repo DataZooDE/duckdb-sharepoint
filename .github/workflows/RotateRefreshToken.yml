@@ -9,6 +9,12 @@
 # PAT (or GitHub App token) for this repository only, "Secrets: Read and write".
 # GITHUB_TOKEN cannot write secrets, whatever `permissions` says.
 #
+# The PAT can write every secret of the repo, so it lives ONLY in the
+# `secrets-rotation` environment, whose deployment branches are restricted to
+# main. workflow_dispatch can target any branch; a branch with a modified
+# script must never see the PAT. Hence `environment:` plus a ref guard.
+# A failed run opens (or comments on) an issue -- see the `alert` job.
+#
 # Race with the live job: a run that already read the old token keeps working
 # -- Entra does not revoke a refresh token when it is redeemed (verified live
 # 2026-10-14: the same token redeemed twice, both rotated). See docs/hld.md §5.2.
@@ -28,7 +34,8 @@ on:
         type: boolean
         default: false
 
-# The secret is written with SECRETS_ROTATION_TOKEN, not GITHUB_TOKEN.
+# The secret is written with SECRETS_ROTATION_TOKEN, not GITHUB_TOKEN. Only the
+# alert job widens this, to issues: write.
 permissions:
   contents: read
 
@@ -43,8 +50,11 @@ jobs:
     timeout-minutes: 10
     name: Redeem and write back SHAREPOINT_USER_REFRESH_TOKEN
     runs-on: ubuntu-latest
-    # Upstream only: a fork has neither the secrets nor any business rotating them.
-    if: github.repository == 'DataZooDE/duckdb-sharepoint'
+    # Upstream only (a fork has neither the secrets nor any business rotating
+    # them), and main only (defence in depth behind the environment's branch rule).
+    if: github.repository == 'DataZooDE/duckdb-sharepoint' && github.ref == 'refs/heads/main'
+    # Holds SECRETS_ROTATION_TOKEN; deployment branches: main only.
+    environment: secrets-rotation
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -58,7 +68,37 @@ jobs:
           SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
           SHAREPOINT_DELEGATED_CLIENT_ID: ${{ secrets.SHAREPOINT_DELEGATED_CLIENT_ID }}
           SHAREPOINT_USER_REFRESH_TOKEN: ${{ secrets.SHAREPOINT_USER_REFRESH_TOKEN }}
-          SECRETS_ROTATION_TOKEN: ${{ secrets.SECRETS_ROTATION_TOKEN }}
+          # Not handed to a dry run at all: it only redeems.
+          SECRETS_ROTATION_TOKEN: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) && secrets.SECRETS_ROTATION_TOKEN || '' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '' }}
         run: |
           python3 scripts/rotate_refresh_token.py --repo "$GITHUB_REPOSITORY" ${DRY_RUN:+--dry-run}
+
+  # A failed rotation is otherwise silent (a failed scheduled run notifies one
+  # person at most). Separate job so the secrets-bearing one keeps contents:
+  # read; this one has issues: write and no secret but GITHUB_TOKEN.
+  alert:
+    needs: rotate
+    if: failure() && github.repository == 'DataZooDE/duckdb-sharepoint' && github.ref == 'refs/heads/main'
+    timeout-minutes: 5
+    name: Open or update the rotation-failure issue
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Delegated refresh-token rotation failed"
+          body="RotateRefreshToken failed: $RUN_URL
+
+          Read the run log. invalid_grant: the token is dead -- run \`make delegated_login\` as the test user and set SHAREPOINT_USER_REFRESH_TOKEN by hand. gh 401/403: SECRETS_ROTATION_TOKEN (environment secrets-rotation) has expired or lacks 'Secrets: Read and write'. See docs/hld.md §5.2."
+          n=$(gh issue list --state open --search "\"$title\" in:title" --json number,title \
+                --jq "map(select(.title == \"$title\"))[0].number // empty")
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

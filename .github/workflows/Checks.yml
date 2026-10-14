@@ -41,6 +41,18 @@ jobs:
       - name: No credentials committed
         run: ./scripts/check_no_credentials.sh
 
+  # The Python scripts that handle a user's refresh token (delegated_login.py,
+  # rotate_refresh_token.py). Their tests stub the token POST and use a fake
+  # `gh` on PATH -- no credentials, no network -- so fork PRs run them too.
+  scripts-offline:
+    timeout-minutes: 15
+    name: Token-script offline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+      - run: cd e2e && uv run --locked pytest -q tests/test_delegated_login_script.py tests/test_rotate_refresh_token_script.py
+
   # A submodule that has drifted off the shipped tag makes every local green
   # meaningless: DuckDB's C++ API differs between versions.
   pin:

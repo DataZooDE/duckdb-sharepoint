@@ -6,6 +6,10 @@ network or GitHub."""
 from __future__ import annotations
 
 import importlib.util
+import os
+import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -182,7 +186,7 @@ def test_an_unrotated_token_is_not_rewritten(rt):
 ])
 def test_inputs_are_validated_before_any_request(rt, over):
     post, gh = Post(), Gh()
-    with pytest.raises(Exception):
+    with pytest.raises(rt.RotateError):
         run(rt, post, gh, environment=env(**over))
     assert post.calls == [] and gh.calls == []
 
@@ -201,3 +205,106 @@ def test_bad_repo_is_refused(rt):
     with pytest.raises(rt.RotateError):
         rt.rotate(env(), dry_run=False, repo="evil; rm -rf /", post_fn=post, gh_fn=Gh(), say=lambda s: None)
     assert post.calls == []
+
+
+def test_gh_child_env_is_an_allowlist(rt):
+    gh = Gh()
+    run(rt, Post(ok()), gh, environment=env(PATH="/usr/bin", HOME="/home/x", HTTPS_PROXY="http://proxy:3128",
+                                            ACTIONS_RUNTIME_TOKEN="RUNTIME", ACTIONS_ID_TOKEN_REQUEST_TOKEN="OIDC",
+                                            ACTIONS_ID_TOKEN_REQUEST_URL="https://x", GITHUB_TOKEN="GHT",
+                                            AWS_SECRET_ACCESS_KEY="AWS", SHAREPOINT_CLIENT_SECRET="CS"))
+    child = gh.calls[0]["env"]
+    assert child["PATH"] == "/usr/bin" and child["HOME"] == "/home/x"
+    assert child["HTTPS_PROXY"] == "http://proxy:3128"
+    assert child["GH_TOKEN"] == PAT and child["GH_PROMPT_DISABLED"] == "1"
+    assert set(child) <= set(rt.CHILD_ENV_ALLOWLIST) | {"GH_TOKEN", "GH_PROMPT_DISABLED"}
+    for leaked in ("RUNTIME", "OIDC", "GHT", "AWS", "CS", OLD):
+        assert leaked not in child.values()
+
+
+@pytest.mark.parametrize("body", [["refresh_token", NEW], "refresh_token", None, 42])
+def test_a_non_object_token_response_is_rejected(rt, body):
+    gh = Gh()
+    with pytest.raises(rt.RotateError) as e:
+        run(rt, Post((200, body)), gh)
+    assert NEW not in str(e.value)
+    assert gh.calls == []
+
+
+# --- the real process boundary: the script as a CLI, and the real gh() wrapper
+# against a fake `gh` executable on PATH. The fake stands in for the GitHub CLI
+# only; nothing here touches Graph or the network.
+
+# The fake records into $HOME: HOME is on the child-env allowlist, so no
+# test-only variable has to get past it. A `fail` file there makes it fail.
+FAKE_GH = """#!/bin/sh
+printf '%s\\n' "$@" > "$HOME/argv"
+cat > "$HOME/stdin"
+env > "$HOME/env"
+if [ -e "$HOME/fail" ]; then
+  echo "HTTP 403: Resource not accessible by personal access token" >&2
+  exit 1
+fi
+"""
+
+
+@pytest.fixture
+def fake_gh(tmp_path):
+    """(child env with the fake first on PATH and HOME = record dir, record dir)"""
+    bindir, rec = tmp_path / "bin", tmp_path / "rec"
+    bindir.mkdir()
+    rec.mkdir()
+    exe = bindir / "gh"
+    exe.write_text(FAKE_GH)
+    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
+    return {"PATH": f"{bindir}:{os.environ.get('PATH', '/usr/bin:/bin')}", "HOME": str(rec)}, rec
+
+
+def test_real_gh_wrapper_feeds_the_token_on_stdin(rt, fake_gh):
+    base, rec = fake_gh
+    rt.rotate(env(**base, ACTIONS_RUNTIME_TOKEN="RUNTIME"), dry_run=False, repo="DataZooDE/duckdb-sharepoint",
+              post_fn=Post(ok()), gh_fn=rt.gh, say=lambda s: None)
+    assert (rec / "stdin").read_text() == NEW
+    argv = (rec / "argv").read_text().split()
+    assert argv == ["secret", "set", "SHAREPOINT_USER_REFRESH_TOKEN", "--repo", "DataZooDE/duckdb-sharepoint"]
+    child_env = (rec / "env").read_text()
+    assert f"GH_TOKEN={PAT}" in child_env
+    assert "RUNTIME" not in child_env and OLD not in child_env and "SHAREPOINT_" not in child_env
+
+
+def test_real_gh_wrapper_failure_is_loud(rt, fake_gh):
+    base, rec = fake_gh
+    (rec / "fail").touch()
+    with pytest.raises(rt.RotateError) as e:
+        rt.rotate(env(**base), dry_run=False, repo="DataZooDE/duckdb-sharepoint",
+                  post_fn=Post(ok()), gh_fn=rt.gh, say=lambda s: None)
+    assert "403" in str(e.value) and NEW not in str(e.value)
+
+
+def _cli(args, environment):
+    return subprocess.run([sys.executable, str(SCRIPT), *args], env=environment, text=True,
+                          capture_output=True, timeout=60)
+
+
+def test_cli_missing_pat_exits_1_without_calling_gh_or_printing_tokens(fake_gh):
+    base, rec = fake_gh
+    p = _cli([], env(SECRETS_ROTATION_TOKEN=None, **base))
+    assert p.returncode == 1
+    assert "SECRETS_ROTATION_TOKEN" in p.stderr and "Secrets: Read and write" in p.stderr
+    assert OLD not in p.stdout + p.stderr
+    assert not (rec / "stdin").exists()
+
+
+def test_cli_bad_input_exits_1_before_any_request(fake_gh):
+    base, rec = fake_gh
+    p = _cli(["--dry-run"], env(SHAREPOINT_LOGIN_ENDPOINT="https://evil.example", **base))
+    assert p.returncode == 1
+    assert "SHAREPOINT_LOGIN_ENDPOINT" in p.stderr
+    assert OLD not in p.stdout + p.stderr
+
+
+def test_cli_rejects_a_bad_repo_argument(fake_gh):
+    base, rec = fake_gh
+    p = _cli(["--repo", "evil;rm"], env(**base))
+    assert not (rec / "stdin").exists()
+    assert p.returncode == 1 and "OWNER/NAME" in p.stderr
