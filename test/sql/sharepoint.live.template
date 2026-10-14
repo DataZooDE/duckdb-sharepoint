@@ -168,6 +168,9 @@ RESET sharepoint_block_size_bytes;
 #     final chunk + commit on close publish the file. Proven by the counters:
 #     ONE session, ceil(size/chunk) chunk PUTs, ONE commit, no single PUT, and
 #     a buffer high-water mark of exactly one chunk -- for a ~3.9 MB COPY.
+#     Every chunk, the commit and any discard go to the session's uploadUrl,
+#     which must pass the SharePoint host allow-list (IsAllowedUploadUrl) --
+#     so this COPY also proves the live host shape is accepted.
 # ---------------------------------------------------------------------------
 statement ok
 SET sharepoint_upload_chunk_bytes = 327680;

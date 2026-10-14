@@ -645,6 +645,88 @@ TEST_CASE("only Microsoft cloud endpoints may receive credentials", "[identity]"
 	REQUIRE_FALSE(IsAllowedLoginEndpoint("http://login.microsoftonline.com"));
 }
 
+TEST_CASE("upload session URLs must be on the cloud's SharePoint host", "[identity][upload]") {
+	// Observed live (2026-10-14): a SharePoint drive's uploadUrl is
+	// https://<tenant>.sharepoint.com/[sites/<site>/]_api/v2.0/drives/.../uploadSession?...
+	// and a OneDrive for Business drive's https://<tenant>-my.sharepoint.com/personal/...
+	const std::string q = "/_api/v2.0/drives/b!x/items/01ABC/uploadSession?guid=g&overwrite=True&rename=False"
+	                      "&dc=0&tempauth=v1.eyJ";
+	const char *global = "https://graph.microsoft.com";
+	for (const char *ok : {"https://contoso.sharepoint.com", "https://contoso-my.sharepoint.com",
+	                       "https://Contoso.SharePoint.com", "HTTPS://contoso.sharepoint.com"}) {
+		INFO(ok);
+		REQUIRE(IsAllowedUploadUrl(std::string(ok) + q, global));
+		REQUIRE(IsAllowedUploadUrl(std::string(ok) + q, "https://graph.microsoft.com/")); // trailing slash
+	}
+	REQUIRE(IsAllowedUploadUrl("https://contoso.sharepoint.com/sites/team/_api/v2.0/drives/x/uploadSession?a=b",
+	                           global));
+	REQUIRE(IsAllowedUploadUrl("https://contoso.sharepoint.com?a=b", global));
+
+	// National clouds: the SharePoint suffix Microsoft documents for each.
+	REQUIRE(IsAllowedUploadUrl("https://contoso.sharepoint.us" + q, "https://graph.microsoft.us"));
+	REQUIRE(IsAllowedUploadUrl("https://contoso.sharepoint-mil.us" + q, "https://dod-graph.microsoft.us"));
+	REQUIRE(IsAllowedUploadUrl("https://contoso.sharepoint.cn" + q, "https://microsoftgraph.chinacloudapi.cn"));
+	// ... and only for that cloud.
+	REQUIRE_FALSE(IsAllowedUploadUrl("https://contoso.sharepoint.com" + q, "https://graph.microsoft.us"));
+	REQUIRE_FALSE(IsAllowedUploadUrl("https://contoso.sharepoint.us" + q, global));
+	REQUIRE_FALSE(IsAllowedUploadUrl("https://contoso.sharepoint-mil.us" + q, "https://graph.microsoft.us"));
+	REQUIRE_FALSE(IsAllowedUploadUrl("https://contoso.sharepoint.us" + q, "https://dod-graph.microsoft.us"));
+	REQUIRE_FALSE(IsAllowedUploadUrl("https://contoso.sharepoint.cn" + q, global));
+	// An endpoint that is not a known Graph cloud allows nothing.
+	REQUIRE_FALSE(IsAllowedUploadUrl("https://contoso.sharepoint.com" + q, "https://evil.example"));
+	REQUIRE_FALSE(IsAllowedUploadUrl("https://contoso.sharepoint.com" + q, "http://graph.microsoft.com"));
+	REQUIRE_FALSE(IsAllowedUploadUrl("https://contoso.sharepoint.com" + q, ""));
+
+	for (const char *bad : {
+	         "http://contoso.sharepoint.com",              // not https
+	         "contoso.sharepoint.com",                     // no scheme
+	         "https://user@contoso.sharepoint.com",        // userinfo
+	         "https://evil.example@contoso.sharepoint.com", // userinfo
+	         "https://contoso.sharepoint.com@evil.example", // userinfo, real host evil
+	         "https://user:pw@contoso.sharepoint.com",     // userinfo
+	         "https://evil-sharepoint.com",                // look-alike
+	         "https://contoso.evil-sharepoint.com",        // look-alike
+	         "https://contososharepoint.com",              // no label boundary
+	         "https://sharepoint.com.evil.net",            // suffix in the middle
+	         "https://contoso.sharepoint.com.evil.net",    // suffix in the middle
+	         "https://sharepoint.com",                     // the bare suffix is no tenant
+	         "https://.sharepoint.com",                    // empty tenant label
+	         "https://a.b.sharepoint.com",                 // exactly one tenant label
+	         "https://contoso.sharepoint.com.",            // trailing dot
+	         "https://contoso.sharepoint.com:443",         // any explicit port
+	         "https://contoso.sharepoint.com:8443",        // port
+	         "https://contoso.sharepoint.com:",            // empty port
+	         "https://1.2.3.4",                            // IPv4 literal
+	         "https://[::1]",                              // IPv6 literal
+	         "https://[2001:db8::1]/x",                    // IPv6 literal
+	         "https://contoso.sharepoint.com\\@evil.example", // backslash tricks
+	         "https://contoso_x.sharepoint.com",           // not a hostname character
+	         "https://contoso%2esharepoint.com",           // percent-encoded host
+	         "https://contoso.sharepoint.com%2f@evil.example", "https:///contoso.sharepoint.com", "https://",
+	         "", "https://files.contoso.com",              // vanity / custom domain
+	         "https://graph.microsoft.com/v1.0/x",         // not a SharePoint host
+	     }) {
+		INFO(bad);
+		REQUIRE_FALSE(IsAllowedUploadUrl(std::string(bad) + q, global));
+		REQUIRE_FALSE(IsAllowedUploadUrl(bad, global));
+	}
+}
+
+TEST_CASE("an upload URL is shown without its signed query", "[identity][upload]") {
+	REQUIRE(UrlOriginForDisplay("https://contoso.sharepoint.com/_api/v2.0/x/uploadSession?tempauth=SECRET") ==
+	        "https://contoso.sharepoint.com");
+	REQUIRE(UrlOriginForDisplay("https://user:pw@evil.example:8443/p?tempauth=SECRET#f") ==
+	        "https://evil.example:8443");
+	REQUIRE(UrlOriginForDisplay("https://evil.example?tempauth=SECRET") == "https://evil.example");
+	REQUIRE(UrlOriginForDisplay("http://evil.example#x") == "http://evil.example");
+	REQUIRE(UrlOriginForDisplay("no scheme?tempauth=SECRET") == "<unparseable URL>");
+	REQUIRE(UrlOriginForDisplay("") == "<unparseable URL>");
+	for (const char *u : {"https://a.example/?tempauth=SECRET", "https://SECRET@a.example/", "x?SECRET"}) {
+		INFO(u);
+		REQUIRE(UrlOriginForDisplay(u).find("SECRET") == std::string::npos);
+	}
+}
+
 TEST_CASE("credential material framing is unambiguous", "[identity]") {
 	// "a|b" + "c" and "a" + "b|c" must never frame to the same key material.
 	REQUIRE(FrameCredentialMaterial({"a|b", "c"}) != FrameCredentialMaterial({"a", "b|c"}));
