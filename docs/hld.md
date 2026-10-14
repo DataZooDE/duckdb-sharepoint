@@ -181,7 +181,7 @@ as-is; with a `REFRESH_TOKEN` it uses the `refresh_token` grant.
    `COPY` whose query errored mid-stream), `DELETE`s the session; a failed
    close throws. Counters: `upload_chunk`, `upload_commit`, `upload_abort`,
    high-water mark `upload_buffer_peak`. Measured: a 373 MiB `COPY` peaks at
-   ~135 MiB RSS (local-disk `COPY` of the same: ~105 MiB), against ~520 MiB
+   ~120 MiB RSS (local-disk `COPY` of the same: ~105 MiB), against ~520 MiB
    buffered. Live: `sharepoint.live.template` §4b, e2e
    `test_streaming_writes.py` (incl. the destination folder deleted
    mid-stream: the `COPY` fails with a 404 and nothing is left).

@@ -150,7 +150,7 @@ they are.
   file being written holds at most one upload chunk in memory
   (`sharepoint_upload_chunk_bytes`), and anything larger goes up chunk by chunk
   through an upload session as it is written — a 373 MiB `COPY` peaks at
-  ~135 MiB RSS for the whole process (it was ~520 MiB when writes were
+  ~120 MiB RSS for the whole process (it was ~520 MiB when writes were
   buffered). The session is opened with `deferCommit`, so the file is published
   only by the commit on close: an overwritten file keeps its old content until
   then, and a write that fails mid-stream — or a query that errors part-way
