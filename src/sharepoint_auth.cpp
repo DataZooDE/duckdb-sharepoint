@@ -8,6 +8,7 @@
 // cache would serve one principal's token to another (the bug the sibling
 // gdrive documents and fixed the same way).
 #include "sharepoint_auth.hpp"
+#include "sharepoint_token_policy.hpp"
 #include "sharepoint_client.hpp"
 #include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"
@@ -263,11 +264,9 @@ private:
 	//! Valid for at least another minute -- by Entra ID's expiry and, under
 	//! the test cap, by age (a token cached before the cap was set counts too).
 	bool Fresh(const CachedToken &t) const {
-		const auto horizon = std::chrono::system_clock::now() + std::chrono::seconds(60);
-		if (t.expires_at <= horizon) {
-			return false;
-		}
-		return req.max_age_seconds <= 0 || t.minted_at + std::chrono::seconds(req.max_age_seconds) > horizon;
+		using std::chrono::system_clock;
+		return TokenIsFresh(system_clock::to_time_t(t.minted_at), system_clock::to_time_t(t.expires_at),
+		                    system_clock::to_time_t(system_clock::now()), req.max_age_seconds);
 	}
 
 	MintRequest req;
@@ -461,7 +460,9 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 		Value max_age;
 		if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_debug_token_max_age_seconds", max_age) &&
 		    !max_age.IsNull()) {
-			req.max_age_seconds = max_age.GetValue<int64_t>();
+			if (!NormalizeMaxAgeSeconds(max_age.GetValue<int64_t>(), req.max_age_seconds)) {
+				throw InvalidInputException("sharepoint_debug_token_max_age_seconds must be 0 (no cap) or positive");
+			}
 		}
 		tokens = make_shared_ptr<MintingTokenSource>(std::move(req));
 	}

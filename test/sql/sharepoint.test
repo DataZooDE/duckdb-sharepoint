@@ -108,3 +108,23 @@ DROP SECRET sp_test;
 # real ids by `make test_live`. NOTE: no `require-env` here -- sqllogictest
 # applies it to the WHOLE file wherever it appears, which silently skipped
 # every assertion above whenever credentials were absent.
+
+# The token-age test hook refuses a negative age when a secret is used (a
+# value inside the 60 s refresh slack is clamped, never "mint on every call").
+statement ok
+SET sharepoint_debug_token_max_age_seconds = -1;
+
+statement ok
+CREATE SECRET sp_cap (TYPE sharepoint, PROVIDER client_credentials, TENANT_ID 'contoso.onmicrosoft.com',
+    CLIENT_ID 'not-a-client', CLIENT_SECRET 'not-a-secret', DRIVE_ID 'd', SCOPE 'sharepoint://_cap_probe');
+
+statement error
+SELECT file_size('sharepoint://_cap_probe/x.txt');
+----
+sharepoint_debug_token_max_age_seconds
+
+statement ok
+SET sharepoint_debug_token_max_age_seconds = 0;
+
+statement ok
+DROP SECRET sp_cap;
