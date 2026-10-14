@@ -120,7 +120,7 @@ authenticates afresh. Interactive delegated flows (`authorization_code` /
 | setting | default | meaning |
 |---|---|---|
 | `sharepoint_block_size_bytes` | 8 MiB | Reads are served from a shared, single-flight block cache (256 MiB, LRU, keyed by credentials + item + cTag). Capped at 64 MiB; `0` disables it. |
-| `sharepoint_upload_chunk_bytes` | 10 MiB | Files up to this size upload in one PUT; larger ones use a resumable upload session in chunks of this size (a multiple of 320 KiB, below 60 MiB). |
+| `sharepoint_upload_chunk_bytes` | 10 MiB | Upload chunk size — and the most memory one file being written holds. Files up to this size upload in one PUT on close; larger ones stream through a resumable upload session, one chunk at a time, as they are written (a multiple of 320 KiB, below 60 MiB). `sharepoint_stats()` reports `upload_chunk`, `upload_commit`, `upload_abort` and the high-water mark `upload_buffer_peak`. |
 | `sharepoint_permanent_delete` | `false` | `remove_file` sends items to the site's recycle bin unless this is set. |
 | `sharepoint_immutable_prefixes` | *(empty)* | Comma-separated `sharepoint://` prefixes whose files are **never rewritten in place** (e.g. a DuckLake `DATA_PATH`). Their metadata is remembered, saving a Graph call per open. **Declaring a prefix whose files change causes stale reads.** |
 | `sharepoint_graph_endpoint` / `sharepoint_login_endpoint` | global cloud | National clouds: `https://graph.microsoft.us` / `https://login.microsoftonline.us` (GCC High), `https://dod-graph.microsoft.us`, or the China cloud. Only these Microsoft hosts are accepted, so credentials cannot be redirected elsewhere. |
@@ -133,6 +133,7 @@ CALL sharepoint_reset_stats();
 SELECT * FROM read_parquet('sharepoint://exports/**/*.parquet');
 SELECT * FROM sharepoint_stats();   -- token_request, stat, read_range, list_page,
                                     -- upload_*, retries, throttled, bytes_read, ...
+                                    -- (upload_buffer_peak is a high-water mark)
 ```
 
 Graph throttles SharePoint aggressively; every call is retried with jittered
@@ -144,8 +145,19 @@ they are.
 
 ## Limitations
 
-- **Whole-file writes.** Graph replaces files; there is no positional write
-  or append. A write is buffered and uploaded on close.
+- **Whole-file writes, streamed.** Graph replaces files; there is no
+  positional write or append (both are refused). A write is **streamed**: the
+  file being written holds at most one upload chunk in memory
+  (`sharepoint_upload_chunk_bytes`), and anything larger goes up chunk by chunk
+  through an upload session as it is written — a 373 MiB `COPY` peaks at
+  ~120 MiB RSS for the whole process (it was ~520 MiB when writes were
+  buffered). The session is opened with `deferCommit`, so the file is published
+  only by the commit on close: an overwritten file keeps its old content until
+  then, and a write that fails mid-stream — or a query that errors part-way
+  through a `COPY` — discards the session and publishes nothing. While a NEW
+  file's session is open, SharePoint shows a 0-byte placeholder at its path
+  (removed if the session is discarded); `COPY` writes to a `tmp_` name and
+  moves it into place, so the real name never shows it.
 - **Names.** SharePoint forbids `" * : < > ? \ |` in file and folder names;
   such writes are refused up front.
 - **ATTACH is read-only** (a DuckDB database file cannot be updated in place).

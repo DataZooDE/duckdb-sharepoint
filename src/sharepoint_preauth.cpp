@@ -1,5 +1,5 @@
 // TLS transport for Graph's pre-authenticated URLs. The request bytes come from
-// the pure BuildRawHttpRequest and the response is parsed by the pure
+// the pure BuildRawHttpHead (the body is sent separately) and the response is parsed by the pure
 // ParseRawHttpResponse / RawHttpResponseComplete; this file only moves bytes
 // over a verified TLS connection, with every phase bounded in time and size.
 // Proven by the live SQL suite (reads go through the /content download
@@ -187,6 +187,12 @@ BioPtr ConnectWithDeadline(const std::string &host, int port, Clock::time_point 
 RawHttpResponse PreauthenticatedRequest(const std::string &method, const std::string &url,
                                         const RawHeaders &headers, const std::string &body, int timeout_seconds,
                                         std::size_t max_body_bytes) {
+	return PreauthenticatedRequest(method, url, headers, body.data(), body.size(), timeout_seconds, max_body_bytes);
+}
+
+RawHttpResponse PreauthenticatedRequest(const std::string &method, const std::string &url,
+                                        const RawHeaders &headers, const char *body, std::size_t body_size,
+                                        int timeout_seconds, std::size_t max_body_bytes) {
 	// Refusals: nothing has been sent, and retrying cannot help.
 	std::string origin, target, host;
 	int port = 0;
@@ -194,8 +200,8 @@ RawHttpResponse PreauthenticatedRequest(const std::string &method, const std::st
 		throw InvalidInputException(
 		    "sharepoint: refusing a pre-authenticated URL that is not a well-formed https URL");
 	}
-	std::string request;
-	if (!BuildRawHttpRequest(method, host, port, target, headers, body, request)) {
+	std::string head;
+	if (!BuildRawHttpHead(method, host, port, target, headers, body_size, head)) {
 		throw InvalidInputException("sharepoint: refusing to send a malformed request to %s", host);
 	}
 	if (timeout_seconds <= 0) {
@@ -232,17 +238,25 @@ RawHttpResponse PreauthenticatedRequest(const std::string &method, const std::st
 		ThrowTransport("TLS handshake / certificate verification", host);
 	}
 
-	std::size_t sent = 0;
-	while (sent < request.size()) {
-		const int chunk = static_cast<int>(std::min<std::size_t>(request.size() - sent, 1 << 20));
-		const int n = BIO_write(bio.get(), request.data() + sent, chunk);
-		if (n <= 0) {
-			// Blocking socket + SSL_MODE_AUTO_RETRY: a "retry" here can only be
-			// SO_SNDTIMEO firing, so it is a timeout, not a reason to spin.
-			ThrowTransport(BIO_should_retry(bio.get()) ? "sending the request (timed out)" : "sending the request",
-			               host);
+	// Head, then the body straight from the caller's buffer (no copy).
+	auto send_all = [&](const char *data, std::size_t size) {
+		std::size_t sent = 0;
+		while (sent < size) {
+			const int chunk = static_cast<int>(std::min<std::size_t>(size - sent, 1 << 20));
+			const int n = BIO_write(bio.get(), data + sent, chunk);
+			if (n <= 0) {
+				// Blocking socket + SSL_MODE_AUTO_RETRY: a "retry" here can only
+				// be SO_SNDTIMEO firing, so it is a timeout, not a reason to spin.
+				ThrowTransport(BIO_should_retry(bio.get()) ? "sending the request (timed out)"
+				                                           : "sending the request",
+				               host);
+			}
+			sent += static_cast<std::size_t>(n);
 		}
-		sent += static_cast<std::size_t>(n);
+	};
+	send_all(head.data(), head.size());
+	if (body_size > 0) {
+		send_all(body, body_size);
 	}
 
 	// Read until the response is complete per its framing, or the peer closes.

@@ -5,6 +5,7 @@
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/unordered_map.hpp"
 
 #include <cstdint>
@@ -33,7 +34,10 @@ namespace sharepoint {
 class SharepointFileHandle : public FileHandle {
 public:
 	SharepointFileHandle(FileSystem &fs, string path, FileOpenFlags flags, AuthContext auth);
-	~SharepointFileHandle() override = default;
+	//! Aborts an upload session left open (a handle destroyed without a
+	//! successful Close(), e.g. a COPY that failed mid-stream): nothing is
+	//! published. Best effort, never throws.
+	~SharepointFileHandle() override;
 
 	void Close() override;
 
@@ -46,17 +50,22 @@ public:
 	//! sharepoint_block_size_bytes. 0 disables the cache (exact ranges).
 	idx_t block_size_bytes = 8ULL * 1024 * 1024;
 
-	//! Write path: bytes accumulate locally and nothing reaches Graph until
-	//! Close() (Graph has no append/positional write). `write_root_relative`
-	//! is where they go; `write_failed` stops Close() uploading a truncated
-	//! file after an error unwound mid-write.
+	//! Write path: bytes stream through `upload`, which holds at most ONE
+	//! chunk (sharepoint_upload_chunk_bytes, captured at OpenFile). A file
+	//! that never outgrows it is sent as a single PUT on Close(); the moment
+	//! it does, a deferCommit upload session is opened and every full chunk
+	//! goes up as it fills. The file is published only by the commit in
+	//! Close(), so an error mid-stream leaves nothing behind -- one exception:
+	//! while a NEW file's session is open, SharePoint shows a 0-byte
+	//! placeholder at its path (removed when the session is discarded; COPY's
+	//! tmp_ staging keeps it off the real name). `write_failed`
+	//! stops Close() publishing a truncated file after an error unwound
+	//! mid-write.
 	bool is_write = false;
-	string write_buffer;
 	string write_root_relative;
 	bool write_failed = false;
-	//! Captured at OpenFile (where the setting is reachable): files at or below
-	//! this go up as one PUT, larger ones via a resumable upload session.
-	idx_t upload_chunk_bytes = 10ULL * 1024 * 1024;
+	unique_ptr<ChunkedUploadBuffer> upload;
+	GraphUploadSession session;
 };
 
 class SharepointFileSystem : public FileSystem {

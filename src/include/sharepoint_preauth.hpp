@@ -31,5 +31,12 @@ RawHttpResponse PreauthenticatedRequest(const std::string &method, const std::st
                                         const RawHeaders &headers, const std::string &body, int timeout_seconds,
                                         std::size_t max_body_bytes);
 
+//! Same, with the body as a non-owning (pointer, length): it is written to the
+//! socket straight from the caller's memory, after the head, so an upload
+//! chunk is never copied into a request string.
+RawHttpResponse PreauthenticatedRequest(const std::string &method, const std::string &url,
+                                        const RawHeaders &headers, const char *body, std::size_t body_size,
+                                        int timeout_seconds, std::size_t max_body_bytes);
+
 } // namespace sharepoint
 } // namespace duckdb

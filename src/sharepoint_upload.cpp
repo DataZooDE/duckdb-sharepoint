@@ -1,5 +1,7 @@
 #include "sharepoint_upload.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 
@@ -65,6 +67,66 @@ bool ParseRangeStart(const std::string &range, std::uint64_t &start) {
 	}
 	start = std::strtoull(range.substr(0, i).c_str(), nullptr, 10);
 	return true;
+}
+
+ChunkedUploadBuffer::ChunkedUploadBuffer(std::uint64_t chunk_bytes) : chunk(NormalizeUploadChunkSize(chunk_bytes)) {
+}
+
+std::size_t ChunkedUploadBuffer::Fill(const char *data, std::size_t len) {
+	const std::size_t room = static_cast<std::size_t>(chunk - std::min<std::uint64_t>(chunk, pending.size()));
+	const std::size_t take = std::min(room, len);
+	if (take > 0) {
+		const std::size_t needed = pending.size() + take;
+		if (needed > pending.capacity()) {
+			// Grow geometrically, as the bytes arrive -- a small file costs
+			// what it wrote, not a whole chunk -- but never past one chunk.
+			const std::size_t doubled = std::max<std::size_t>(needed, 2 * pending.capacity());
+			pending.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(chunk, doubled)));
+		}
+		pending.append(data, take);
+		peak = std::max<std::uint64_t>(peak, pending.size());
+	}
+	return take;
+}
+
+void ChunkedUploadBuffer::MarkChunkSent() {
+	offset += pending.size();
+	pending.clear(); // keeps its capacity: the next chunk reuses the allocation
+	sent_any = true;
+}
+
+std::string ChunkedUploadBuffer::ContentRange(bool final, std::size_t skip) const {
+	const std::uint64_t start = offset + skip;
+	const std::uint64_t length = pending.size() - skip;
+	if (final) {
+		return UploadContentRange(start, length, Total());
+	}
+	// Total unknown until close: "/*" (accepted on a deferCommit session).
+	return "bytes " + std::to_string(start) + "-" + std::to_string(start + length - 1) + "/*";
+}
+
+bool ChunkedUploadBuffer::ResumeSkip(std::uint64_t next_expected, std::size_t &skip) const {
+	if (next_expected < offset || next_expected > Total()) {
+		return false;
+	}
+	skip = static_cast<std::size_t>(next_expected - offset);
+	return true;
+}
+
+void StreamInto(ChunkedUploadBuffer &buf, const char *data, std::size_t len,
+                const std::function<void()> &send_nonfinal) {
+	while (len > 0) {
+		// A full chunk goes up only once MORE bytes arrive: until then it may
+		// be the whole file (one PUT) or the final chunk (which must carry the
+		// total).
+		if (buf.Full()) {
+			send_nonfinal();
+			buf.MarkChunkSent();
+		}
+		const auto took = buf.Fill(data, len);
+		data += took;
+		len -= took;
+	}
 }
 
 } // namespace sharepoint

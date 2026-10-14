@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace duckdb {
@@ -9,7 +11,7 @@ namespace sharepoint {
 // ---------------------------------------------------------------------------
 // Pure helpers for the resumable upload-session chunk plan. No I/O, so the
 // Catch2 binary exercises them directly. The PUT loop that drives them lives in
-// the (impure, Graph-facing) GraphClient::PutContent.
+// the (impure, Graph-facing) GraphClient upload-session methods.
 //
 // Graph's upload-session contract: every chunk except the last MUST be a
 // multiple of 320 KiB (327680 bytes), each PUT carries a Content-Range header,
@@ -55,6 +57,88 @@ bool IsHttpsUrl(const std::string &url);
 //!   "512-1023" -> 512 ; "655360-" -> 655360.
 //! Returns false if `range` has no leading decimal integer.
 bool ParseRangeStart(const std::string &range, std::uint64_t &start);
+
+//! The streaming-write state machine behind a write handle: holds AT MOST one
+//! chunk of not-yet-sent bytes, so a write of any size needs ~one chunk of
+//! memory. The caller (SharepointFileSystem::Write) loops:
+//!
+//!   while (bytes left) { if (Full()) { send Pending() as a NON-final chunk;
+//!                                      MarkChunkSent(); }
+//!                        consume Fill(...) bytes; }
+//!
+//! A full chunk is sent only when MORE bytes arrive -- until then it may be
+//! the whole file (Close() sends one PUT) or the final chunk (which must carry
+//! the total). So the final chunk is never empty, and a file of exactly one
+//! chunk never opens a session. Pure: no I/O, the caller does the sending.
+class ChunkedUploadBuffer {
+public:
+	enum class CloseAction {
+		SINGLE_REQUEST, //!< nothing was sent yet: Pending() is the whole file
+		FINAL_CHUNK     //!< a session is open: Pending() is its non-empty last chunk
+	};
+
+	//! `chunk_bytes` is normalised (NormalizeUploadChunkSize).
+	explicit ChunkedUploadBuffer(std::uint64_t chunk_bytes);
+
+	//! Append as much of [data, data+len) as fits in the chunk; returns the
+	//! number of bytes taken (0 only when Full() or len == 0).
+	std::size_t Fill(const char *data, std::size_t len);
+	//! The pending chunk is complete; another byte needs a send first.
+	bool Full() const {
+		return pending.size() >= chunk;
+	}
+	//! The pending chunk was accepted by the server as a non-final chunk.
+	void MarkChunkSent();
+	CloseAction OnClose() const {
+		return sent_any ? CloseAction::FINAL_CHUNK : CloseAction::SINGLE_REQUEST;
+	}
+
+	//! Content-Range for Pending() minus its first `skip` bytes (a resume):
+	//! "bytes a-b/*" for a non-final chunk (total unknown), "bytes a-b/total"
+	//! for the final one.
+	std::string ContentRange(bool final, std::size_t skip = 0) const;
+	//! Given the next byte the server expects, how many bytes of Pending() it
+	//! already holds. False when that offset lies outside the pending chunk:
+	//! bytes before it are no longer in memory, so it cannot be resumed.
+	bool ResumeSkip(std::uint64_t next_expected, std::size_t &skip) const;
+
+	const std::string &Pending() const {
+		return pending;
+	}
+	std::uint64_t ChunkBytes() const {
+		return chunk;
+	}
+	//! Bytes already sent (the absolute offset of Pending()).
+	std::uint64_t Offset() const {
+		return offset;
+	}
+	std::uint64_t Total() const {
+		return offset + pending.size();
+	}
+	bool SessionStarted() const {
+		return sent_any;
+	}
+	//! The most bytes ever held at once -- the memory bound, made observable.
+	std::uint64_t Peak() const {
+		return peak;
+	}
+
+private:
+	std::uint64_t chunk;
+	std::string pending;
+	std::uint64_t offset = 0;
+	std::uint64_t peak = 0;
+	bool sent_any = false;
+};
+
+//! The write loop itself (SharepointFileSystem::Write runs exactly this):
+//! append [data, data+len) to `buf`; whenever the buffer is full and more
+//! bytes are waiting, call `send_nonfinal` to send Pending() as a NON-final
+//! chunk, then MarkChunkSent(). If `send_nonfinal` throws, the chunk stays
+//! pending and unsent and the exception propagates. Never holds more than one
+//! chunk.
+void StreamInto(ChunkedUploadBuffer &buf, const char *data, std::size_t len,
+                const std::function<void()> &send_nonfinal);
 
 } // namespace sharepoint
 } // namespace duckdb

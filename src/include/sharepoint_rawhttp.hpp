@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -32,6 +33,13 @@ using RawHeaders = std::vector<std::pair<std::string, std::string>>;
 //! Connection, Content-Length, Transfer-Encoding), or if the port is invalid.
 bool BuildRawHttpRequest(const std::string &method, const std::string &host, int port, const std::string &target,
                          const RawHeaders &headers, const std::string &body, std::string &out);
+
+//! Same validation and bytes as BuildRawHttpRequest, but only the head (up to
+//! and including the blank line) for a body of `body_size` bytes that the
+//! caller sends separately -- so an upload chunk is never copied into a
+//! request string.
+bool BuildRawHttpHead(const std::string &method, const std::string &host, int port, const std::string &target,
+                      const RawHeaders &headers, std::size_t body_size, std::string &out);
 
 struct RawHttpResponse {
 	int status = 0;

@@ -92,15 +92,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "national clouds, e.g. https://login.microsoftonline.us.",
 	    LogicalType::VARCHAR, Value("https://login.microsoftonline.com"));
 
-	// Files smaller than this are uploaded in a single PUT; larger files use a
-	// resumable upload session (createUploadSession) chunked at this size.
-	// Graph requires session chunks to be a multiple of 320 KiB; the default
-	// (10 MiB) is a multiple and a common recommendation.
+	// Streaming writes: a write handle holds at most one chunk in memory. A
+	// file up to this size is uploaded in a single PUT on close; a larger one
+	// streams through a deferCommit upload session (createUploadSession), one
+	// chunk at a time, as it is written. Graph requires session chunks to be a
+	// multiple of 320 KiB; the default (10 MiB) is a multiple.
 	loader.GetDatabaseInstance().config.AddExtensionOption(
 	    "sharepoint_upload_chunk_bytes",
-	    "Files up to this size upload in one PUT; larger ones use a resumable session in chunks of "
-	    "this size (default 10 MiB), rounded down to a multiple of 320 KiB and capped below 60 MiB "
-	    "per the Graph upload-session contract.",
+	    "Upload chunk size, and the most memory one file being written holds (default 10 MiB; rounded "
+	    "down to a multiple of 320 KiB and capped below 60 MiB per the Graph upload-session contract). "
+	    "Files up to this size upload in one PUT on close; larger ones stream through a resumable "
+	    "upload session as they are written.",
 	    LogicalType::UBIGINT, Value::UBIGINT(10ULL * 1024 * 1024));
 
 	// Like gdrive's block cache: a ranged read pays a round trip regardless of

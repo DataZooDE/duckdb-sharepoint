@@ -34,6 +34,12 @@ const char *CounterName(Counter c) {
 		return "upload_session";
 	case Counter::UPLOAD_CHUNK:
 		return "upload_chunk";
+	case Counter::UPLOAD_COMMIT:
+		return "upload_commit";
+	case Counter::UPLOAD_ABORT:
+		return "upload_abort";
+	case Counter::UPLOAD_BUFFER_PEAK:
+		return "upload_buffer_peak";
 	case Counter::DELETE_ITEM:
 		return "delete";
 	case Counter::MOVE:
@@ -59,6 +65,13 @@ const char *CounterName(Counter c) {
 
 void IncrementCounter(Counter c, uint64_t by) {
 	Slot(c).fetch_add(by, std::memory_order_relaxed);
+}
+
+void RecordMaxCounter(Counter c, uint64_t value) {
+	auto &slot = Slot(c);
+	uint64_t seen = slot.load(std::memory_order_relaxed);
+	while (seen < value && !slot.compare_exchange_weak(seen, value, std::memory_order_relaxed)) {
+	}
 }
 
 std::vector<std::pair<const char *, uint64_t>> SnapshotCounters() {

@@ -22,7 +22,9 @@ enum class Counter {
 	LIST_PAGE,       // GET one page of a folder's children
 	UPLOAD_PUT,      // single-request upload (file <= upload chunk size)
 	UPLOAD_SESSION,  // createUploadSession
-	UPLOAD_CHUNK,    // one chunk PUT inside a session
+	UPLOAD_CHUNK,    // one chunk PUT inside a session, counted when ACCEPTED (retries show in RETRY)
+	UPLOAD_COMMIT,   // a streamed (deferCommit) upload committed, i.e. published (once per file)
+	UPLOAD_ABORT,    // an upload session discarded (error mid-stream, handle never closed); only when the DELETE took
 	DELETE_ITEM,     // DELETE / permanentDelete
 	MOVE,            // PATCH parentReference + name
 	CREATE_FOLDER,   // POST children (folder)
@@ -32,6 +34,7 @@ enum class Counter {
 	BYTES_WRITTEN,   // content bytes sent by UPLOAD_PUT / UPLOAD_CHUNK
 	META_CACHE_HIT,  // an open served from the immutable-prefix metadata cache
 	AUTH_REFRESH,    // a 401 made a request re-mint its token and re-send
+	UPLOAD_BUFFER_PEAK, // HIGH-WATER MARK, not a count: most bytes one write handle held in memory
 	COUNT_           // sentinel
 };
 
@@ -42,6 +45,10 @@ void IncrementCounter(Counter c, uint64_t by = 1);
 
 //! Every counter in declaration order with its current value.
 std::vector<std::pair<const char *, uint64_t>> SnapshotCounters();
+
+//! For a high-water-mark metric (UPLOAD_BUFFER_PEAK): raise it to `value` if
+//! that is larger. Reset like every other counter.
+void RecordMaxCounter(Counter c, uint64_t value);
 
 void ResetCounters();
 
