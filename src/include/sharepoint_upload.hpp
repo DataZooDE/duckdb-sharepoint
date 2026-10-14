@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 namespace duckdb {
@@ -129,6 +130,15 @@ private:
 	std::uint64_t peak = 0;
 	bool sent_any = false;
 };
+
+//! The write loop itself (SharepointFileSystem::Write runs exactly this):
+//! append [data, data+len) to `buf`; whenever the buffer is full and more
+//! bytes are waiting, call `send_nonfinal` to send Pending() as a NON-final
+//! chunk, then MarkChunkSent(). If `send_nonfinal` throws, the chunk stays
+//! pending and unsent and the exception propagates. Never holds more than one
+//! chunk.
+void StreamInto(ChunkedUploadBuffer &buf, const char *data, std::size_t len,
+                const std::function<void()> &send_nonfinal);
 
 } // namespace sharepoint
 } // namespace duckdb

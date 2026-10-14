@@ -317,7 +317,9 @@ int64_t SharepointFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_
 
 void SharepointFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	// Positional write: Graph replaces whole files and cannot write at an
-	// offset. Fail loudly rather than silently drop or corrupt.
+	// offset. Fail loudly rather than silently drop or corrupt -- and mark the
+	// write failed, so a caller that catches this and closes publishes nothing.
+	handle.Cast<SharepointFileHandle>().write_failed = true;
 	throw IOException("sharepoint: cannot write at a byte offset -- Graph replaces whole files. Write "
 	                  "sequentially (the file is streamed in chunks and published on close).");
 }
@@ -332,25 +334,16 @@ int64_t SharepointFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr
 		                  handle.path.c_str());
 	}
 	auto &buf = *h.upload;
-	const char *data = static_cast<const char *>(buffer);
-	idx_t left = static_cast<idx_t>(nr_bytes);
 	try {
-		while (left > 0) {
-			// A full chunk goes up only once MORE bytes arrive: until then it
-			// may be the whole file (one PUT) or the final chunk (which must
-			// carry the total). So the buffer never exceeds one chunk.
-			if (buf.Full()) {
-				GraphClient client(h.auth);
-				if (!h.session.IsOpen()) {
-					client.OpenUploadSession(h.write_root_relative, h.session);
-				}
-				client.SendUploadChunk(h.session, buf, /*final=*/false);
-				buf.MarkChunkSent();
+		// The pure loop (StreamInto, Catch2-tested): at most one chunk is held;
+		// a full chunk is sent as a non-final session chunk once more arrives.
+		StreamInto(buf, static_cast<const char *>(buffer), static_cast<std::size_t>(nr_bytes), [&] {
+			GraphClient client(h.auth);
+			if (!h.session.IsOpen()) {
+				client.OpenUploadSession(h.write_root_relative, h.session);
 			}
-			const auto took = buf.Fill(data, left);
-			data += took;
-			left -= took;
-		}
+			client.SendUploadChunk(h.session, buf, /*final=*/false);
+		});
 	} catch (...) {
 		// Never publish what we have so far as if it were the whole file:
 		// discard the session now, and Close() then publishes nothing.
@@ -366,7 +359,7 @@ int64_t SharepointFileSystem::Write(FileHandle &handle, void *buffer, int64_t nr
 
 int64_t SharepointFileSystem::GetFileSize(FileHandle &handle) {
 	auto &h = handle.Cast<SharepointFileHandle>();
-	return h.is_write ? static_cast<int64_t>(h.position) : h.meta.size;
+	return h.is_write && h.upload ? static_cast<int64_t>(h.upload->Total()) : h.meta.size;
 }
 
 namespace {
@@ -653,7 +646,16 @@ void SharepointFileSystem::FileSync(FileHandle &handle) {
 }
 
 void SharepointFileSystem::Seek(FileHandle &handle, idx_t location) {
-	handle.Cast<SharepointFileHandle>().position = location;
+	auto &h = handle.Cast<SharepointFileHandle>();
+	if (h.is_write && location != h.position) {
+		// A write handle is a stream: seeking elsewhere would make the next
+		// Write a positional one, which Graph cannot do. Refuse, and never
+		// publish this file.
+		h.write_failed = true;
+		throw IOException("sharepoint: cannot write at a byte offset -- Graph replaces whole files. Write "
+		                  "sequentially (the file is streamed in chunks and published on close).");
+	}
+	h.position = location;
 }
 
 idx_t SharepointFileSystem::SeekPosition(FileHandle &handle) {

@@ -487,14 +487,14 @@ void GraphClient::SendUploadChunk(GraphUploadSession &session, const ChunkedUplo
 		}
 		RawHttpResponse res;
 		bool transport_ok = true;
-		IncrementCounter(Counter::UPLOAD_CHUNK);
 		try {
 			// Non-final chunks say "/*": the total is unknown until close
-			// (allowed because the session was opened with deferCommit).
+			// (allowed because the session was opened with deferCommit). The
+			// body is sent straight from the pending buffer -- no copy.
 			res = PreauthenticatedRequest(
 			    "PUT", session.upload_url,
 			    {{"Content-Range", buf.ContentRange(final, skip)}, {"Content-Type", "application/octet-stream"}},
-			    skip == 0 ? pending : pending.substr(skip), kPreauthTimeoutSeconds, kUploadReplyMaxBytes);
+			    pending.data() + skip, pending.size() - skip, kPreauthTimeoutSeconds, kUploadReplyMaxBytes);
 		} catch (IOException &e) {
 			// Transport failures are retried below. A REFUSAL (InvalidInputException:
 			// bad URL or request shape) is not caught here: retrying cannot fix it.
@@ -505,6 +505,8 @@ void GraphClient::SendUploadChunk(GraphUploadSession &session, const ChunkedUplo
 		// 202 (nextExpectedRanges: []); the item appears only on the commit.
 		// 200/201 would mean Graph committed anyway -- also fine.
 		if (transport_ok && res.status >= 200 && res.status < 300) {
+			// Counted on success only: a retried chunk shows in `retries`.
+			IncrementCounter(Counter::UPLOAD_CHUNK);
 			IncrementCounter(Counter::BYTES_WRITTEN, pending.size() - skip);
 			return;
 		}
@@ -523,7 +525,13 @@ void GraphClient::SendUploadChunk(GraphUploadSession &session, const ChunkedUplo
 			}
 			uint64_t next = 0;
 			bool complete = false;
-			if (QueryUploadSession(session.upload_url, next, complete)) {
+			const bool queried = QueryUploadSession(session.upload_url, next, complete);
+			if (!queried && range_conflict) {
+				// The resync itself failed: do not resend the same range in a
+				// tight loop.
+				SleepBeforeRetry(failures, 0);
+			}
+			if (queried) {
 				if (complete) {
 					next = buf.Offset() + pending.size(); // it holds everything, this chunk included
 				}
@@ -548,12 +556,13 @@ DriveItemMeta GraphClient::CommitUploadSession(GraphUploadSession &session, uint
 	const string &path = session.root_relative_path;
 	// The commit's reply can be lost after Graph committed the file; the
 	// session is then gone, so a re-POST 404s. If the item now has our size
-	// and a different eTag than before, it is ours. (A concurrent writer of
+	// and a different cTag (the CONTENT tag -- eTag also moves on a
+	// metadata-only edit) than before, it is ours. (A concurrent writer of
 	// exactly the same size is the residual ambiguity.)
 	auto verify_committed = [&](DriveItemMeta &out) -> bool {
 		auto now = StatByPath(path);
 		if (now.found && !now.is_folder && static_cast<uint64_t>(now.size) == total &&
-		    (!session.before.found || now.etag != session.before.etag)) {
+		    (!session.before.found || now.ctag != session.before.ctag)) {
 			out = now;
 			return true;
 		}
@@ -564,7 +573,6 @@ DriveItemMeta GraphClient::CommitUploadSession(GraphUploadSession &session, uint
 	for (;;) {
 		RawHttpResponse res;
 		bool transport_ok = true;
-		IncrementCounter(Counter::UPLOAD_COMMIT);
 		try {
 			res = PreauthenticatedRequest("POST", session.upload_url, {}, "", kPreauthTimeoutSeconds,
 			                              kUploadReplyMaxBytes);
@@ -573,13 +581,19 @@ DriveItemMeta GraphClient::CommitUploadSession(GraphUploadSession &session, uint
 			last_error = e.what();
 		}
 		if (transport_ok && (res.status == 200 || res.status == 201)) {
+			// Committed: the file IS published, whatever the body says. Never
+			// throw from here -- a writer told "failed" for a published file
+			// would retry an overwrite. Metadata is best effort.
+			IncrementCounter(Counter::UPLOAD_COMMIT);
 			session.upload_url.clear(); // consumed: nothing left to abort
 			picojson::value v;
-			if (!picojson::parse(v, res.body).empty() || !v.is<picojson::object>()) {
-				throw IOException("sharepoint: committing the upload of '%s' returned no item metadata",
-				                  path.c_str());
+			if (picojson::parse(v, res.body).empty() && v.is<picojson::object>()) {
+				return ParseMeta(v.get<picojson::object>());
 			}
-			return ParseMeta(v.get<picojson::object>());
+			DriveItemMeta unknown;
+			unknown.found = true;
+			unknown.size = static_cast<int64_t>(total);
+			return unknown;
 		}
 		const bool retryable = !transport_ok || IsRetryable(ClassifyGraphError(res.status, ErrorCode(res.body)));
 		if (retryable && ++failures <= kMaxUploadChunkRetries) {
@@ -591,6 +605,7 @@ DriveItemMeta GraphClient::CommitUploadSession(GraphUploadSession &session, uint
 		// (404) while the file is in place.
 		DriveItemMeta committed;
 		if (failures > 0 && verify_committed(committed)) {
+			IncrementCounter(Counter::UPLOAD_COMMIT);
 			session.upload_url.clear();
 			return committed;
 		}
@@ -611,12 +626,29 @@ void GraphClient::AbortUploadSession(GraphUploadSession &session) noexcept {
 	// an overwritten file keeps its old content (verified 2026-10-14).
 	// Best effort: this runs on error paths and from a destructor, so it must
 	// never throw. An abandoned session also expires on its own.
+	//
+	// At most one quick retry (transport error or 5xx), with a short timeout:
+	// this can run while an exception unwinds, and every failed COPY waits for
+	// it. A DELETE that still fails leaves the session -- and a NEW file's
+	// 0-byte placeholder -- until Graph expires it (docs/hld.md 7a).
 	const string url = std::move(session.upload_url);
 	session.upload_url.clear();
-	IncrementCounter(Counter::UPLOAD_ABORT);
-	try {
-		PreauthenticatedRequest("DELETE", url, {}, "", 30, kUploadReplyMaxBytes);
-	} catch (...) {
+	for (int attempt = 1; attempt <= 2; attempt++) {
+		try {
+			auto res = PreauthenticatedRequest("DELETE", url, {}, "", 10, kUploadReplyMaxBytes);
+			if ((res.status >= 200 && res.status < 300) || res.status == 404) {
+				IncrementCounter(Counter::UPLOAD_ABORT); // counted only when it took
+				return;
+			}
+			if (res.status < 500) {
+				return; // a refusal: retrying cannot help
+			}
+		} catch (...) {
+		}
+		if (attempt == 1) {
+			IncrementCounter(Counter::RETRY);
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+		}
 	}
 }
 

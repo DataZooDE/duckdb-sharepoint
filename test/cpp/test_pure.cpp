@@ -16,6 +16,7 @@
 #include <atomic>
 #include <map>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -698,26 +699,18 @@ TEST_CASE("call counters count, snapshot by name and reset", "[counters]") {
 // ---------------------------------------------------------------------------
 namespace {
 
-//! Drive a ChunkedUploadBuffer the way SharepointFileSystem::Write does and
-//! record each non-final chunk's Content-Range. Returns the close action.
+//! Drive a ChunkedUploadBuffer through StreamInto -- the SAME loop
+//! SharepointFileSystem::Write runs -- and record each non-final chunk's
+//! Content-Range. Returns the close action.
 ChunkedUploadBuffer::CloseAction Stream(ChunkedUploadBuffer &buf, const std::vector<std::size_t> &writes,
                                         std::vector<std::string> &flushed) {
 	for (auto n : writes) {
 		std::string data(n, 'x');
-		const char *p = data.data();
-		std::size_t left = n;
-		while (left > 0) {
-			if (buf.Full()) {
-				flushed.push_back(buf.ContentRange(false));
-				REQUIRE(buf.Pending().size() == buf.ChunkBytes());
-				buf.MarkChunkSent();
-			}
-			auto took = buf.Fill(p, left);
-			REQUIRE(took > 0);
-			p += took;
-			left -= took;
-			REQUIRE(buf.Pending().size() <= buf.ChunkBytes());
-		}
+		StreamInto(buf, data.data(), n, [&] {
+			REQUIRE(buf.Pending().size() == buf.ChunkBytes());
+			flushed.push_back(buf.ContentRange(false));
+		});
+		REQUIRE(buf.Pending().size() <= buf.ChunkBytes());
 	}
 	return buf.OnClose();
 }
@@ -817,4 +810,46 @@ TEST_CASE("max counters keep the high-water mark", "[counters]") {
 	REQUIRE(snap.count("upload_commit") == 1);
 	REQUIRE(snap.count("upload_abort") == 1);
 	ResetCounters();
+}
+
+TEST_CASE("streaming upload: a failed send leaves the chunk pending and unsent", "[upload][streaming]") {
+	const std::uint64_t C = kGraphUploadChunkMultiple;
+	ChunkedUploadBuffer buf(C);
+	std::string data(static_cast<std::size_t>(C + 10), 'x');
+	REQUIRE_THROWS(StreamInto(buf, data.data(), data.size(), [] { throw std::runtime_error("network"); }));
+	// Nothing was marked sent: the full chunk is still pending, offset 0.
+	REQUIRE(buf.Offset() == 0);
+	REQUIRE(buf.Pending().size() == C);
+	REQUIRE_FALSE(buf.SessionStarted());
+}
+
+TEST_CASE("streaming upload: content range of a resumed chunk", "[upload][streaming]") {
+	const std::uint64_t C = kGraphUploadChunkMultiple;
+	ChunkedUploadBuffer buf(C);
+	std::vector<std::string> flushed;
+	Stream(buf, {static_cast<std::size_t>(C + 100)}, flushed); // offset C, 100 pending
+	REQUIRE(buf.ContentRange(false, 40) == "bytes 327720-327779/*");
+	REQUIRE(buf.ContentRange(true, 40) == "bytes 327720-327779/327780");
+	REQUIRE(buf.ContentRange(true, 0) == "bytes 327680-327779/327780");
+}
+
+TEST_CASE("streaming upload: a small file does not allocate a whole chunk", "[upload][streaming]") {
+	// A handle per open file (COPY ... PARTITION_BY keeps many open): memory
+	// must follow what was written, not the chunk size.
+	ChunkedUploadBuffer buf(kGraphUploadChunkMax);
+	const char one = 'x';
+	REQUIRE(buf.Fill(&one, 1) == 1);
+	REQUIRE(buf.Pending().capacity() < 4096);
+	std::string some(100000, 'y');
+	REQUIRE(buf.Fill(some.data(), some.size()) == some.size());
+	REQUIRE(buf.Pending().capacity() < 4 * 100001);
+}
+
+TEST_CASE("raw request head is the request minus its body", "[rawhttp]") {
+	// The body is sent separately (no copy of a chunk into a request string).
+	std::string head, whole;
+	REQUIRE(BuildRawHttpHead("PUT", "h", 443, "/u?a=1", {{"Content-Range", "bytes 0-2/3"}}, 3, head));
+	REQUIRE(BuildRawHttpRequest("PUT", "h", 443, "/u?a=1", {{"Content-Range", "bytes 0-2/3"}}, "xyz", whole));
+	REQUIRE(whole == head + "xyz");
+	REQUIRE_FALSE(BuildRawHttpHead("PUT", "h", 443, "/u", {{"Content-Length", "9"}}, 3, head));
 }

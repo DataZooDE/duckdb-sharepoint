@@ -109,8 +109,8 @@ bool DecodeChunked(const std::string &raw, std::size_t pos, std::string &body) {
 
 } // namespace
 
-bool BuildRawHttpRequest(const std::string &method, const std::string &host, int port, const std::string &target,
-                         const RawHeaders &headers, const std::string &body, std::string &out) {
+bool BuildRawHttpHead(const std::string &method, const std::string &host, int port, const std::string &target,
+                      const RawHeaders &headers, std::size_t body_size, std::string &out) {
 	if (!IsVisibleAscii(method) || !IsVisibleAscii(host) || !IsVisibleAscii(target) || target[0] != '/' ||
 	    port < 1 || port > 65535) {
 		return false;
@@ -130,9 +130,17 @@ bool BuildRawHttpRequest(const std::string &method, const std::string &host, int
 		}
 		req += h.first + ": " + h.second + "\r\n";
 	}
-	req += "Content-Length: " + std::to_string(body.size()) + "\r\n\r\n";
-	req += body;
+	req += "Content-Length: " + std::to_string(body_size) + "\r\n\r\n";
 	out = std::move(req);
+	return true;
+}
+
+bool BuildRawHttpRequest(const std::string &method, const std::string &host, int port, const std::string &target,
+                         const RawHeaders &headers, const std::string &body, std::string &out) {
+	if (!BuildRawHttpHead(method, host, port, target, headers, body.size(), out)) {
+		return false;
+	}
+	out += body;
 	return true;
 }
 

@@ -55,7 +55,10 @@ public:
 	//! that never outgrows it is sent as a single PUT on Close(); the moment
 	//! it does, a deferCommit upload session is opened and every full chunk
 	//! goes up as it fills. The file is published only by the commit in
-	//! Close(), so an error mid-stream leaves nothing behind. `write_failed`
+	//! Close(), so an error mid-stream leaves nothing behind -- one exception:
+	//! while a NEW file's session is open, SharePoint shows a 0-byte
+	//! placeholder at its path (removed when the session is discarded; COPY's
+	//! tmp_ staging keeps it off the real name). `write_failed`
 	//! stops Close() publishing a truncated file after an error unwound
 	//! mid-write.
 	bool is_write = false;

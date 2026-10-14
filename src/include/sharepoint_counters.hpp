@@ -22,9 +22,9 @@ enum class Counter {
 	LIST_PAGE,       // GET one page of a folder's children
 	UPLOAD_PUT,      // single-request upload (file <= upload chunk size)
 	UPLOAD_SESSION,  // createUploadSession
-	UPLOAD_CHUNK,    // one chunk PUT inside a session
-	UPLOAD_COMMIT,   // the commit POST that publishes a streamed (deferCommit) upload
-	UPLOAD_ABORT,    // an upload session discarded (error mid-stream, or a handle never closed)
+	UPLOAD_CHUNK,    // one chunk PUT inside a session, counted when ACCEPTED (retries show in RETRY)
+	UPLOAD_COMMIT,   // a streamed (deferCommit) upload committed, i.e. published (once per file)
+	UPLOAD_ABORT,    // an upload session discarded (error mid-stream, handle never closed); only when the DELETE took
 	DELETE_ITEM,     // DELETE / permanentDelete
 	MOVE,            // PATCH parentReference + name
 	CREATE_FOLDER,   // POST children (folder)

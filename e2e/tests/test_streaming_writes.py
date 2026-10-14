@@ -9,8 +9,10 @@ as the kernel reports it (wait4), against a file several times larger.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
+import sys
 import threading
 import time
 
@@ -39,6 +41,7 @@ def _run_measured(duckdb_cli, env, statements: str) -> tuple[int, str, int]:
 
 
 @pytest.mark.slow
+@pytest.mark.skipif(sys.platform != "linux", reason="ru_maxrss is KiB only on Linux")
 def test_large_copy_streams_in_bounded_memory(graph, scratch, duckdb_cli, isolated_home, secret_sql):
     # ~400 MB of CSV from a generator that itself needs almost no memory.
     rows = 3_600_000
@@ -87,6 +90,35 @@ def test_streamed_bytes_round_trip_exactly(scratch, sql, secret_sql, tmp_path):
     assert remote_md5 == local_md5
 
 
+SMALL = 327680  # the 320-KiB minimum chunk
+
+
+@pytest.mark.parametrize("size", [0, SMALL - 1, SMALL, SMALL + 1, 2 * SMALL])
+def test_chunk_boundaries_pick_put_or_session(scratch, sql, secret_sql, size, tmp_path):
+    # Up to one chunk: one PUT, no session. Above: one deferCommit session
+    # whose FINAL chunk carries the total -- including a full final chunk
+    # (2 * chunk), which is the case a "/*"-then-total protocol could get wrong.
+    data = os.urandom(size)
+    local = tmp_path / "in.bin"
+    local.write_bytes(data)
+    uri = f"sharepoint://{scratch}/b_{size}.bin"
+    out = sql(f"""{secret_sql}
+        SET sharepoint_upload_chunk_bytes = {SMALL};
+        CALL sharepoint_reset_stats();
+        SELECT write_blob('{uri}', content) FROM read_blob('{local}');
+        SELECT string_agg(metric || '=' || value, ',') FROM sharepoint_stats()
+         WHERE metric IN ('upload_put', 'upload_session', 'upload_chunk', 'upload_commit');
+        SELECT md5(content) FROM read_blob('{uri}');""")
+    lines = out.splitlines()
+    stats = dict(kv.split("=") for kv in lines[-2].split(","))
+    if size <= SMALL:
+        assert stats == {"upload_put": "1", "upload_session": "0", "upload_chunk": "0", "upload_commit": "0"}
+    else:
+        assert stats == {"upload_put": "0", "upload_session": "1",
+                         "upload_chunk": str(-(-size // SMALL)), "upload_commit": "1"}
+    assert lines[-1] == hashlib.md5(data).hexdigest()
+
+
 def test_failure_mid_stream_publishes_nothing(graph, scratch, duckdb_cli, isolated_home, secret_sql):
     """The destination's folder vanishes while the upload is streaming. The COPY
     must FAIL (not report success for a file that is not there), and nothing may
@@ -109,15 +141,19 @@ def test_failure_mid_stream_publishes_nothing(graph, scratch, duckdb_cli, isolat
     reader = threading.Thread(target=lambda: output.append(proc.stdout.read()), daemon=True)
     reader.start()
 
-    deadline = time.time() + 120
-    # SharePoint shows a 0-byte placeholder item (stat finds it; a folder
-    # listing does not) as soon as an upload session is open on the path.
-    while time.time() < deadline and graph.stat(f"{scratch}/doomed/x.csv") is None:
-        time.sleep(0.5)
-    assert graph.stat(f"{scratch}/doomed/x.csv") is not None, "the upload session never opened"
-    assert graph.delete(f"{scratch}/doomed", permanent=True)
-
-    proc.wait(timeout=900)
+    try:
+        deadline = time.time() + 120
+        # SharePoint shows a 0-byte placeholder item (stat finds it; a folder
+        # listing does not) as soon as an upload session is open on the path.
+        while time.time() < deadline and graph.stat(f"{scratch}/doomed/x.csv") is None:
+            time.sleep(0.5)
+        assert graph.stat(f"{scratch}/doomed/x.csv") is not None, "the upload session never opened"
+        assert graph.delete(f"{scratch}/doomed", permanent=True)
+        proc.wait(timeout=900)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
     reader.join(timeout=30)
     text = scrub("".join(output))
     assert proc.returncode != 0 or "copy-returned" not in text, f"COPY reported success:\n{text}"

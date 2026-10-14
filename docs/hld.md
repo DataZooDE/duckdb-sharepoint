@@ -247,6 +247,30 @@ Found while building streaming writes (2026-10-14):
   old file — exactly as on local disk. With the default tmp-file staging, the
   old file survives.
 
+Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
+
+- **Discarding a session is one best-effort `DELETE`** (10 s timeout, one
+  retry on transport error / 5xx), and it can run from the write handle's
+  destructor while a failed `COPY` unwinds -- so a failed `COPY` can wait up
+  to ~20 s for it. If it still fails, the session lingers until Graph expires
+  it, and for a NEW file so does its 0-byte placeholder. `upload_abort` counts
+  only discards that took.
+- **A retried `createUploadSession` whose first reply was lost** may leave an
+  orphaned session (and placeholder) behind. Not verified live.
+- **The `uploadUrl` host is not allow-listed** -- only https is enforced. It
+  comes from a TLS reply of an allow-listed Graph host; an allow-list needs
+  every national cloud's upload-host suffix confirmed live first.
+- **Lost commit reply**: recognised by size + a changed **cTag** (the content
+  tag); a concurrent writer of exactly the same size in that window is the
+  remaining ambiguity. A 200/201 commit is success whatever its body says.
+- **Memory**: the pending chunk is the only copy -- a chunk is written to the
+  TLS socket straight from it (`BuildRawHttpHead` + body), never copied into a
+  request string -- and it grows with what was written (a small file never
+  allocates a whole chunk).
+- **Seek on a write handle** to anywhere but the current position throws and
+  marks the write failed (nothing is published). No DuckDB writer is known to
+  do it; it is refused rather than allowed to desync the stream.
+
 ## 8. Two-actor note
 
 The extension binary is built and released from **this** repo (ghcr / the
