@@ -158,6 +158,7 @@ def test_rotated_refresh_token_is_persisted(graph, scratch, sql, isolated_home):
     sql("DROP PERSISTENT SECRET sp_rot;")
 
 
+@pytest.mark.timeout(1200)  # a human types the code; the default 600 s is too tight
 @pytest.mark.skipif(os.environ.get("SHAREPOINT_INTERACTIVE") != "1",
                     reason="needs a human: set SHAREPOINT_INTERACTIVE=1 and run with `pytest -s`")
 def test_interactive_device_code_round_trip(graph, scratch, duckdb_cli, isolated_home):
