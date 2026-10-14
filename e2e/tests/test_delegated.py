@@ -146,9 +146,10 @@ def test_rotated_refresh_token_is_persisted(graph, scratch, sql, isolated_home):
     original = os.environ["SHAREPOINT_USER_REFRESH_TOKEN"]
     sql(_delegated_secret("sp_rot", persistent=True))
     sql(f"SELECT write_blob('sharepoint://{scratch}/rot.txt', 'x'::BLOB);")
-    sql("SET sharepoint_debug_token_max_age_seconds = 60;"
-        f"SELECT file_size('sharepoint://{scratch}/rot.txt');"
-        f"SELECT file_size('sharepoint://{scratch}/rot.txt');")
+    # Each process starts with an empty token cache, so each of these mints
+    # (and rotates) from the refresh token stored by the one before.
+    for _ in range(2):
+        sql(f"SELECT file_size('sharepoint://{scratch}/rot.txt');")
     stored = (Path(isolated_home["HOME"]) / ".duckdb" / "stored_secrets" / "sp_rot.duckdb_secret").read_bytes()
     assert b"refresh_token_lineage" in stored, "no rotated refresh token was written back"
     assert original.encode() not in stored, "the stored refresh token was not replaced by the rotated one"

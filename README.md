@@ -197,7 +197,6 @@ they are.
 - **Names.** SharePoint forbids `" * : < > ? \ |` in file and folder names;
   such writes are refused up front.
 - **ATTACH is read-only** (a DuckDB database file cannot be updated in place).
-- **Delegated (user) auth** is not implemented yet.
 - **Error class for a missing secret** is `InvalidInputException` here and
   `IOException` in `duckdb-gdrive`.
 
