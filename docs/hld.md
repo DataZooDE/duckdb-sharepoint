@@ -100,12 +100,33 @@ bearer token. From then on the secret is an ordinary refresh-token secret:
 secret, exactly the `config` path. `REFRESH_TOKEN` can be passed at creation to
 skip the sign-in (that is how the live suite and CI drive it).
 
-Concurrency: a multi-file scan opens files on several threads; the sign-in is
-serialised per (database, connection, secret configuration), so one device
-code is printed, and a same-named secret in another connection never inherits
-it. The token-cache fingerprint includes the refresh token, so two users'
-secrets of one name never share an access token.
+**Write-back from inside a statement is intentional**, and guarded: the
+sign-in can wait minutes for a human, so the secret is re-fetched by name and
+storage first, and written only if its configuration (every field but
+`refresh_token` / `refresh_token_lineage`, the provider and the SCOPE paths)
+still equals the snapshot the statement started from and its refresh token is
+still the one expected. A secret replaced or dropped meanwhile is left alone
+(the statement still uses its tokens). Verified locally (2026-10-14): a write
+from `GetAuthContext` is visible to the next open in the same statement and
+survives a restart for a persistent secret, with no catalog deadlock.
 
+**No side cache of sign-ins.** The sign-in is serialised per secret (name,
+storage, provider, tenant, client id, scope, login host); a thread that waited
+re-reads the secret manager and finds the refresh token the first one stored,
+so a parallel scan prints one code. A secret recreated without
+`REFRESH_TOKEN` — the recovery the "rejected" message teaches — really signs
+in again, and a same-named secret for another user inherits nothing.
+
+**Cache identity and rotation.** Entra issues a new refresh token on every
+refresh grant. The credential fingerprint keys on the token's **lineage** —
+SHA-256 of the refresh token the secret was first given (at creation or
+sign-in), stored as the redacted `refresh_token_lineage` beside the token —
+not on the current token, so rotation does not orphan the token cache, the
+mint lock or the block-cache/same-drive identity. `MintToken` remembers the
+newest rotated token per fingerprint (every later mint presents it, never a
+superseded one), and `GetAuthContext` writes it back through the same guarded
+write-back (best effort: a statement never fails because of it). A secret thus
+stays usable past the first token's 90-day window as long as it is used.
 Transport: the `/devicecode` and code-redemption POSTs go through the raw TLS
 transport (`sharepoint_preauth.cpp`: one deadline, SNI + certificate-hostname
 verification armed or fail closed, bounded body). The refresh grant uses the
@@ -226,11 +247,13 @@ each get a message naming the fix.
    refresh-error path (app-only app registration). *Open:* the end-to-end user
    round trip (`sharepoint_delegated.live.template`, `e2e/tests/test_delegated.py`)
    needs the `duckdb-sharepoint-delegated` app and a refresh token from
-   `scripts/delegated_login.py`; an interactive `authorization_code` sign-in
-   has only been exercised up to the browser launch. *Follow-up:* Entra rotates
-   the refresh token on every refresh; the rotated one is not written back
-   (the stored one stays valid until its own expiry / 90-day inactivity), so a
-   secret unused for 90 days needs a new sign-in.
+   `scripts/delegated_login.py`; the human device-code round trip is
+   `e2e/tests/test_delegated.py::test_interactive_device_code_round_trip`
+   (`SHAREPOINT_INTERACTIVE=1 ... pytest -s -k interactive`); an interactive
+   `authorization_code` sign-in has only been exercised up to the browser
+   launch. Rotated refresh tokens are written back (§5.1); a secret unused for
+   ~90 days still needs a new sign-in, and the CI repo secret
+   `SHAREPOINT_USER_REFRESH_TOKEN` is not updated by runs.
 6b. **DNS is not bounded by the pre-auth transport's deadline.** Connect,
    handshake, send and receive are; `getaddrinfo` inside `BIO_do_connect`
    blocks for the OS resolver timeout. Bounding it needs a resolver thread.

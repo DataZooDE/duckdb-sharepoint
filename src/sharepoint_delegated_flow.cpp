@@ -23,6 +23,8 @@
 #endif
 
 #include <chrono>
+#include <map>
+#include <cstdint>
 #include <cstdlib>
 #include <thread>
 
@@ -147,6 +149,17 @@ DelegatedTokens RunAuthorizationCodeFlow(const DelegatedFlowConfig &cfg) {
 	config.custom_token_url = EntraUrl(cfg.login_endpoint, cfg.tenant, "token");
 	const std::string auth_url = erpl_web::BuildAuthorizationUrlPure(config, challenge, state);
 
+	// Listen BEFORE the browser opens: an existing browser session can redirect
+	// back within milliseconds, and a redirect to a closed port is lost.
+	erpl_web::OAuth2Server server(cfg.redirect_port);
+	try {
+		server.Start(state, cfg.redirect_port);
+	} catch (const std::exception &e) {
+		throw IOException("sharepoint secret '%s' (PROVIDER authorization_code): %s. Set REDIRECT_PORT to a free "
+		                  "port.",
+		                  cfg.secret_name, e.what());
+	}
+
 	Printer::Print(OutputStream::STREAM_STDERR,
 	               "sharepoint: opening a browser to sign in. If it does not open, visit: " + auth_url);
 	Printer::Flush(OutputStream::STREAM_STDERR);
@@ -158,14 +171,14 @@ DelegatedTokens RunAuthorizationCodeFlow(const DelegatedFlowConfig &cfg) {
 
 	std::string code;
 	try {
-		erpl_web::OAuth2Server server(cfg.redirect_port);
-		code = server.StartAndWaitForCode(state, cfg.redirect_port);
+		code = server.WaitForCode();
 	} catch (const std::exception &e) {
 		throw IOException("sharepoint secret '%s' (PROVIDER authorization_code): the browser sign-in did not "
-		                  "complete: %s. It needs a free localhost port (%d; set REDIRECT_PORT) and a browser on "
-		                  "this machine; on a headless host use PROVIDER device_code.",
-		                  cfg.secret_name, e.what(), cfg.redirect_port);
+		                  "complete: %s. It needs a browser on this machine; on a headless host use PROVIDER "
+		                  "device_code.",
+		                  cfg.secret_name, e.what());
 	}
+	server.Stop();
 
 	const auto res = PostForm(config.custom_token_url,
 	                          AuthorizationCodeTokenRequest(cfg.client_id, code, config.redirect_uri, verifier,
@@ -178,17 +191,86 @@ DelegatedTokens RunAuthorizationCodeFlow(const DelegatedFlowConfig &cfg) {
 #endif
 }
 
-void PersistRefreshToken(ClientContext &context, const SecretMatch &match, const string &refresh_token) {
-	// Through the secret manager: the KeyValueSecret a lookup returns is a deep
-	// copy, so writing to it would change nothing (the trap gdrive documents).
-	const auto &current = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
+namespace {
+
+string Field(const KeyValueSecret &kv, const char *key) {
+	auto it = kv.secret_map.find(key);
+	return (it == kv.secret_map.end() || it->second.IsNull()) ? string() : it->second.ToString();
+}
+
+//! Same secret configuration, ignoring the fields a write-back changes.
+bool SameConfiguration(const KeyValueSecret &a, const KeyValueSecret &b) {
+	if (a.GetType() != b.GetType() || a.GetProvider() != b.GetProvider() || a.GetName() != b.GetName() ||
+	    a.GetScope() != b.GetScope()) {
+		return false;
+	}
+	auto stripped = [](const KeyValueSecret &kv) {
+		std::map<string, string> out;
+		for (auto &entry : kv.secret_map) {
+			if (entry.first == "refresh_token" || entry.first == "refresh_token_lineage") {
+				continue;
+			}
+			out[entry.first] = entry.second.IsNull() ? string("\x01NULL") : entry.second.ToString();
+		}
+		return out;
+	};
+	return stripped(a) == stripped(b);
+}
+
+//! The current registered secret, if it still has the snapshot's configuration.
+unique_ptr<SecretEntry> RefetchMatching(ClientContext &context, const SecretMatch &snapshot) {
+	const auto &before = dynamic_cast<const KeyValueSecret &>(snapshot.GetSecret());
+	auto &secret_manager = SecretManager::Get(context);
+	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
+	auto entry = secret_manager.GetSecretByName(transaction, before.GetName(), snapshot.secret_entry->storage_mode);
+	if (!entry || !entry->secret) {
+		return nullptr;
+	}
+	auto now = dynamic_cast<const KeyValueSecret *>(entry->secret.get());
+	if (!now || !SameConfiguration(before, *now)) {
+		return nullptr;
+	}
+	return entry;
+}
+
+} // namespace
+
+StoredDelegatedState RefetchDelegatedState(ClientContext &context, const SecretMatch &snapshot) {
+	StoredDelegatedState state;
+	auto entry = RefetchMatching(context, snapshot);
+	if (entry) {
+		const auto &kv = dynamic_cast<const KeyValueSecret &>(*entry->secret);
+		state.present = true;
+		state.refresh_token = Field(kv, "refresh_token");
+		state.lineage = Field(kv, "refresh_token_lineage");
+	}
+	return state;
+}
+
+bool WriteBackRefreshToken(ClientContext &context, const SecretMatch &snapshot, const string &expected_current,
+                           const string &refresh_token, const string &lineage) {
+	// Re-fetched rather than written from the snapshot: a sign-in can take
+	// minutes, and a CREATE OR REPLACE / DROP of this secret meanwhile must not
+	// be silently reverted or resurrected. (Writing to the snapshot itself would
+	// change nothing either: a lookup returns a deep copy -- gdrive's trap.)
+	auto entry = RefetchMatching(context, snapshot);
+	if (!entry) {
+		return false;
+	}
+	const auto &current = dynamic_cast<const KeyValueSecret &>(*entry->secret);
+	if (Field(current, "refresh_token") != expected_current) {
+		return false; // someone else already updated it
+	}
 	auto updated = make_uniq<KeyValueSecret>(current);
 	updated->secret_map["refresh_token"] = Value(refresh_token);
+	updated->secret_map["refresh_token_lineage"] = Value(lineage);
 	updated->redact_keys.insert("refresh_token");
+	updated->redact_keys.insert("refresh_token_lineage");
 	auto &secret_manager = SecretManager::Get(context);
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
 	secret_manager.RegisterSecret(transaction, std::move(updated), OnCreateConflict::REPLACE_ON_CONFLICT,
-	                              match.secret_entry->persist_type, match.secret_entry->storage_mode);
+	                              entry->persist_type, entry->storage_mode);
+	return true;
 }
 
 } // namespace sharepoint

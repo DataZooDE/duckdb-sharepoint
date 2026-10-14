@@ -50,6 +50,23 @@ FormParams AuthorizationCodeTokenRequest(const std::string &client_id, const std
 FormParams RefreshTokenRequest(const std::string &client_id, const std::string &client_secret,
                                const std::string &refresh_token, const std::string &scope);
 
+//! Whether a credential acts as a USER (delegated): the device_code and
+//! authorization_code providers, and a config refresh token without a client
+//! secret (only a public client issues those). Picks the default scope and the
+//! wording of refresh errors -- one rule, so the two cannot drift.
+bool IsDelegatedCredential(const std::string &provider, bool has_client_secret);
+
+//! A device-code user_code fit to show a human: 1-16 of [A-Za-z0-9-]. Refuses
+//! anything that could break the one-line prompt (newline, ANSI escapes).
+bool IsValidUserCode(const std::string &user_code);
+
+//! A verification_uri fit to show a human: https, no userinfo or port, no
+//! whitespace / control / non-ASCII bytes, on a Microsoft sign-in domain
+//! (microsoft.com, microsoftonline.com/.us/.cn, chinacloudapi.cn or a
+//! subdomain). The login host is already allow-listed and TLS-verified; this
+//! keeps a broken or hostile reply from steering the user to a phishing page.
+bool IsAllowedVerificationUri(const std::string &uri);
+
 //! The /devicecode response (RFC 8628 section 3.2).
 struct DeviceCodeGrant {
 	std::string device_code;
@@ -60,8 +77,9 @@ struct DeviceCodeGrant {
 };
 
 //! Parse a 200 /devicecode body. False (with a credential-free `error`) when
-//! a field is missing, the expiry is not positive, or verification_uri is not
-//! https -- it is shown to a human as the place to type their code.
+//! a field is missing, the expiry is not positive, or user_code /
+//! verification_uri fail IsValidUserCode / IsAllowedVerificationUri -- both
+//! are shown to a human.
 bool ParseDeviceCodeResponse(const std::string &body, DeviceCodeGrant &out, std::string &error);
 
 //! What a /token (or /devicecode) reply means for the caller.

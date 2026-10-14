@@ -98,6 +98,17 @@ SET sharepoint_device_code_timeout_seconds = 0;
 ----
 must be between
 
+statement ok
+SET sharepoint_device_code_timeout_seconds = 3600;
+
+statement error
+SET sharepoint_device_code_timeout_seconds = 3601;
+----
+must be between
+
+statement ok
+RESET sharepoint_device_code_timeout_seconds;
+
 # ---------------------------------------------------------------------------
 # PROVIDER authorization_code: browser + localhost redirect, public client.
 # ---------------------------------------------------------------------------

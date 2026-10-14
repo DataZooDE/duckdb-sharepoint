@@ -6,6 +6,7 @@
 #include <picojson.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 
 namespace duckdb {
@@ -85,6 +86,56 @@ int64_t ClampInterval(int64_t s) {
 
 } // namespace
 
+bool IsDelegatedCredential(const std::string &provider, bool has_client_secret) {
+	return provider == "device_code" || provider == "authorization_code" ||
+	       (provider == "config" && !has_client_secret);
+}
+
+bool IsValidUserCode(const std::string &user_code) {
+	if (user_code.empty() || user_code.size() > 16) {
+		return false;
+	}
+	for (char c : user_code) {
+		if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool IsAllowedVerificationUri(const std::string &uri) {
+	static const std::string kScheme = "https://";
+	if (uri.compare(0, kScheme.size(), kScheme) != 0 || uri.size() > 512) {
+		return false;
+	}
+	for (unsigned char c : uri) {
+		if (c <= 0x20 || c >= 0x7F) {
+			return false; // whitespace, control (incl. ESC), non-ASCII
+		}
+	}
+	const auto host_end = uri.find_first_of("/?#", kScheme.size());
+	std::string host = uri.substr(kScheme.size(), host_end == std::string::npos ? std::string::npos
+	                                                                             : host_end - kScheme.size());
+	if (host.empty() || host.find_first_of("@:[]") != std::string::npos) {
+		return false; // userinfo, port, IPv6 literal
+	}
+	for (auto &c : host) {
+		if (c >= 'A' && c <= 'Z') {
+			c = static_cast<char>(c - 'A' + 'a');
+		}
+	}
+	for (const char *domain :
+	     {"microsoft.com", "microsoftonline.com", "microsoftonline.us", "microsoftonline.cn", "chinacloudapi.cn"}) {
+		const std::string d(domain);
+		if (host == d ||
+		    (host.size() > d.size() && host.compare(host.size() - d.size(), d.size(), d) == 0 &&
+		     host[host.size() - d.size() - 1] == '.')) {
+			return true;
+		}
+	}
+	return false;
+}
+
 std::string FormUrlEncode(const FormParams &params) {
 	std::string out;
 	for (const auto &kv : params) {
@@ -153,9 +204,13 @@ bool ParseDeviceCodeResponse(const std::string &body, DeviceCodeGrant &out, std:
 		error = "the device-code response lacks device_code, user_code or verification_uri";
 		return false;
 	}
-	// Shown to a human as the place to type their code: https only.
-	if (g.verification_uri.compare(0, 8, "https://") != 0) {
-		error = "the device-code response's verification_uri is not an https URL";
+	// Both are shown to a human, on one line.
+	if (!IsAllowedVerificationUri(g.verification_uri)) {
+		error = "the device-code response's verification_uri is not an https Microsoft sign-in page";
+		return false;
+	}
+	if (!IsValidUserCode(g.user_code)) {
+		error = "the device-code response's user_code is not a short alphanumeric code";
 		return false;
 	}
 	if (g.expires_in <= 0) {
@@ -228,7 +283,7 @@ int64_t NextPollIntervalSeconds(int64_t current, TokenReplyKind kind) {
 
 std::string DeviceCodePrompt(const DeviceCodeGrant &grant) {
 	return "sharepoint: to sign in, open " + grant.verification_uri + " and enter the code " + grant.user_code +
-	       " (valid for " + std::to_string(grant.expires_in / 60) + " minutes)";
+	       " (valid for " + std::to_string(std::max<int64_t>(1, (grant.expires_in + 59) / 60)) + " minutes)";
 }
 
 std::string DelegatedErrorMessage(const TokenReply &reply, const std::string &secret_name,

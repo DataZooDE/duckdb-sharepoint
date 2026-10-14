@@ -135,6 +135,16 @@ a token from `scripts/delegated_login.py` (`make delegated_login`), which runs
 the device-code flow and writes the token to the git-ignored
 `.env.sharepoint.delegated` — never to the terminal.
 
+> **What a delegated secret holds.** The refresh token acts as the user for
+> everything the default scope covers — read/write on every file and site the
+> user can reach (`Files.ReadWrite.All Sites.ReadWrite.All`). Narrow it with
+> `GRAPH_SCOPE` (keep `offline_access`). A `PERSISTENT` secret stores the token
+> in DuckDB's secret directory **in plain text** (DuckDB's design, as for every
+> persistent secret), protected only by file permissions; prefer a temporary
+> secret on shared machines. Entra rotates the token on each refresh and the
+> extension writes the newest one back, so an active secret keeps working; one
+> unused for ~90 days needs a new sign-in.
+
 > The option is `GRAPH_SCOPE`, **not** `SCOPE`: DuckDB's `CREATE SECRET` grammar
 > reserves `SCOPE` for the secret's path-matching prefix list, so an OAuth scope
 > named `scope` would silently rescope the secret to match no path at all. This

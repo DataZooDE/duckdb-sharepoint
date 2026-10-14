@@ -4,6 +4,7 @@
 #include "sharepoint_delegated.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <cstdint>
 #include <string>
 
 using namespace duckdb::sharepoint;
@@ -258,4 +259,68 @@ TEST_CASE("browser launch needs a display on non-Apple POSIX", "[delegated]") {
 	REQUIRE_FALSE(CanLaunchBrowser(true, "", ""));
 	REQUIRE(CanLaunchBrowser(true, ":0", ""));
 	REQUIRE(CanLaunchBrowser(true, "", "wayland-0"));
+}
+
+TEST_CASE("which credentials are delegated (user) ones", "[delegated]") {
+	REQUIRE(IsDelegatedCredential("device_code", false));
+	REQUIRE(IsDelegatedCredential("authorization_code", false));
+	// A config refresh token without a client secret came from a public client.
+	REQUIRE(IsDelegatedCredential("config", false));
+	REQUIRE_FALSE(IsDelegatedCredential("config", true));
+	REQUIRE_FALSE(IsDelegatedCredential("client_credentials", true));
+	REQUIRE_FALSE(IsDelegatedCredential("client_credentials", false));
+}
+
+TEST_CASE("user codes are short and printable", "[delegated]") {
+	REQUIRE(IsValidUserCode("GW68JTTUN"));
+	REQUIRE(IsValidUserCode("ABCD-1234"));
+	REQUIRE(IsValidUserCode("abc123"));
+	REQUIRE_FALSE(IsValidUserCode(""));
+	REQUIRE_FALSE(IsValidUserCode("ABCDEFGHIJKLMNOPQ")); // 17
+	REQUIRE_FALSE(IsValidUserCode("ABC\nDEF"));
+	REQUIRE_FALSE(IsValidUserCode("ABC\x1b[2JDEF"));
+	REQUIRE_FALSE(IsValidUserCode("ABC DEF"));
+	REQUIRE_FALSE(IsValidUserCode("ABC\xC3\xA4"));
+}
+
+TEST_CASE("verification URIs must be a Microsoft https sign-in page", "[delegated]") {
+	REQUIRE(IsAllowedVerificationUri("https://login.microsoft.com/device"));
+	REQUIRE(IsAllowedVerificationUri("https://microsoft.com/devicelogin"));
+	REQUIRE(IsAllowedVerificationUri("https://www.microsoft.com/link"));
+	REQUIRE(IsAllowedVerificationUri("https://login.microsoftonline.us/common/oauth2/deviceauth"));
+	REQUIRE(IsAllowedVerificationUri("https://microsoft.com/deviceloginchina"));
+	REQUIRE(IsAllowedVerificationUri("https://login.chinacloudapi.cn/common/oauth2/deviceauth"));
+	REQUIRE_FALSE(IsAllowedVerificationUri("http://login.microsoft.com/device"));
+	REQUIRE_FALSE(IsAllowedVerificationUri("https://login.microsoft.com.evil.example/device"));
+	REQUIRE_FALSE(IsAllowedVerificationUri("https://evilmicrosoft.com/device"));
+	REQUIRE_FALSE(IsAllowedVerificationUri("https://user@login.microsoft.com/device"));
+	REQUIRE_FALSE(IsAllowedVerificationUri("https://login.microsoft.com:8443/device"));
+	REQUIRE_FALSE(IsAllowedVerificationUri("https://login.microsoft.com/dev\nice"));
+	REQUIRE_FALSE(IsAllowedVerificationUri("https://login.microsoft.com/\x1b[31mdevice"));
+	REQUIRE_FALSE(IsAllowedVerificationUri("https://login.microsoft.com/de vice"));
+	REQUIRE_FALSE(IsAllowedVerificationUri("https:///device"));
+}
+
+TEST_CASE("device code responses with a hostile prompt are refused", "[delegated]") {
+	DeviceCodeGrant g;
+	std::string err;
+	REQUIRE_FALSE(ParseDeviceCodeResponse(
+	    R"({"user_code":"AB\nCD","device_code":"D","verification_uri":"https://login.microsoft.com/device","expires_in":900})",
+	    g, err));
+	REQUIRE_FALSE(ParseDeviceCodeResponse(
+	    R"({"user_code":"ABCD","device_code":"D","verification_uri":"https://phish.example/device","expires_in":900})", g,
+	    err));
+	REQUIRE_FALSE(ParseDeviceCodeResponse(
+	    R"({"user_code":"ABCD\u001b[2J","device_code":"D","verification_uri":"https://login.microsoft.com/device","expires_in":900})",
+	    g, err));
+}
+
+TEST_CASE("the prompt never claims zero minutes", "[delegated]") {
+	DeviceCodeGrant g;
+	g.user_code = "ABCD";
+	g.verification_uri = "https://login.microsoft.com/device";
+	g.expires_in = 45;
+	REQUIRE(DeviceCodePrompt(g).find("valid for 1 minutes") != std::string::npos);
+	g.expires_in = 900;
+	REQUIRE(DeviceCodePrompt(g).find("valid for 15 minutes") != std::string::npos);
 }

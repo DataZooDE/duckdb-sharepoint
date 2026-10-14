@@ -53,6 +53,12 @@ struct CachedToken {
 mutex g_token_lock;
 unordered_map<string, CachedToken> g_tokens;  // credential fingerprint -> token
 unordered_map<string, string> g_site_drives; // fingerprint of (credentials, site) -> drive id
+//! Credential fingerprint -> the newest refresh token Entra ID issued for it.
+//! Entra rotates the refresh token on every refresh grant; every later mint
+//! for that credential presents the newest one (never a superseded token), and
+//! GetAuthContext writes it back into the secret. Holds refresh tokens; never
+//! displayed.
+unordered_map<string, string> g_latest_refresh;
 
 //! SHA-256 (hex) of length-prefixed credential material. Hashed so no
 //! credential sits in a map key, and a cryptographic hash so distinct
@@ -73,6 +79,16 @@ string Fingerprint(const vector<string> &parts) {
 		hex.push_back(kHex[digest[i] & 0xF]);
 	}
 	return hex;
+}
+
+//! A delegated secret's cache identity: SHA-256 over the refresh token it was
+//! FIRST given (REFRESH_TOKEN at creation, or the sign-in's). Stored beside the
+//! token as refresh_token_lineage when a token is written back, so the
+//! credential fingerprint survives rotation -- keying on the CURRENT token
+//! would orphan the token cache, the mint lock and the drive-identity keys on
+//! every refresh. Still per user: no two sign-ins share a first token.
+string LineageOf(const string &refresh_token) {
+	return refresh_token.empty() ? string() : Fingerprint({"refresh-token-lineage", refresh_token});
 }
 
 // Read a field from a KeyValueSecret, empty string if absent.
@@ -180,13 +196,23 @@ struct MintRequest {
 string MintToken(const MintRequest &req) {
 	duckdb_httplib_openssl::Params params;
 	TokenErrorFormatter on_error;
-	if (!req.refresh_token.empty()) {
+	string refresh_token = req.refresh_token;
+	if (!refresh_token.empty()) {
+		// Present the newest token Entra issued for this credential, not the
+		// one this source was built with (it may have been superseded).
+		{
+			lock_guard<mutex> guard(g_token_lock);
+			auto latest = g_latest_refresh.find(req.credential_fp);
+			if (latest != g_latest_refresh.end()) {
+				refresh_token = latest->second;
+			}
+		}
 		// PROVIDER config, device_code and authorization_code: the refresh
 		// grant. A public client (no CLIENT_SECRET) sends none.
-		for (auto &kv : RefreshTokenRequest(req.client_id, req.client_secret, req.refresh_token, req.scope)) {
+		for (auto &kv : RefreshTokenRequest(req.client_id, req.client_secret, refresh_token, req.scope)) {
 			params.emplace(kv.first, kv.second);
 		}
-		if (req.provider != "config" || req.client_secret.empty()) {
+		if (IsDelegatedCredential(req.provider, !req.client_secret.empty())) {
 			// A delegated token: say what fixes a delegated failure (consent,
 			// public client flows, sign in again), not the app-only checklist.
 			const string name = req.secret_name, provider = req.provider;
@@ -224,6 +250,11 @@ string MintToken(const MintRequest &req) {
 	lock_guard<mutex> guard(g_token_lock);
 	const auto now = std::chrono::system_clock::now();
 	g_tokens[req.credential_fp] = CachedToken {token, now + std::chrono::seconds(expires_in), now};
+	auto rotated = obj.find("refresh_token");
+	if (!refresh_token.empty() && rotated != obj.end() && rotated->second.is<string>() &&
+	    !rotated->second.get<string>().empty() && rotated->second.get<string>() != refresh_token) {
+		g_latest_refresh[req.credential_fp] = rotated->second.get<string>();
+	}
 	return token;
 }
 
@@ -404,23 +435,25 @@ string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint
 	return id.get<string>();
 }
 
-//! Sign-ins already completed in this process, keyed per connection and
-//! secret (see SignIn). Holds refresh tokens; never displayed.
-mutex g_signin_lock;
-unordered_map<string, string> g_signed_in;
+struct SignInResult {
+	string refresh_token;
+	string lineage;
+};
 
 //! Run the delegated sign-in for a secret that has no refresh token yet, store
-//! the refresh token back into the secret, and seed the token cache with the
-//! access token it came with. Returns the refresh token.
+//! the refresh token back into the secret (guarded: see WriteBackRefreshToken),
+//! and seed the token cache with the access token it came with.
 //!
-//! Serialised per (connection, secret): a multi-file scan opens files on
-//! several threads at once, and each must not print its own device code. The
-//! first thread signs in; the rest find its result here. Keyed by the
-//! connection as well as the secret's configuration, so a same-named secret in
-//! ANOTHER connection (which may be another user's) never inherits it.
-string SignIn(optional_ptr<FileOpener> opener, const SecretMatch &match, const string &path, const string &provider,
-              const string &login_endpoint, const string &tenant, const string &client_id, const string &scope,
-              const std::function<string(const string &)> &fingerprint_for) {
+//! Serialised per secret: a multi-file scan opens files on several threads at
+//! once, and each must not print its own device code. Under the lock the
+//! secret is RE-READ from the secret manager -- no side cache -- so the threads
+//! that waited find the refresh token the first one stored, while a secret
+//! recreated without REFRESH_TOKEN (the documented recovery) or for another
+//! user really does sign in again.
+SignInResult SignIn(optional_ptr<FileOpener> opener, const SecretMatch &match, const string &path,
+                    const string &provider, const string &login_endpoint, const string &tenant,
+                    const string &client_id, const string &scope,
+                    const std::function<string(const string &)> &fingerprint_for) {
 	const string secret_name = match.GetSecret().GetName();
 	auto client_context = FileOpener::TryGetClientContext(opener);
 	if (!client_context) {
@@ -430,20 +463,22 @@ string SignIn(optional_ptr<FileOpener> opener, const SecretMatch &match, const s
 		                  "REFRESH_TOKEN.",
 		                  secret_name, provider, path);
 	}
-	const string key =
-	    Fingerprint({"signin", std::to_string(reinterpret_cast<uintptr_t>(&DatabaseInstance::GetDatabase(*client_context))),
-	                 std::to_string(client_context->GetConnectionId()), secret_name, provider, tenant, client_id,
-	                 scope, login_endpoint});
-	// One sign-in at a time per key (it can wait minutes for a human); other
-	// secrets and connections are not held up.
-	auto signin_lock = MintLockFor(key);
+	// One sign-in at a time per secret (it can wait minutes for a human);
+	// other secrets are not held up.
+	auto signin_lock = MintLockFor(Fingerprint({"signin", secret_name, match.secret_entry->storage_mode, provider,
+	                                            tenant, client_id, scope, login_endpoint}));
 	lock_guard<mutex> signin_guard(*signin_lock);
-	{
-		lock_guard<mutex> guard(g_signin_lock);
-		auto done = g_signed_in.find(key);
-		if (done != g_signed_in.end()) {
-			return done->second;
-		}
+
+	const auto stored = RefetchDelegatedState(*client_context, match);
+	if (!stored.present) {
+		throw IOException("sharepoint secret '%s' was replaced or dropped while '%s' was being opened; run the "
+		                  "statement again.",
+		                  secret_name, path);
+	}
+	if (!stored.refresh_token.empty()) {
+		// Another thread signed in while this one waited for the lock.
+		return SignInResult {stored.refresh_token,
+		                     stored.lineage.empty() ? LineageOf(stored.refresh_token) : stored.lineage};
 	}
 
 	DelegatedFlowConfig cfg;
@@ -477,20 +512,47 @@ string SignIn(optional_ptr<FileOpener> opener, const SecretMatch &match, const s
 	}
 
 	// Store the refresh token in the secret -- on disk for a PERSISTENT one --
-	// so this is the last prompt, and cache the access token it came with so
-	// the query that triggered the sign-in does not mint a second one.
-	PersistRefreshToken(*client_context, match, tokens.refresh_token);
-	{
-		lock_guard<mutex> guard(g_signin_lock);
-		g_signed_in[key] = tokens.refresh_token;
-	}
+	// so this is the last prompt. Skipped if the secret was replaced or dropped
+	// during the sign-in (this statement still uses the tokens). Then cache the
+	// access token it came with, so this statement does not mint a second one.
+	const string lineage = LineageOf(tokens.refresh_token);
+	WriteBackRefreshToken(*client_context, match, string(), tokens.refresh_token, lineage);
 	{
 		lock_guard<mutex> token_guard(g_token_lock);
 		const auto now = std::chrono::system_clock::now();
-		g_tokens[fingerprint_for(tokens.refresh_token)] =
+		g_tokens[fingerprint_for(lineage)] =
 		    CachedToken {tokens.access_token, now + std::chrono::seconds(tokens.expires_in), now};
 	}
-	return tokens.refresh_token;
+	return SignInResult {tokens.refresh_token, lineage};
+}
+
+//! After a mint: if Entra rotated this credential's refresh token, write the
+//! newest one back into the secret (guarded), so a restart -- or the stored
+//! token's own expiry -- never falls back to a superseded token. Best effort:
+//! a statement never fails because the write-back could not happen.
+void PersistRotatedRefreshToken(optional_ptr<FileOpener> opener, const SecretMatch &match,
+                                const string &credential_fp, const string &stored_refresh_token,
+                                const string &lineage) {
+	string latest;
+	{
+		lock_guard<mutex> guard(g_token_lock);
+		auto it = g_latest_refresh.find(credential_fp);
+		if (it == g_latest_refresh.end() || it->second == stored_refresh_token) {
+			return;
+		}
+		latest = it->second;
+	}
+	auto client_context = FileOpener::TryGetClientContext(opener);
+	if (!client_context) {
+		return; // e.g. an ATTACH opener; the next regular statement writes it
+	}
+	auto lock = MintLockFor(Fingerprint({"writeback", credential_fp}));
+	lock_guard<mutex> guard(*lock);
+	try {
+		WriteBackRefreshToken(*client_context, match, stored_refresh_token, latest, lineage);
+	} catch (std::exception &) {
+		// The rotated token stays in use in-process; a later statement retries.
+	}
 }
 
 } // namespace
@@ -531,21 +593,26 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 	}
 
 	const string provider = secret.GetProvider();
-	const bool delegated = provider == "device_code" || provider == "authorization_code";
+	// The providers that sign a user in interactively (and own their secret's
+	// refresh token, writing it back).
+	const bool interactive = provider == "device_code" || provider == "authorization_code";
 	const string tenant = SecretField(secret, "tenant_id");
 	const string client_id = SecretField(secret, "client_id");
-	// Never read for a delegated provider: a public client has no secret.
-	const string client_secret = delegated ? string() : SecretField(secret, "client_secret");
+	// Never read for an interactive provider: a public client has no secret.
+	const string client_secret = interactive ? string() : SecretField(secret, "client_secret");
 	string refresh_token = SecretField(secret, "refresh_token");
+	string lineage = SecretField(secret, "refresh_token_lineage");
+	if (lineage.empty()) {
+		lineage = LineageOf(refresh_token);
+	}
 	const string configured_scope = SecretField(secret, "graph_scope");
 	// App-only tokens use "<graph>/.default"; a delegated token names its
 	// permissions plus offline_access (or Entra issues no refresh token). A
 	// config refresh token without CLIENT_SECRET is a public-client (delegated)
 	// one too.
-	const bool delegated_scope = delegated || (provider == "config" && client_secret.empty());
-	const string scope = !configured_scope.empty() ? configured_scope
-	                     : delegated_scope         ? DelegatedGraphScope(graph_endpoint)
-	                                               : DefaultGraphScope(graph_endpoint);
+	const string scope = !configured_scope.empty()                                ? configured_scope
+	                     : IsDelegatedCredential(provider, !client_secret.empty()) ? DelegatedGraphScope(graph_endpoint)
+	                                                                               : DefaultGraphScope(graph_endpoint);
 
 	// A config secret with ONLY an ACCESS_TOKEN is used as-is -- the caller owns
 	// its lifetime. With a REFRESH_TOKEN as well, the refresh grant is used, so
@@ -555,12 +622,13 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 
 	// Everything that changes which token comes back -- and where it may be
 	// sent. Two secrets (or one name recreated) share a token only if all of
-	// this is identical. For a delegated secret the refresh token IS the user's
-	// identity: two users' secrets of the same name never share a token.
-	auto fingerprint_for = [&](const string &rt) {
-		return Fingerprint({provider, tenant, client_id, client_secret, rt, scope, login_endpoint, static_token});
+	// this is identical. For a refresh-token secret the token's LINEAGE (see
+	// LineageOf) is the user's identity: two users' secrets of the same name
+	// never share a token, and rotation does not change the key.
+	auto fingerprint_for = [&](const string &lin) {
+		return Fingerprint({provider, tenant, client_id, client_secret, lin, scope, login_endpoint, static_token});
 	};
-	string credential_fp = fingerprint_for(refresh_token);
+	string credential_fp = fingerprint_for(lineage);
 
 	shared_ptr<TokenSource> tokens;
 	if (!static_token.empty()) {
@@ -570,12 +638,14 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 			throw InvalidInputException("sharepoint: TENANT_ID must be a tenant GUID or domain (letters, digits, "
 			                            "'-', '.')");
 		}
-		if (delegated && refresh_token.empty()) {
+		if (interactive && refresh_token.empty()) {
 			// No refresh token yet: the interactive sign-in, once. Afterwards the
 			// refresh token lives in the secret and this branch is not taken.
-			refresh_token = SignIn(opener, match, path, provider, login_endpoint, tenant, client_id, scope,
-			                       fingerprint_for);
-			credential_fp = fingerprint_for(refresh_token);
+			const auto signed_in = SignIn(opener, match, path, provider, login_endpoint, tenant, client_id, scope,
+			                              fingerprint_for);
+			refresh_token = signed_in.refresh_token;
+			lineage = signed_in.lineage;
+			credential_fp = fingerprint_for(lineage);
 		}
 		MintRequest req;
 		req.credential_fp = credential_fp;
@@ -597,6 +667,9 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 		tokens = make_shared_ptr<MintingTokenSource>(std::move(req));
 	}
 	const string token = tokens->Token();
+	if (interactive) {
+		PersistRotatedRefreshToken(opener, match, credential_fp, refresh_token, lineage);
+	}
 
 	AuthContext auth;
 	auth.tokens = tokens;

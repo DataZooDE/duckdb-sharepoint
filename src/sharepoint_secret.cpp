@@ -139,6 +139,7 @@ void CopyDelegatedOptions(CreateSecretInput &input, KeyValueSecret &result, cons
 	// Redacted from the outset: the refresh token is written back after the
 	// sign-in, and there must be no window in which it could be displayed.
 	result.redact_keys.insert("refresh_token");
+	result.redact_keys.insert("refresh_token_lineage");
 	result.redact_keys.insert("access_token");
 }
 

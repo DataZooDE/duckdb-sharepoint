@@ -212,6 +212,14 @@ jobs:
           SHAREPOINT_CLIENT_ID: ${{ secrets.SHAREPOINT_CLIENT_ID }}
           SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
           SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
+          # Delegated (user) suite: a public-client app and a test user's
+          # refresh token from scripts/delegated_login.py. REQUIRE makes their
+          # absence a failure, not a silent skip. (The stored token is rotated
+          # in-process each run but the repo secret is not updated: re-run the
+          # login if it has gone unused for ~90 days.)
+          SHAREPOINT_DELEGATED_CLIENT_ID: ${{ secrets.SHAREPOINT_DELEGATED_CLIENT_ID }}
+          SHAREPOINT_USER_REFRESH_TOKEN: ${{ secrets.SHAREPOINT_USER_REFRESH_TOKEN }}
+          SHAREPOINT_REQUIRE_DELEGATED: '1'
         run: make test_live
       - name: Install stock duckdb v1.5.6
         run: |
@@ -238,6 +246,9 @@ jobs:
           SHAREPOINT_CLIENT_SECRET: ${{ secrets.SHAREPOINT_CLIENT_SECRET }}
           SHAREPOINT_DRIVE_ID: ${{ secrets.SHAREPOINT_DRIVE_ID }}
           SHAREPOINT_SITE_ID: ${{ secrets.SHAREPOINT_SITE_ID }}
+          SHAREPOINT_DELEGATED_CLIENT_ID: ${{ secrets.SHAREPOINT_DELEGATED_CLIENT_ID }}
+          SHAREPOINT_USER_REFRESH_TOKEN: ${{ secrets.SHAREPOINT_USER_REFRESH_TOKEN }}
+          SHAREPOINT_REQUIRE_DELEGATED: '1'
           DATAZOO_DISABLE_TELEMETRY: '1'
         run: cd e2e && uv run --locked pytest -v
 

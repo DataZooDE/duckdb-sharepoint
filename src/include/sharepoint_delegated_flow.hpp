@@ -56,10 +56,26 @@ DelegatedTokens RunDeviceCodeFlow(const DelegatedFlowConfig &cfg, const std::fun
 //! can be launched.
 DelegatedTokens RunAuthorizationCodeFlow(const DelegatedFlowConfig &cfg);
 
-//! Write `refresh_token` into the secret `match` resolved to, keeping its
-//! persistence (a PERSISTENT secret is rewritten on disk) and storage. Only
-//! the refresh token is stored: an access token is never written to disk.
-void PersistRefreshToken(ClientContext &context, const SecretMatch &match, const string &refresh_token);
+//! The delegated fields of the secret `snapshot` was resolved from, as the
+//! secret manager holds them NOW. `present` is false when that secret was
+//! dropped, or replaced by one whose configuration differs from the snapshot
+//! (any field other than refresh_token / refresh_token_lineage, the provider,
+//! or the SCOPE paths).
+struct StoredDelegatedState {
+	bool present = false;
+	string refresh_token;
+	string lineage;
+};
+StoredDelegatedState RefetchDelegatedState(ClientContext &context, const SecretMatch &snapshot);
 
+//! Guarded write-back: store `refresh_token` (and its `lineage`) into the
+//! secret `snapshot` was resolved from -- on disk for a PERSISTENT secret --
+//! ONLY if that secret still has the snapshot's configuration and still holds
+//! `expected_current` as its refresh token. Anything else means it was
+//! replaced, dropped or already updated meanwhile, and is left alone (returns
+//! false). Only the refresh token is stored: never an access token. The caller
+//! serialises write-backs for one secret.
+bool WriteBackRefreshToken(ClientContext &context, const SecretMatch &snapshot, const string &expected_current,
+                           const string &refresh_token, const string &lineage);
 } // namespace sharepoint
 } // namespace duckdb
