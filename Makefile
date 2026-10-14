@@ -37,6 +37,16 @@ test_live: release
 	@./scripts/run_live_tests.sh
 
 # ---------------------------------------------------------------------------
+# Device-code sign-in for the delegated live tests: prints ONLY the
+# verification URL and user code; the refresh token goes to the git-ignored
+# .env.sharepoint.delegated. Needs SHAREPOINT_TENANT_ID and
+# SHAREPOINT_DELEGATED_CLIENT_ID.
+# ---------------------------------------------------------------------------
+.PHONY: delegated_login
+delegated_login:
+	@python3 scripts/delegated_login.py
+
+# ---------------------------------------------------------------------------
 # The duckdb submodule must sit on the tag we ship against.
 # ---------------------------------------------------------------------------
 .PHONY: check_pin

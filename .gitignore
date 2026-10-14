@@ -16,6 +16,9 @@ scripts/__pycache__/
 # ---------------------------------------------------------------------------
 .env.sharepoint
 .env.sharepoint.local
+# Delegated (user) refresh token written by scripts/delegated_login.py.
+.env.sharepoint.delegated
+.env.sharepoint.delegated.tmp
 # Azure AD app manifest / client-secret dumps.
 *.client_secret.json
 azure-app-*.json

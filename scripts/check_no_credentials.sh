@@ -13,6 +13,8 @@ while IFS= read -r f; do
 		# `.example` files exist to show the shape (as in duckdb-gdrive); the
 		# value check below still runs over them.
 		*.example) ;;
+		# .env.sharepoint* covers .env.sharepoint.delegated, where
+		# scripts/delegated_login.py writes a user's refresh token.
 		*.pem|*.pfx|*.client_secret.json|azure-app-*.json|.env.sharepoint*)
 			echo "ERROR: credential-shaped file is tracked by git: $f"
 			fail=1
@@ -28,6 +30,24 @@ if git grep -nEI "eyJ[A-Za-z0-9_-]{20,}\." -- 'src/**' 'test/**' 'e2e/**' >/dev/
 	git grep -nEI "eyJ[A-Za-z0-9_-]{20,}\." -- 'src/**' 'test/**' 'e2e/**' || true
 	fail=1
 fi
+
+# An Entra ID refresh token ("0.A..." / "1.A...", several hundred characters)
+# pasted into a tracked file -- e.g. a delegated token copied out of
+# .env.sharepoint.delegated into a test.
+if git grep -nEI "(^|[^A-Za-z0-9_.-])[01]\.A[A-Za-z0-9_-]{200,}" -- 'src/**' 'test/**' 'e2e/**' 'scripts/**' 'docs/**' \
+	'README.md' >/dev/null 2>&1; then
+	echo "ERROR: a refresh-token-shaped string appears in a tracked file:"
+	git grep -nlEI "(^|[^A-Za-z0-9_.-])[01]\.A[A-Za-z0-9_-]{200,}" -- 'src/**' 'test/**' 'e2e/**' 'scripts/**' \
+		'docs/**' 'README.md' || true
+	fail=1
+fi
+for f in $(git ls-files); do
+	case "$f" in *.example) ;; *) continue ;; esac
+	if grep -qE '^SHAREPOINT_USER_REFRESH_TOKEN=.+' "$f"; then
+		echo "ERROR: $f has a value for SHAREPOINT_USER_REFRESH_TOKEN (keep it empty)"
+		fail=1
+	fi
+done
 
 # An example env file must carry placeholders, never a real client secret.
 if git ls-files --error-unmatch .env.sharepoint.example >/dev/null 2>&1 &&

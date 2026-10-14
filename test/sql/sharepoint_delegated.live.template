@@ -1,0 +1,220 @@
+# name: test/sql/sharepoint_delegated.live.template
+# description: Delegated (user) auth round trip against a REAL tenant: a
+#              public-client refresh token (scripts/delegated_login.py) drives
+#              PROVIDER device_code, authorization_code and config secrets
+#              through the shared refresh path, reading and writing files AS
+#              THE USER. NOT run directly -- scripts/run_live_tests.sh
+#              materialises it into the git-ignored test/sql/live/ when
+#              SHAREPOINT_DELEGATED_CLIENT_ID and SHAREPOINT_USER_REFRESH_TOKEN
+#              are set.
+# group: [sharepoint]
+
+require sharepoint
+
+require parquet
+
+require-env SHAREPOINT_USER_REFRESH_TOKEN
+
+# See sharepoint.live.template: no Graph failure may be silently ignored.
+set ignore_error_messages __sharepoint_never_ignore__
+
+# For the PERSISTENT secret at the end; must precede the first secret use.
+statement ok
+SET secret_directory = '__TEST_DIR__/sp_delegated_live_secrets';
+
+# ---------------------------------------------------------------------------
+# PROVIDER device_code with a REFRESH_TOKEN: no prompt -- the stored token is
+# refreshed (public client, no CLIENT_SECRET) and the user's access token used.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE SECRET sp_user (
+    TYPE sharepoint,
+    PROVIDER device_code,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_DELEGATED_CLIENT_ID@',
+    REFRESH_TOKEN '@SHAREPOINT_USER_REFRESH_TOKEN@',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@'
+);
+
+# Redacted. (Asserted on the marker, not by matching the token itself, so a
+# failure report can never echo it.)
+query I
+SELECT secret_string LIKE '%refresh_token=redacted%' FROM duckdb_secrets() WHERE name = 'sp_user';
+----
+true
+
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live_delegated/hello.txt', 'hello as a user'::BLOB);
+
+query I
+SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live_delegated/hello.txt');
+----
+hello as a user
+
+statement ok
+COPY (SELECT range AS n FROM range(1000)) TO 'sharepoint://_duckdb_sharepoint_live_delegated/nums.parquet'
+    (FORMAT parquet);
+
+query II
+SELECT count(*), sum(n) FROM read_parquet('sharepoint://_duckdb_sharepoint_live_delegated/nums.parquet');
+----
+1000	499500
+
+query I
+SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live_delegated/*');
+----
+2
+
+# A forced re-mint mid-session goes through the same refresh path again.
+statement ok
+SET sharepoint_debug_token_max_age_seconds = 61;
+
+query I
+SELECT file_size('sharepoint://_duckdb_sharepoint_live_delegated/hello.txt');
+----
+15
+
+statement ok
+RESET sharepoint_debug_token_max_age_seconds;
+
+# ---------------------------------------------------------------------------
+# The same refresh token through PROVIDER authorization_code (no browser is
+# opened when a refresh token is present) and PROVIDER config without a
+# CLIENT_SECRET.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE SECRET sp_user (
+    TYPE sharepoint,
+    PROVIDER authorization_code,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_DELEGATED_CLIENT_ID@',
+    REFRESH_TOKEN '@SHAREPOINT_USER_REFRESH_TOKEN@',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@'
+);
+
+query I
+SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live_delegated/hello.txt');
+----
+hello as a user
+
+statement ok
+CREATE OR REPLACE SECRET sp_user (
+    TYPE sharepoint,
+    PROVIDER config,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_DELEGATED_CLIENT_ID@',
+    REFRESH_TOKEN '@SHAREPOINT_USER_REFRESH_TOKEN@',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@'
+);
+
+query I
+SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live_delegated/hello.txt');
+----
+hello as a user
+
+# ---------------------------------------------------------------------------
+# A rejected refresh token fails with the delegated fix, not the app-only one.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE SECRET sp_user_bad (
+    TYPE sharepoint,
+    PROVIDER device_code,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_DELEGATED_CLIENT_ID@',
+    REFRESH_TOKEN 'not-a-real-refresh-token',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@',
+    SCOPE 'sharepoint://_duckdb_sharepoint_live_delegated/bad'
+);
+
+statement error
+SELECT file_size('sharepoint://_duckdb_sharepoint_live_delegated/bad/x.txt');
+----
+the refresh token (or code) was rejected
+
+statement ok
+DROP SECRET sp_user_bad;
+
+# ---------------------------------------------------------------------------
+# Teardown.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live_delegated/hello.txt');
+
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live_delegated/nums.parquet');
+
+statement ok
+DROP SECRET sp_user;
+
+# ---------------------------------------------------------------------------
+# Refresh-token rotation. Entra issues a new refresh token on every refresh;
+# the newest is written back into the secret (on disk here), under a stable
+# lineage so the token cache key does not change. Two forced re-mints, then a
+# fresh process must work from what was stored -- never from a superseded or
+# lost token.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE OR REPLACE PERSISTENT SECRET sp_rotate (
+    TYPE sharepoint,
+    PROVIDER device_code,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_DELEGATED_CLIENT_ID@',
+    REFRESH_TOKEN '@SHAREPOINT_USER_REFRESH_TOKEN@',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@',
+    -- The folder above rotate/, which exists: write_blob's parent walk asks
+    -- about it when rotate/ is new, so the secret must cover it.
+    SCOPE 'sharepoint://_duckdb_sharepoint_live_delegated'
+);
+
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live_delegated/rotate/r.txt', 'rotated'::BLOB);
+
+# The smallest cap (61 s; anything at or below the 60 s refresh slack is
+# clamped to it) leaves a token fresh for 1 s, so after a 2 s pause every
+# statement below mints (and rotates) again.
+statement ok
+SET sharepoint_debug_token_max_age_seconds = 61;
+
+statement ok
+CALL sharepoint_reset_stats();
+
+sleep 2 seconds
+
+query I
+SELECT file_size('sharepoint://_duckdb_sharepoint_live_delegated/rotate/r.txt');
+----
+7
+
+sleep 2 seconds
+
+query I
+SELECT file_size('sharepoint://_duckdb_sharepoint_live_delegated/rotate/r.txt');
+----
+7
+
+query I
+SELECT value >= 2 FROM sharepoint_stats() WHERE metric = 'token_request';
+----
+true
+
+# The lineage was written beside the rotated token -- and is never displayed.
+query I
+SELECT secret_string LIKE '%refresh_token_lineage=redacted%' FROM duckdb_secrets() WHERE name = 'sp_rotate';
+----
+true
+
+restart
+
+statement ok
+SET secret_directory = '__TEST_DIR__/sp_delegated_live_secrets';
+
+query I
+SELECT content::VARCHAR FROM read_blob('sharepoint://_duckdb_sharepoint_live_delegated/rotate/r.txt');
+----
+rotated
+
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live_delegated/rotate/r.txt');
+
+statement ok
+DROP PERSISTENT SECRET sp_rotate;

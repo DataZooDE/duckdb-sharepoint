@@ -22,8 +22,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_dotenv() -> None:
-    """Load .env.sharepoint without a dependency. The environment wins."""
-    env_file = REPO_ROOT / ".env.sharepoint"
+    """Load .env.sharepoint (app-only) and .env.sharepoint.delegated (written by
+    scripts/delegated_login.py) without a dependency. The environment wins."""
+    for name in (".env.sharepoint", ".env.sharepoint.delegated"):
+        _load_env_file(REPO_ROOT / name)
+
+
+def _load_env_file(env_file: Path) -> None:
     if not env_file.exists():
         return
     for line in env_file.read_text().splitlines():
@@ -37,7 +42,8 @@ def _load_dotenv() -> None:
 def scrub(text: str) -> str:
     """Remove credential values, bearer tokens and signed URLs from text that
     may end up in a failure report (and so in CI logs)."""
-    for name in ("SHAREPOINT_CLIENT_SECRET", "SHAREPOINT_CLIENT_ID", "SHAREPOINT_TENANT_ID"):
+    for name in ("SHAREPOINT_USER_REFRESH_TOKEN", "SHAREPOINT_CLIENT_SECRET", "SHAREPOINT_DELEGATED_CLIENT_ID",
+                 "SHAREPOINT_CLIENT_ID", "SHAREPOINT_TENANT_ID"):
         value = os.environ.get(name)
         if value:
             text = text.replace(value, f"<{name}>")

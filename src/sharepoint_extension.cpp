@@ -17,6 +17,8 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/function/scalar_function.hpp"
 
+#include <cstdint>
+
 // The version comes from SharepointVersionCString(), not a literal: a copied
 // literal is what left the sibling gdrive's banner announcing "0.1.0".
 const datazoo::BannerInfo SHAREPOINT_BANNER {"sharepoint", duckdb::sharepoint::SharepointVersionCString(),
@@ -132,6 +134,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "TESTING ONLY: treat access tokens as expiring after at most this many seconds (0 = their real "
 	    "lifetime).",
 	    LogicalType::BIGINT, Value::BIGINT(0));
+
+	// PROVIDER device_code blocks the first query until the user signs in on
+	// another device. Bounded by the device code's own life (15 minutes from
+	// Entra ID) and by this; a live test lowers it to prove the wait ends.
+	loader.GetDatabaseInstance().config.AddExtensionOption(
+	    "sharepoint_device_code_timeout_seconds",
+	    "How long PROVIDER device_code waits for the user to finish signing in (default 900, at most 3600; "
+	    "also capped by the device code's own lifetime).",
+	    LogicalType::BIGINT, Value::BIGINT(900), [](ClientContext &, SetScope, Value &parameter) {
+		    const auto v = parameter.GetValue<int64_t>();
+		    if (v < 1 || v > 3600) {
+			    throw InvalidInputException("sharepoint_device_code_timeout_seconds must be between 1 and 3600");
+		    }
+	    });
 
 	sharepoint::RegisterSharepointSecrets(loader);
 

@@ -696,6 +696,86 @@ statement ok
 DROP SECRET sp_bogus;
 
 # ---------------------------------------------------------------------------
+# PROVIDER device_code against the REAL Entra ID endpoints. Nobody is there to
+# sign in, so this proves everything up to the human: the /devicecode request
+# (public client, raw TLS transport), parsing its reply, printing the prompt,
+# and RFC 8628 polling (authorization_pending is kept polling) -- then the
+# bounded wait gives up with a teaching error. The app-only app registration
+# answers /devicecode too (verified 2026-10-14), so no delegated app is needed.
+# ---------------------------------------------------------------------------
+# 12 s against Entra's 5 s interval: room for a slow /devicecode reply and
+# still at least one poll (asserted loosely below, so timing cannot flake it).
+statement ok
+SET sharepoint_device_code_timeout_seconds = 12;
+
+statement ok
+CREATE SECRET sp_devicecode (TYPE sharepoint, PROVIDER device_code, TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_CLIENT_ID@', DRIVE_ID '@SHAREPOINT_DRIVE_ID@',
+    SCOPE 'sharepoint://_duckdb_sharepoint_live/devicecode');
+
+statement ok
+CALL sharepoint_reset_stats();
+
+statement error
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/devicecode/x.txt');
+----
+the device-code sign-in was not completed within 12 seconds
+
+# At least the /devicecode request reached the token host.
+query I
+SELECT value >= 1 FROM sharepoint_stats() WHERE metric = 'token_request';
+----
+true
+
+statement ok
+DROP SECRET sp_devicecode;
+
+# The delegated refresh path (public client: no CLIENT_SECRET is sent) against
+# the real token endpoint: a rejected refresh token gets the delegated fix --
+# sign in again -- not the app-only checklist.
+statement ok
+CREATE SECRET sp_badrefresh (TYPE sharepoint, PROVIDER device_code, TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_CLIENT_ID@', REFRESH_TOKEN 'not-a-real-refresh-token', DRIVE_ID '@SHAREPOINT_DRIVE_ID@',
+    SCOPE 'sharepoint://_duckdb_sharepoint_live/badrefresh');
+
+statement error
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/badrefresh/x.txt');
+----
+the refresh token (or code) was rejected
+
+statement ok
+DROP SECRET sp_badrefresh;
+
+# The recovery the 'rejected' message teaches -- recreate the secret without
+# REFRESH_TOKEN -- must really start a new sign-in on the same connection, not
+# reuse anything remembered from the old secret.
+statement ok
+CREATE SECRET sp_recover (TYPE sharepoint, PROVIDER device_code, TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_CLIENT_ID@', REFRESH_TOKEN 'not-a-real-refresh-token', DRIVE_ID '@SHAREPOINT_DRIVE_ID@',
+    SCOPE 'sharepoint://_duckdb_sharepoint_live/recover');
+
+statement error
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/recover/x.txt');
+----
+the refresh token (or code) was rejected
+
+statement ok
+CREATE OR REPLACE SECRET sp_recover (TYPE sharepoint, PROVIDER device_code, TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_CLIENT_ID@', DRIVE_ID '@SHAREPOINT_DRIVE_ID@',
+    SCOPE 'sharepoint://_duckdb_sharepoint_live/recover');
+
+statement error
+SELECT file_size('sharepoint://_duckdb_sharepoint_live/recover/x.txt');
+----
+the device-code sign-in was not completed within 12 seconds
+
+statement ok
+DROP SECRET sp_recover;
+
+statement ok
+RESET sharepoint_device_code_timeout_seconds;
+
+# ---------------------------------------------------------------------------
 # Best-effort teardown of the leaf files. Empty fixture folders may remain; the
 # next run replaces every file in place, so a lingering tree is harmless.
 # ---------------------------------------------------------------------------

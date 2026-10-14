@@ -1,0 +1,40 @@
+# name: test/sql/sharepoint_delegated_persist.test
+# description: a PERSISTENT delegated secret stores its refresh token on disk
+#              (so a restart needs no new sign-in) and never displays it.
+# group: [sharepoint]
+
+require sharepoint
+
+# Must come before the secret manager is first used.
+statement ok
+SET secret_directory = '__TEST_DIR__/sp_delegated_secrets';
+
+statement ok
+CREATE PERSISTENT SECRET sp_persist (
+    TYPE sharepoint,
+    PROVIDER device_code,
+    TENANT_ID '00000000-0000-0000-0000-000000000000',
+    CLIENT_ID '11111111-1111-1111-1111-111111111111',
+    REFRESH_TOKEN 'persisted-not-a-real-refresh-token',
+    DRIVE_ID 'b!placeholder'
+);
+
+query I
+SELECT contains(hex(content), hex('persisted-not-a-real-refresh-token'::BLOB))
+FROM read_blob('__TEST_DIR__/sp_delegated_secrets/sp_persist.duckdb_secret');
+----
+true
+
+restart
+
+statement ok
+SET secret_directory = '__TEST_DIR__/sp_delegated_secrets';
+
+query III
+SELECT persistent, provider, secret_string NOT LIKE '%persisted-not-a-real-refresh-token%'
+FROM duckdb_secrets() WHERE name = 'sp_persist';
+----
+true	device_code	true
+
+statement ok
+DROP PERSISTENT SECRET sp_persist;
