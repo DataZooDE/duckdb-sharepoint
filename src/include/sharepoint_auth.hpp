@@ -63,7 +63,11 @@ struct AuthContext {
 //!   * PROVIDER client_credentials -> POST {login}/{tenant}/oauth2/v2.0/token
 //!     with grant_type=client_credentials & scope={graph_scope}.
 //!   * PROVIDER config with ACCESS_TOKEN -> used as-is (never refreshed).
-//!   * PROVIDER config with REFRESH_TOKEN -> grant_type=refresh_token.
+//!   * PROVIDER config with REFRESH_TOKEN -> grant_type=refresh_token
+//!     (client_secret only when the secret has one).
+//!   * PROVIDER device_code / authorization_code -> the delegated sign-in on
+//!     first use (sharepoint_delegated_flow.hpp), the refresh token stored
+//!     back into the secret, then grant_type=refresh_token as a public client.
 AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path);
 
 //! True if any `sharepoint` secret exists at all (whatever its scope). Lets

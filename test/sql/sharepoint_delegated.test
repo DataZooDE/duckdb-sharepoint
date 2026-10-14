@@ -1,0 +1,161 @@
+# name: test/sql/sharepoint_delegated.test
+# description: delegated (user) auth providers -- device_code and
+#              authorization_code -- created, validated and redacted with no
+#              network call. The flows themselves are proven live
+#              (test/sql/sharepoint_delegated.live.template, e2e/).
+# group: [sharepoint]
+
+require sharepoint
+
+# ---------------------------------------------------------------------------
+# PROVIDER device_code: a public client. TENANT_ID + CLIENT_ID, no secret.
+# CREATE SECRET makes no network call; the sign-in runs at first use.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE SECRET sp_dc (
+    TYPE sharepoint,
+    PROVIDER device_code,
+    TENANT_ID '00000000-0000-0000-0000-000000000000',
+    CLIENT_ID '11111111-1111-1111-1111-111111111111',
+    DRIVE_ID 'b!placeholder'
+);
+
+query II
+SELECT provider, secret_string LIKE '%client_id=11111111-1111-1111-1111-111111111111%'
+FROM duckdb_secrets() WHERE name = 'sp_dc';
+----
+device_code	true
+
+statement error
+CREATE OR REPLACE SECRET sp_dc (TYPE sharepoint, PROVIDER device_code, CLIENT_ID 'x', DRIVE_ID 'b!x');
+----
+needs TENANT_ID and CLIENT_ID
+
+statement error
+CREATE OR REPLACE SECRET sp_dc (TYPE sharepoint, PROVIDER device_code, TENANT_ID 't', DRIVE_ID 'b!x');
+----
+needs TENANT_ID and CLIENT_ID
+
+# A public client never holds a client secret: the option does not exist.
+statement error
+CREATE OR REPLACE SECRET sp_dc (TYPE sharepoint, PROVIDER device_code, TENANT_ID 't', CLIENT_ID 'c',
+    CLIENT_SECRET 'nope', DRIVE_ID 'b!x');
+----
+Unknown parameter 'client_secret'
+
+# A refresh token from an earlier sign-in skips the interactive flow, and is
+# never displayed.
+statement ok
+CREATE OR REPLACE SECRET sp_dc (
+    TYPE sharepoint,
+    PROVIDER device_code,
+    TENANT_ID '00000000-0000-0000-0000-000000000000',
+    CLIENT_ID '11111111-1111-1111-1111-111111111111',
+    REFRESH_TOKEN 'not-a-real-refresh-token',
+    DRIVE_ID 'b!placeholder'
+);
+
+query II
+SELECT secret_string NOT LIKE '%not-a-real-refresh-token%', secret_string LIKE '%refresh_token=redacted%'
+FROM duckdb_secrets() WHERE name = 'sp_dc';
+----
+true	true
+
+# Endpoint and tenant checks apply before anything is sent: the device-code
+# request would carry the client id to the login host.
+statement ok
+SET sharepoint_login_endpoint = 'https://login.microsoftonline.com.evil.example';
+
+statement error
+SELECT * FROM glob('sharepoint://anything/*');
+----
+is not a Microsoft Entra ID login host
+
+statement ok
+RESET sharepoint_login_endpoint;
+
+statement ok
+CREATE OR REPLACE SECRET sp_dc (TYPE sharepoint, PROVIDER device_code, TENANT_ID '../evil?x=',
+    CLIENT_ID 'c', DRIVE_ID 'b!x');
+
+statement error
+SELECT * FROM glob('sharepoint://anything/*');
+----
+TENANT_ID must be a tenant GUID or domain
+
+statement ok
+DROP SECRET sp_dc;
+
+# The device-code wait is bounded by a setting (default: the code's own
+# 15-minute life); it must be positive.
+query I
+SELECT current_setting('sharepoint_device_code_timeout_seconds');
+----
+900
+
+statement error
+SET sharepoint_device_code_timeout_seconds = 0;
+----
+must be between
+
+# ---------------------------------------------------------------------------
+# PROVIDER authorization_code: browser + localhost redirect, public client.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE SECRET sp_ac (
+    TYPE sharepoint,
+    PROVIDER authorization_code,
+    TENANT_ID 'contoso.onmicrosoft.com',
+    CLIENT_ID '11111111-1111-1111-1111-111111111111',
+    REDIRECT_PORT '53682',
+    REFRESH_TOKEN 'not-a-real-refresh-token',
+    SITE_ID 'contoso.sharepoint.com,1,2'
+);
+
+query III
+SELECT provider, secret_string NOT LIKE '%not-a-real-refresh-token%', secret_string LIKE '%redirect_port=53682%'
+FROM duckdb_secrets() WHERE name = 'sp_ac';
+----
+authorization_code	true	true
+
+statement error
+CREATE OR REPLACE SECRET sp_ac (TYPE sharepoint, PROVIDER authorization_code, TENANT_ID 't', CLIENT_ID 'c',
+    REDIRECT_PORT '80', DRIVE_ID 'b!x');
+----
+REDIRECT_PORT must be a port between 1024 and 65535
+
+statement error
+CREATE OR REPLACE SECRET sp_ac (TYPE sharepoint, PROVIDER authorization_code, TENANT_ID 't', DRIVE_ID 'b!x');
+----
+needs TENANT_ID and CLIENT_ID
+
+statement ok
+DROP SECRET sp_ac;
+
+# ---------------------------------------------------------------------------
+# PROVIDER config with a delegated (public-client) refresh token: CLIENT_SECRET
+# is optional -- the token from scripts/delegated_login.py refreshes without one.
+# ---------------------------------------------------------------------------
+statement ok
+CREATE SECRET sp_cfg (
+    TYPE sharepoint,
+    PROVIDER config,
+    TENANT_ID '00000000-0000-0000-0000-000000000000',
+    CLIENT_ID '11111111-1111-1111-1111-111111111111',
+    REFRESH_TOKEN 'not-a-real-refresh-token',
+    DRIVE_ID 'b!placeholder'
+);
+
+query I
+SELECT secret_string NOT LIKE '%not-a-real-refresh-token%' FROM duckdb_secrets() WHERE name = 'sp_cfg';
+----
+true
+
+# Still refused without TENANT_ID or CLIENT_ID: there is nothing to refresh against.
+statement error
+CREATE OR REPLACE SECRET sp_cfg (TYPE sharepoint, PROVIDER config, CLIENT_ID 'c', REFRESH_TOKEN 'r');
+----
+refreshing needs TENANT_ID and CLIENT_ID
+
+statement ok
+DROP SECRET sp_cfg;

@@ -11,6 +11,8 @@
 #include "sharepoint_token_policy.hpp"
 #include "sharepoint_client.hpp"
 #include "sharepoint_counters.hpp"
+#include "sharepoint_delegated.hpp"
+#include "sharepoint_delegated_flow.hpp"
 #include "sharepoint_errors.hpp"
 #include "sharepoint_identity.hpp"
 #include "sharepoint_secret.hpp"
@@ -32,6 +34,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 
 namespace duckdb {
 namespace sharepoint {
@@ -96,8 +99,11 @@ duckdb_httplib_openssl::Client MakeClient(const string &base_url) {
 // POST an application/x-www-form-urlencoded body to the Azure AD token
 // endpoint and return the parsed JSON, throwing a classified DuckDB exception
 // on any non-2xx.
+//! Builds the exception text for a non-2xx token reply (status, body).
+using TokenErrorFormatter = std::function<string(int, const string &)>;
+
 picojson::object PostToken(const string &login_endpoint, const string &tenant,
-                           const duckdb_httplib_openssl::Params &params) {
+                           const duckdb_httplib_openssl::Params &params, const TokenErrorFormatter &on_error) {
 	IncrementCounter(Counter::TOKEN_REQUEST);
 	auto cli = MakeClient(login_endpoint);
 	string path = "/" + tenant + "/oauth2/v2.0/token";
@@ -116,6 +122,9 @@ picojson::object PostToken(const string &login_endpoint, const string &tenant,
 	if (!res) {
 		throw IOException("sharepoint: token request to %s%s failed at the transport layer",
 		                  login_endpoint.c_str(), path.c_str());
+	}
+	if ((res->status < 200 || res->status >= 300) && on_error) {
+		throw IOException(on_error(res->status, res->body));
 	}
 	if (res->status < 200 || res->status >= 300) {
 		// Entra ID returns { "error": "invalid_client", "error_codes": [7000215],
@@ -152,6 +161,7 @@ picojson::object PostToken(const string &login_endpoint, const string &tenant,
 //! What it takes to mint a token for one credential set, and to cache it.
 struct MintRequest {
 	string credential_fp;
+	string secret_name;
 	string login_endpoint;
 	string tenant;
 	string provider;
@@ -169,16 +179,28 @@ struct MintRequest {
 //! token endpoint are retried with the same backoff as Graph calls.
 string MintToken(const MintRequest &req) {
 	duckdb_httplib_openssl::Params params;
-	params.emplace("client_id", req.client_id);
-	params.emplace("client_secret", req.client_secret);
-	params.emplace("scope", req.scope);
-	if (req.provider == "config") {
-		params.emplace("grant_type", "refresh_token");
-		params.emplace("refresh_token", req.refresh_token);
+	TokenErrorFormatter on_error;
+	if (!req.refresh_token.empty()) {
+		// PROVIDER config, device_code and authorization_code: the refresh
+		// grant. A public client (no CLIENT_SECRET) sends none.
+		for (auto &kv : RefreshTokenRequest(req.client_id, req.client_secret, req.refresh_token, req.scope)) {
+			params.emplace(kv.first, kv.second);
+		}
+		if (req.provider != "config" || req.client_secret.empty()) {
+			// A delegated token: say what fixes a delegated failure (consent,
+			// public client flows, sign in again), not the app-only checklist.
+			const string name = req.secret_name, provider = req.provider;
+			on_error = [name, provider](int status, const string &body) {
+				return DelegatedErrorMessage(ParseTokenReply(status, body), name, provider);
+			};
+		}
 	} else {
+		params.emplace("client_id", req.client_id);
+		params.emplace("client_secret", req.client_secret);
+		params.emplace("scope", req.scope);
 		params.emplace("grant_type", "client_credentials");
 	}
-	auto obj = PostToken(req.login_endpoint, req.tenant, params);
+	auto obj = PostToken(req.login_endpoint, req.tenant, params, on_error);
 	auto at = obj.find("access_token");
 	if (at == obj.end() || !at->second.is<string>()) {
 		throw IOException("sharepoint: token endpoint returned no access_token");
@@ -382,6 +404,95 @@ string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint
 	return id.get<string>();
 }
 
+//! Sign-ins already completed in this process, keyed per connection and
+//! secret (see SignIn). Holds refresh tokens; never displayed.
+mutex g_signin_lock;
+unordered_map<string, string> g_signed_in;
+
+//! Run the delegated sign-in for a secret that has no refresh token yet, store
+//! the refresh token back into the secret, and seed the token cache with the
+//! access token it came with. Returns the refresh token.
+//!
+//! Serialised per (connection, secret): a multi-file scan opens files on
+//! several threads at once, and each must not print its own device code. The
+//! first thread signs in; the rest find its result here. Keyed by the
+//! connection as well as the secret's configuration, so a same-named secret in
+//! ANOTHER connection (which may be another user's) never inherits it.
+string SignIn(optional_ptr<FileOpener> opener, const SecretMatch &match, const string &path, const string &provider,
+              const string &login_endpoint, const string &tenant, const string &client_id, const string &scope,
+              const std::function<string(const string &)> &fingerprint_for) {
+	const string secret_name = match.GetSecret().GetName();
+	auto client_context = FileOpener::TryGetClientContext(opener);
+	if (!client_context) {
+		throw IOException("sharepoint secret '%s' (PROVIDER %s) has no refresh token yet, and '%s' was opened "
+		                  "without a client connection (e.g. by ATTACH), so it cannot sign in or store the result. "
+		                  "Sign in first with any query on a sharepoint:// path from a regular connection, or pass "
+		                  "REFRESH_TOKEN.",
+		                  secret_name, provider, path);
+	}
+	const string key =
+	    Fingerprint({"signin", std::to_string(reinterpret_cast<uintptr_t>(&DatabaseInstance::GetDatabase(*client_context))),
+	                 std::to_string(client_context->GetConnectionId()), secret_name, provider, tenant, client_id,
+	                 scope, login_endpoint});
+	// One sign-in at a time per key (it can wait minutes for a human); other
+	// secrets and connections are not held up.
+	auto signin_lock = MintLockFor(key);
+	lock_guard<mutex> signin_guard(*signin_lock);
+	{
+		lock_guard<mutex> guard(g_signin_lock);
+		auto done = g_signed_in.find(key);
+		if (done != g_signed_in.end()) {
+			return done->second;
+		}
+	}
+
+	DelegatedFlowConfig cfg;
+	cfg.secret_name = secret_name;
+	cfg.provider = provider;
+	cfg.login_endpoint = login_endpoint;
+	cfg.tenant = tenant;
+	cfg.client_id = client_id;
+	cfg.scope = scope;
+	DelegatedTokens tokens;
+	if (provider == "device_code") {
+		Value timeout;
+		if (FileOpener::TryGetCurrentSetting(opener, "sharepoint_device_code_timeout_seconds", timeout) &&
+		    !timeout.IsNull()) {
+			cfg.timeout_seconds = timeout.GetValue<int64_t>();
+		}
+		ClientContext &ctx = *client_context;
+		tokens = RunDeviceCodeFlow(cfg, [&ctx]() { return ctx.interrupted.load(); });
+	} else {
+		const auto &kv = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
+		int port = 8020;
+		ParseRedirectPort(SecretField(kv, "redirect_port"), port); // validated at CREATE SECRET
+		cfg.redirect_port = port;
+		tokens = RunAuthorizationCodeFlow(cfg);
+	}
+	if (tokens.refresh_token.empty()) {
+		throw IOException("sharepoint secret '%s' (PROVIDER %s): the sign-in succeeded but Entra ID issued no "
+		                  "refresh token. GRAPH_SCOPE must include offline_access, and the app must have it "
+		                  "consented.",
+		                  secret_name, provider);
+	}
+
+	// Store the refresh token in the secret -- on disk for a PERSISTENT one --
+	// so this is the last prompt, and cache the access token it came with so
+	// the query that triggered the sign-in does not mint a second one.
+	PersistRefreshToken(*client_context, match, tokens.refresh_token);
+	{
+		lock_guard<mutex> guard(g_signin_lock);
+		g_signed_in[key] = tokens.refresh_token;
+	}
+	{
+		lock_guard<mutex> token_guard(g_token_lock);
+		const auto now = std::chrono::system_clock::now();
+		g_tokens[fingerprint_for(tokens.refresh_token)] =
+		    CachedToken {tokens.access_token, now + std::chrono::seconds(tokens.expires_in), now};
+	}
+	return tokens.refresh_token;
+}
+
 } // namespace
 
 AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) {
@@ -420,25 +531,36 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 	}
 
 	const string provider = secret.GetProvider();
+	const bool delegated = provider == "device_code" || provider == "authorization_code";
 	const string tenant = SecretField(secret, "tenant_id");
 	const string client_id = SecretField(secret, "client_id");
-	const string client_secret = SecretField(secret, "client_secret");
-	const string refresh_token = SecretField(secret, "refresh_token");
+	// Never read for a delegated provider: a public client has no secret.
+	const string client_secret = delegated ? string() : SecretField(secret, "client_secret");
+	string refresh_token = SecretField(secret, "refresh_token");
 	const string configured_scope = SecretField(secret, "graph_scope");
-	const string scope = configured_scope.empty() ? DefaultGraphScope(graph_endpoint) : configured_scope;
+	// App-only tokens use "<graph>/.default"; a delegated token names its
+	// permissions plus offline_access (or Entra issues no refresh token). A
+	// config refresh token without CLIENT_SECRET is a public-client (delegated)
+	// one too.
+	const bool delegated_scope = delegated || (provider == "config" && client_secret.empty());
+	const string scope = !configured_scope.empty() ? configured_scope
+	                     : delegated_scope         ? DelegatedGraphScope(graph_endpoint)
+	                                               : DefaultGraphScope(graph_endpoint);
 
 	// A config secret with ONLY an ACCESS_TOKEN is used as-is -- the caller owns
 	// its lifetime. With a REFRESH_TOKEN as well, the refresh grant is used, so
 	// the secret keeps working past the pasted token's expiry.
-	const bool can_refresh =
-	    !refresh_token.empty() && !tenant.empty() && !client_id.empty() && !client_secret.empty();
+	const bool can_refresh = !refresh_token.empty() && !tenant.empty() && !client_id.empty();
 	const string static_token = (provider == "config" && !can_refresh) ? SecretField(secret, "access_token") : string();
 
 	// Everything that changes which token comes back -- and where it may be
 	// sent. Two secrets (or one name recreated) share a token only if all of
-	// this is identical.
-	const string credential_fp = Fingerprint({provider, tenant, client_id, client_secret, refresh_token, scope,
-	                                          login_endpoint, static_token});
+	// this is identical. For a delegated secret the refresh token IS the user's
+	// identity: two users' secrets of the same name never share a token.
+	auto fingerprint_for = [&](const string &rt) {
+		return Fingerprint({provider, tenant, client_id, client_secret, rt, scope, login_endpoint, static_token});
+	};
+	string credential_fp = fingerprint_for(refresh_token);
 
 	shared_ptr<TokenSource> tokens;
 	if (!static_token.empty()) {
@@ -448,8 +570,16 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 			throw InvalidInputException("sharepoint: TENANT_ID must be a tenant GUID or domain (letters, digits, "
 			                            "'-', '.')");
 		}
+		if (delegated && refresh_token.empty()) {
+			// No refresh token yet: the interactive sign-in, once. Afterwards the
+			// refresh token lives in the secret and this branch is not taken.
+			refresh_token = SignIn(opener, match, path, provider, login_endpoint, tenant, client_id, scope,
+			                       fingerprint_for);
+			credential_fp = fingerprint_for(refresh_token);
+		}
 		MintRequest req;
 		req.credential_fp = credential_fp;
+		req.secret_name = secret.GetName();
 		req.login_endpoint = login_endpoint;
 		req.tenant = tenant;
 		req.provider = provider;

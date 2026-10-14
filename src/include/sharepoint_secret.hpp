@@ -19,10 +19,11 @@ constexpr const char *kSecretTypeName = "sharepoint";
 //!       application permission + admin consent).
 //!   PROVIDER config -- paste a pre-obtained ACCESS_TOKEN (and optionally a
 //!       REFRESH_TOKEN + CLIENT_ID/CLIENT_SECRET/TENANT_ID to refresh it).
-//!
-//! The interactive delegated flows (authorization_code / device_code) are a
-//! documented follow-up: they need the datazoo-oauth2 submodule the sibling
-//! gdrive uses, which is not wired in here yet.
+//!   PROVIDER device_code -- delegated (user) auth for headless shells: prints
+//!       a URL + code at first use (RFC 8628), public client, no secret.
+//!   PROVIDER authorization_code -- delegated auth via the browser and a
+//!       localhost redirect (PKCE), public client, no secret.
+//! Both store the resulting refresh token back into the secret.
 void RegisterSharepointSecrets(ExtensionLoader &loader);
 
 } // namespace sharepoint

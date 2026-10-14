@@ -96,9 +96,11 @@ SELECT remove_file('sharepoint://notes/readme.md');   -- true, then false
 | provider | use | fields |
 |---|---|---|
 | `client_credentials` *(default)* | headless daemon | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` |
-| `config` | paste a pre-obtained token | `ACCESS_TOKEN` *(or `REFRESH_TOKEN` + `TENANT_ID`/`CLIENT_ID`/`CLIENT_SECRET`)* |
+| `config` | paste a pre-obtained token | `ACCESS_TOKEN` *(or `REFRESH_TOKEN` + `TENANT_ID`/`CLIENT_ID`, + `CLIENT_SECRET` for a confidential client)* |
+| `device_code` | **as a user**, headless shells | `TENANT_ID`, `CLIENT_ID` *(optional `REFRESH_TOKEN`)* |
+| `authorization_code` | **as a user**, browser on this machine | `TENANT_ID`, `CLIENT_ID` *(optional `REFRESH_TOKEN`, `REDIRECT_PORT`, default 8020)* |
 
-Common to both: `DRIVE_ID` **or** `SITE_ID` (the drive the paths hang off;
+Common to all: `DRIVE_ID` **or** `SITE_ID` (the drive the paths hang off;
 a `SITE_ID` is resolved to the site's default library once and cached), and an
 optional `GRAPH_SCOPE` (defaults to `<graph endpoint>/.default`, i.e. the right
 cloud). Several secrets can coexist; DuckDB picks the one whose `SCOPE` path
@@ -107,8 +109,31 @@ between two drives are refused rather than silently landing in one of them).
 
 Tokens are cached per **fingerprint of the credentials** (never per secret
 name), so a secret recreated under the same name with different credentials
-authenticates afresh. Interactive delegated flows (`authorization_code` /
-`device_code`) are a planned follow-up.
+authenticates afresh.
+
+### Delegated (user) auth
+
+`device_code` and `authorization_code` act **as the signed-in user** (files are
+authored by them, and they see only what they may). Both are public clients —
+no client secret. Register an Entra app with *Allow public client flows*
+enabled (and, for `authorization_code`, an `http://localhost` *Mobile and
+desktop applications* redirect), with the **delegated** permissions
+`Files.ReadWrite.All`, `Sites.ReadWrite.All` and `offline_access` consented.
+
+```sql
+CREATE PERSISTENT SECRET sp_me (TYPE sharepoint, PROVIDER device_code,
+    TENANT_ID 'contoso.onmicrosoft.com', CLIENT_ID '...', DRIVE_ID 'b!...');
+SELECT * FROM read_csv('sharepoint://Shared/report.csv');
+-- sharepoint: to sign in, open https://login.microsoft.com/device and enter the code ABCD1234 (valid for 15 minutes)
+```
+
+The sign-in runs once, on first use; the refresh token is then stored in the
+secret (on disk for a `PERSISTENT` one, redacted in `duckdb_secrets()`) and
+refreshed silently from then on. `sharepoint_device_code_timeout_seconds`
+bounds the wait. Pass `REFRESH_TOKEN` to skip the sign-in entirely, e.g. with
+a token from `scripts/delegated_login.py` (`make delegated_login`), which runs
+the device-code flow and writes the token to the git-ignored
+`.env.sharepoint.delegated` — never to the terminal.
 
 > The option is `GRAPH_SCOPE`, **not** `SCOPE`: DuckDB's `CREATE SECRET` grammar
 > reserves `SCOPE` for the secret's path-matching prefix list, so an OAuth scope
@@ -123,6 +148,7 @@ authenticates afresh. Interactive delegated flows (`authorization_code` /
 | `sharepoint_upload_chunk_bytes` | 10 MiB | Upload chunk size — and the most memory one file being written holds. Files up to this size upload in one PUT on close; larger ones stream through a resumable upload session, one chunk at a time, as they are written (a multiple of 320 KiB, below 60 MiB). `sharepoint_stats()` reports `upload_chunk`, `upload_commit`, `upload_abort` and the high-water mark `upload_buffer_peak`. |
 | `sharepoint_permanent_delete` | `false` | `remove_file` sends items to the site's recycle bin unless this is set. |
 | `sharepoint_immutable_prefixes` | *(empty)* | Comma-separated `sharepoint://` prefixes whose files are **never rewritten in place** (e.g. a DuckLake `DATA_PATH`). Their metadata is remembered, saving a Graph call per open. **Declaring a prefix whose files change causes stale reads.** |
+| `sharepoint_device_code_timeout_seconds` | 900 | How long `PROVIDER device_code` waits for the user to sign in (1–3600; also capped by the code's own lifetime). |
 | `sharepoint_graph_endpoint` / `sharepoint_login_endpoint` | global cloud | National clouds: `https://graph.microsoft.us` / `https://login.microsoftonline.us` (GCC High), `https://dod-graph.microsoft.us`, or the China cloud. Only these Microsoft hosts are accepted, so credentials cannot be redirected elsewhere. |
 | `sharepoint_telemetry_enabled` | `true` | Anonymous usage telemetry, shared with the sibling DataZoo extensions. `false` stops it for the rest of the session; the one-time load event is sent before any setting can exist (DuckDB rejects a setting for an extension that is not loaded yet), so to suppress that too set the environment variable `DATAZOO_DISABLE_TELEMETRY=1`. |
 

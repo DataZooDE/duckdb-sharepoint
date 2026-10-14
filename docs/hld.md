@@ -63,7 +63,68 @@ and the move same-drive check key on a fingerprint of credentials + Graph cloud
 ATTACHed database re-mints before expiry (and once on an unexpected 401). The
 Graph and login endpoints are session settings, so only Microsoft cloud hosts
 over https are accepted. A `config` secret with a bare `ACCESS_TOKEN` is used
-as-is; with a `REFRESH_TOKEN` it uses the `refresh_token` grant.
+as-is; with a `REFRESH_TOKEN` it uses the `refresh_token` grant
+(`CLIENT_SECRET` optional — a public-client token refreshes without one).
+
+### 5.1 Delegated (user) auth — `device_code` / `authorization_code`
+
+Both providers are **public clients** of the Microsoft identity platform v2: an
+Entra app with *Allow public client flows* enabled (device code) and/or an
+`http://localhost` *Mobile and desktop applications* redirect (authorization
+code; Entra ignores the port on a localhost redirect), with the delegated
+`Files.ReadWrite.All`, `Sites.ReadWrite.All` and `offline_access` permissions
+consented. There is no `CLIENT_SECRET` option. The scope defaults to
+`<graph>/Files.ReadWrite.All <graph>/Sites.ReadWrite.All offline_access` for
+the configured Graph cloud (`GRAPH_SCOPE` overrides; `offline_access` is what
+makes Entra issue a refresh token).
+
+```
+device_code         POST {login}/{tenant}/oauth2/v2.0/devicecode  client_id & scope
+                    -> print ONE line: verification_uri + user_code (stderr)
+                    POST .../token  grant_type=urn:ietf:params:oauth:grant-type:device_code
+                    every `interval` s (5 if absent; +5 on slow_down -- RFC 8628),
+                    until success / expired_token / declined / sharepoint_device_code_timeout_seconds
+authorization_code  PKCE S256 + state, browser, loopback server on REDIRECT_PORT (8020)
+                    POST .../token  grant_type=authorization_code & code_verifier
+```
+
+Like gdrive, `CREATE SECRET` only stores configuration; the sign-in runs at
+**first use** (so SQL never blocks at creation and creation is testable
+offline). It needs a client connection (it writes the result back); an ATTACH
+opener without one gets a teaching error. Afterwards the **refresh token is
+written back into the secret** through the secret manager (on disk for a
+`PERSISTENT` secret, redacted in `duckdb_secrets()`), and the access token is
+seeded into the token cache; only the refresh token is persisted, never a
+bearer token. From then on the secret is an ordinary refresh-token secret:
+`MintingTokenSource` → `MintToken` → `grant_type=refresh_token` with no client
+secret, exactly the `config` path. `REFRESH_TOKEN` can be passed at creation to
+skip the sign-in (that is how the live suite and CI drive it).
+
+Concurrency: a multi-file scan opens files on several threads; the sign-in is
+serialised per (database, connection, secret configuration), so one device
+code is printed, and a same-named secret in another connection never inherits
+it. The token-cache fingerprint includes the refresh token, so two users'
+secrets of one name never share an access token.
+
+Transport: the `/devicecode` and code-redemption POSTs go through the raw TLS
+transport (`sharepoint_preauth.cpp`: one deadline, SNI + certificate-hostname
+verification armed or fail closed, bounded body). The refresh grant uses the
+existing `PostToken` (httplib, no redirects) shared with client credentials.
+
+Reuse: `datazoo-oauth2` is a submodule pinned at the same commit as gdrive
+(`91c18f9`). Its loopback server, browser launcher, PKCE/state generators and
+`BuildAuthorizationUrlPure` are used as-is; its `OAuth2FlowV2::ExecuteFlow` is
+not, because it redeems the code over its own httplib client (outside the
+pre-auth transport rules) and it has no device-code grant — RFC 8628 is not in
+the library. The pure parts (request bodies, reply classification, polling
+interval, messages) are `sharepoint_delegated.cpp`, covered by Catch2.
+
+Errors are classified from Entra's `error` + first `error_codes` entry, never
+the description: `authorization_pending`/`slow_down` keep polling;
+`expired_token`, `authorization_declined`/`access_denied`, AADSTS65001
+(consent), AADSTS7000218 (public client flows disabled), `invalid_grant`
+(refresh token expired/revoked → sign in again), `invalid_client`/`invalid_scope`
+each get a message naming the fix.
 
 ## 6. Read / write / mutate (`sharepoint_client.*`, `sharepoint_filesystem.*`)
 
@@ -160,7 +221,16 @@ as-is; with a `REFRESH_TOKEN` it uses the `refresh_token` grant.
      the list to a never-matching sentinel (`set ignore_error_messages
      __sharepoint_never_ignore__`) so failures fail.
 6. **`authorization_code` / `device_code`** delegated providers via the
-   `datazoo-oauth2` submodule. *Still open.*
+   `datazoo-oauth2` submodule. **Implemented (2026-10-14), §5.1.** Proven live
+   so far: the real `/devicecode` request + RFC 8628 polling and the delegated
+   refresh-error path (app-only app registration). *Open:* the end-to-end user
+   round trip (`sharepoint_delegated.live.template`, `e2e/tests/test_delegated.py`)
+   needs the `duckdb-sharepoint-delegated` app and a refresh token from
+   `scripts/delegated_login.py`; an interactive `authorization_code` sign-in
+   has only been exercised up to the browser launch. *Follow-up:* Entra rotates
+   the refresh token on every refresh; the rotated one is not written back
+   (the stored one stays valid until its own expiry / 90-day inactivity), so a
+   secret unused for 90 days needs a new sign-in.
 6b. **DNS is not bounded by the pre-auth transport's deadline.** Connect,
    handshake, send and receive are; `getaddrinfo` inside `BIO_do_connect`
    blocks for the OS resolver timeout. Bounding it needs a resolver thread.
@@ -225,6 +295,17 @@ each guarded by a test so it is not rediscovered:
   { }`, spaces, non-ASCII) round-trips and is in the live suite.
 - **DuckDB 1.5's Parquet reader calls `GetLastModifiedTime`**; it is served from
   `lastModifiedDateTime` (RFC 3339).
+- **`/devicecode` answers for a confidential app too** (2026-10-14): the
+  app-only registration gets a code (`verification_uri`
+  `https://login.microsoft.com/device`, `expires_in` 900, `interval` 5, numbers
+  as JSON integers) and polling returns `authorization_pending` (AADSTS70016).
+  That is what lets the live suite prove the device-code path without a human.
+  A malformed refresh token is `invalid_grant` AADSTS9002313; a malformed device
+  code `invalid_grant` AADSTS7000014.
+- **App-only writes are attributed to a pseudo-user "SharePoint-App"**
+  (`lastModifiedBy.user.displayName`), next to `application: Microsoft Graph`.
+  "Has a `user`" therefore does not prove a delegated write; the e2e test
+  checks the name.
 
 Found while building streaming writes (2026-10-14):
 

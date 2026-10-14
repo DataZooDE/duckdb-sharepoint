@@ -56,6 +56,19 @@ if(NOT EMSCRIPTEN)
 endif()
 
 # ---------------------------------------------------------------------------
+# datazoo-oauth2 -- the shared, provider-agnostic OAuth2 stack the sibling
+# duckdb-gdrive uses (PKCE, the loopback redirect server, browser launch).
+# PROVIDER authorization_code builds on it; see docs/hld.md section 5.
+#
+# Pinned by commit, not tracked by branch: each consumer upgrades on its own
+# schedule. Native only, like posthog-telemetry: the loopback server and the
+# browser launcher have no meaning under emscripten.
+# ---------------------------------------------------------------------------
+if(NOT EMSCRIPTEN)
+    add_subdirectory(datazoo-oauth2)
+endif()
+
+# ---------------------------------------------------------------------------
 # Pure-logic sources: no `#include "duckdb.hpp"`, no I/O. Compiled into BOTH
 # the extension and the Catch2 unit-test binary. Because they do no I/O there
 # is nothing to mock.
@@ -71,6 +84,7 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_identity.cpp
     src/sharepoint_counters.cpp
     src/sharepoint_token_policy.cpp
+    src/sharepoint_delegated.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -81,6 +95,7 @@ file(GLOB DUCKDB_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_extension.cpp
     src/sharepoint_secret.cpp
     src/sharepoint_auth.cpp
+    src/sharepoint_delegated_flow.cpp
     src/sharepoint_client.cpp
     src/sharepoint_preauth.cpp
     src/sharepoint_stats.cpp
@@ -99,8 +114,8 @@ target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
 target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto)
 if(NOT EMSCRIPTEN)
-  target_link_libraries(${EXTENSION_NAME} posthog_telemetry)
-  target_link_libraries(${LOADABLE_EXTENSION_NAME} posthog_telemetry)
+  target_link_libraries(${EXTENSION_NAME} posthog_telemetry datazoo_oauth2)
+  target_link_libraries(${LOADABLE_EXTENSION_NAME} posthog_telemetry datazoo_oauth2)
 endif()
 
 install(
