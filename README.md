@@ -217,6 +217,16 @@ Live tests read `SHAREPOINT_TENANT_ID`, `SHAREPOINT_CLIENT_ID`,
 git-ignored `.env.sharepoint`, see `.env.sharepoint.example`). There are no
 mocks: everything Graph-facing is proven against a real tenant.
 
+The delegated live tests use a test user's refresh token from
+`make delegated_login` (`.env.sharepoint.delegated`). In CI it is the repo
+secret `SHAREPOINT_USER_REFRESH_TOKEN`; the weekly `RotateRefreshToken.yml`
+workflow redeems it and writes the rotated token back, using a repo secret
+`SECRETS_ROTATION_TOKEN` (a fine-grained PAT for this repository only with
+"Secrets: Read and write"). Check it locally without writing anything:
+`python3 scripts/rotate_refresh_token.py --dry-run`. If it reports
+`invalid_grant`, sign in again with `make delegated_login` and update the
+secret. Details: [docs/hld.md §5.2](docs/hld.md).
+
 ## License
 
 MIT © 2026 DataZoo GmbH.

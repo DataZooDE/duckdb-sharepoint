@@ -1,0 +1,64 @@
+#
+# Keep the CI user's refresh token alive.
+#
+# Entra rotates a refresh token on every redemption, but the live job in
+# Checks.yml never writes the new one back, so the repo secret
+# SHAREPOINT_USER_REFRESH_TOKEN would age out (~90 days unused, earlier if a
+# policy revokes it). Weekly, this redeems it and writes the rotated token back
+# with `gh secret set`, authenticated by SECRETS_ROTATION_TOKEN: a fine-grained
+# PAT (or GitHub App token) for this repository only, "Secrets: Read and write".
+# GITHUB_TOKEN cannot write secrets, whatever `permissions` says.
+#
+# Race with the live job: a run that already read the old token keeps working
+# -- Entra does not revoke a refresh token when it is redeemed (verified live
+# 2026-10-14: the same token redeemed twice, both rotated). See docs/hld.md §5.2.
+#
+# If this fails with invalid_grant, the token is dead: run
+# `make delegated_login` as the test user and set the secret by hand.
+#
+name: Rotate delegated refresh token
+on:
+  schedule:
+    # Mondays 04:23 UTC: off the hour, after the nightly sweep (03:47).
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Redeem and validate only; do not write the secret'
+        type: boolean
+        default: false
+
+# The secret is written with SECRETS_ROTATION_TOKEN, not GITHUB_TOKEN.
+permissions:
+  contents: read
+
+concurrency:
+  # Two rotations must never race: both would redeem the same token and the
+  # later write could store the older of two rotated tokens.
+  group: rotate-refresh-token
+  cancel-in-progress: false
+
+jobs:
+  rotate:
+    timeout-minutes: 10
+    name: Redeem and write back SHAREPOINT_USER_REFRESH_TOKEN
+    runs-on: ubuntu-latest
+    # Upstream only: a fork has neither the secrets nor any business rotating them.
+    if: github.repository == 'DataZooDE/duckdb-sharepoint'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Rotate
+        env:
+          # Step-scoped, never job-wide.
+          SHAREPOINT_TENANT_ID: ${{ secrets.SHAREPOINT_TENANT_ID }}
+          SHAREPOINT_DELEGATED_CLIENT_ID: ${{ secrets.SHAREPOINT_DELEGATED_CLIENT_ID }}
+          SHAREPOINT_USER_REFRESH_TOKEN: ${{ secrets.SHAREPOINT_USER_REFRESH_TOKEN }}
+          SECRETS_ROTATION_TOKEN: ${{ secrets.SECRETS_ROTATION_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '' }}
+        run: |
+          python3 scripts/rotate_refresh_token.py --repo "$GITHUB_REPOSITORY" ${DRY_RUN:+--dry-run}

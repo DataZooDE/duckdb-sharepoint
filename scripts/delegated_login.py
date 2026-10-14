@@ -149,10 +149,10 @@ def _as_int(v, default: int) -> int:
         return default
 
 
-def login(env: dict[str, str], post_fn: Callable[[str, dict], tuple[int, dict]] = post,
-          sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
-          say: Callable[[str], None] = lambda s: print(s, flush=True)) -> dict[str, str]:
-    """Run the flow and return the values to write. Raises LoginError."""
+def endpoints(env: dict[str, str]) -> tuple[str, str, str, str]:
+    """Validate the tenant, client id and endpoints; return (tenant, client_id,
+    the oauth2/v2.0 base URL, the delegated scope). Shared with
+    scripts/rotate_refresh_token.py. Raises LoginError before any request."""
     tenant = env.get("SHAREPOINT_TENANT_ID", "")
     client_id = env.get("SHAREPOINT_DELEGATED_CLIENT_ID", "")
     if not tenant or not client_id:
@@ -166,8 +166,14 @@ def login(env: dict[str, str], post_fn: Callable[[str, dict], tuple[int, dict]] 
     graph = https_base(env.get("SHAREPOINT_GRAPH_ENDPOINT", "https://graph.microsoft.com"),
                        ALLOWED_GRAPH_HOSTS, "SHAREPOINT_GRAPH_ENDPOINT")
     scope = f"{graph}/Files.ReadWrite.All {graph}/Sites.ReadWrite.All offline_access"
+    return tenant, client_id, f"{login_host}/{tenant}/oauth2/v2.0", scope
 
-    base = f"{login_host}/{tenant}/oauth2/v2.0"
+
+def login(env: dict[str, str], post_fn: Callable[[str, dict], tuple[int, dict]] = post,
+          sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic,
+          say: Callable[[str], None] = lambda s: print(s, flush=True)) -> dict[str, str]:
+    """Run the flow and return the values to write. Raises LoginError."""
+    tenant, client_id, base, scope = endpoints(env)
     status, grant = post_fn(f"{base}/devicecode", {"client_id": client_id, "scope": scope})
     if status != 200 or not isinstance(grant.get("device_code"), str):
         raise LoginError(f"device-code request failed: HTTP {status} ({describe(grant)})")
