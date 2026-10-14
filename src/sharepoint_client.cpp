@@ -260,11 +260,9 @@ bool QueryUploadSession(const string &upload_url, uint64_t &next, bool &complete
 //! mistakes it for a transient failure.
 void RequireAllowedUploadUrl(const string &upload_url, const string &graph_endpoint) {
 	if (!IsAllowedUploadUrl(upload_url, graph_endpoint)) {
-		throw InvalidInputException(
-		    "sharepoint: refusing upload session URL on '%s': not an https SharePoint host of the configured cloud "
-		    "(expected <tenant>.sharepoint.com for %s, or the national cloud's SharePoint domain; custom domains are "
-		    "not supported)",
-		    UrlOriginForDisplay(upload_url), graph_endpoint);
+		// Pre-formatted, passed as the sole argument: no printf-style
+		// formatting is applied to the (untrusted) origin it contains.
+		throw InvalidInputException(UploadUrlRefusalMessage(upload_url, graph_endpoint));
 	}
 }
 
@@ -654,7 +652,14 @@ void GraphClient::AbortUploadSession(GraphUploadSession &session) noexcept {
 	const string url = std::move(session.upload_url);
 	session.upload_url.clear();
 	if (!IsAllowedUploadUrl(url, auth.graph_endpoint)) {
-		return; // never send a DELETE to a host outside the allow-list
+		// Unreachable by construction: OpenUploadSession is the only writer
+		// of upload_url and stores it only after the same check, and
+		// graph_endpoint is fixed for the client's lifetime. Kept so a future
+		// writer can never turn a discard into a DELETE to a foreign host. If
+		// it were ever hit, the session -- and a NEW file's 0-byte placeholder
+		// -- would stay until Graph expires the session, exactly as when the
+		// DELETE below fails; it is not counted as an upload_abort.
+		return;
 	}
 	for (int attempt = 1; attempt <= 2; attempt++) {
 		try {

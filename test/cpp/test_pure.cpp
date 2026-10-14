@@ -12,6 +12,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <algorithm>
+#include <cctype>
 #include <cstdint>
 #include <atomic>
 #include <map>
@@ -710,6 +711,85 @@ TEST_CASE("upload session URLs must be on the cloud's SharePoint host", "[identi
 		REQUIRE_FALSE(IsAllowedUploadUrl(std::string(bad) + q, global));
 		REQUIRE_FALSE(IsAllowedUploadUrl(bad, global));
 	}
+}
+
+TEST_CASE("the upload allow-list accepts any tenant on the cloud's suffix", "[identity][upload]") {
+	// A recorded decision, not an oversight (docs/hld.md 7a): the check pins
+	// the CLOUD, not the tenant. Another tenant's host passes; trust that the
+	// label is ours rests on the TLS reply from the allow-listed Graph host.
+	const char *global = "https://graph.microsoft.com";
+	REQUIRE(IsAllowedUploadUrl("https://attacker.sharepoint.com/_api/v2.0/drives/x/uploadSession?tempauth=t", global));
+	REQUIRE(IsAllowedUploadUrl("https://attacker-my.sharepoint.com/personal/u/_api/v2.0/drive/items/i/uploadSession",
+	                           global));
+	REQUIRE(IsAllowedUploadUrl("https://attacker-my.sharepoint.us/x", "https://graph.microsoft.us"));
+}
+
+TEST_CASE("the upload allow-list and the sender agree on the host", "[identity][upload]") {
+	// The allow-list parses the URL itself; the request is sent to the host
+	// SplitAbsoluteUrl + SplitHttpsOrigin extract. Whenever the allow-list
+	// says yes, the sender must reach exactly the host that was checked, on
+	// 443. Both end the authority at the first of '/', '?' or '#'.
+	struct Case {
+		const char *url;
+		const char *host; // expected (lowercased) host if allowed, else nullptr
+	};
+	const Case cases[] = {
+	    {"https://contoso.sharepoint.com/_api/v2.0/x/uploadSession?tempauth=t", "contoso.sharepoint.com"},
+	    {"https://contoso-my.sharepoint.com/personal/u?x=1", "contoso-my.sharepoint.com"},
+	    {"https://Contoso.SharePoint.com/x", "contoso.sharepoint.com"},
+	    {"https://contoso.sharepoint.com?tempauth=t", "contoso.sharepoint.com"},
+	    {"https://contoso.sharepoint.com#frag", "contoso.sharepoint.com"},
+	    {"https://contoso.sharepoint.com", "contoso.sharepoint.com"},
+	    {"https://contoso.sharepoint.com?x=@evil.example", "contoso.sharepoint.com"},
+	    {"https://contoso.sharepoint.com#@evil.example", "contoso.sharepoint.com"},
+	    {"https://contoso.sharepoint.com/@evil.example", "contoso.sharepoint.com"},
+	    {"https://evil.example?@contoso.sharepoint.com", nullptr},
+	    {"https://evil.example#.contoso.sharepoint.com", nullptr},
+	    {"https://evil.example/.contoso.sharepoint.com", nullptr},
+	    {"https://contoso.sharepoint.com@evil.example/x", nullptr},
+	    {"https://contoso.sharepoint.com:443/x", nullptr},
+	    {"https://contoso.sharepoint.com\\.evil.example/x", nullptr},
+	};
+	for (const auto &c : cases) {
+		INFO(c.url);
+		const bool allowed = IsAllowedUploadUrl(c.url, "https://graph.microsoft.com");
+		REQUIRE(allowed == (c.host != nullptr));
+		if (!allowed) {
+			continue;
+		}
+		std::string origin, target, host;
+		int port = 0;
+		REQUIRE(SplitAbsoluteUrl(c.url, origin, target));
+		REQUIRE(SplitHttpsOrigin(origin, host, port));
+		std::string lower = host;
+		std::transform(lower.begin(), lower.end(), lower.begin(),
+		               [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+		REQUIRE(lower == c.host);
+		REQUIRE(port == 443);
+		REQUIRE(target.front() == '/');
+	}
+}
+
+TEST_CASE("the upload refusal never carries the signed query", "[identity][upload]") {
+	for (const char *url : {"https://evil.example/_api/v2.0/x/uploadSession?guid=g&tempauth=SECRET",
+	                        "https://SECRETUSER:SECRETPW@evil.example:8443/SECRETPATH?tempauth=SECRET#SECRET",
+	                        "http://contoso.sharepoint.com/SECRETPATH?tempauth=SECRET",
+	                        "garbage?tempauth=SECRET", "https://evil.example?tempauth=SECRET"}) {
+		for (const char *endpoint : {"https://graph.microsoft.com", "https://graph.microsoft.us", "https://bogus"}) {
+			INFO(url << " / " << endpoint);
+			REQUIRE_FALSE(IsAllowedUploadUrl(url, endpoint));
+			const std::string msg = UploadUrlRefusalMessage(url, endpoint);
+			REQUIRE(msg.find("SECRET") == std::string::npos);
+			REQUIRE(msg.find("tempauth") == std::string::npos);
+			REQUIRE(msg.find("refusing upload session URL") != std::string::npos);
+		}
+	}
+	const std::string m =
+	    UploadUrlRefusalMessage("https://evil.example/x?tempauth=SECRET", "https://graph.microsoft.com");
+	REQUIRE(m.find("'https://evil.example'") != std::string::npos);
+	REQUIRE(m.find("https://<tenant>.sharepoint.com") != std::string::npos);
+	REQUIRE(UploadUrlRefusalMessage("https://x.sharepoint.cn/x", "https://microsoftgraph.chinacloudapi.cn")
+	            .find("https://<tenant>.sharepoint.cn") != std::string::npos);
 }
 
 TEST_CASE("an upload URL is shown without its signed query", "[identity][upload]") {

@@ -362,8 +362,9 @@ Found while building streaming writes (2026-10-14):
   credential. The chunk `PUT`s, the state `GET`, the commit `POST` and the
   discard `DELETE` (`204`) all go to that same URL. Since it is sent without a
   bearer and the URL alone authorises the write, `IsAllowedUploadUrl`
-  (`sharepoint_identity.*`, Catch2-tested) refuses any other URL before it is
-  stored -- so no chunk, commit or `DELETE` can reach it -- with an
+  (`sharepoint_identity.*`, Catch2-tested) refuses any URL off the cloud's
+  SharePoint suffix before it is stored -- so no chunk, commit or `DELETE`
+  can reach it -- with an
   `InvalidInputException` naming only the origin, never the query string.
   Rules: `https://`, an authority that is exactly `<label>.<suffix>` (label of
   letters, digits and `-`; so no userinfo, no port -- not even `:443` -- no IP
@@ -379,7 +380,26 @@ Found while building streaming writes (2026-10-14):
   `microsoftgraph.chinacloudapi.cn` -> `sharepoint.cn`
   ([21Vianet](https://learn.microsoft.com/en-us/microsoft-365/enterprise/urls-and-ip-address-ranges-21vianet)).
   Only the global cloud is verified live; the national suffixes are from those
-  docs alone. The DoD list also names `*.dps.mil`, which is not a tenant
+  docs alone.
+  **What is accepted, plainly: ANY tenant's host on the cloud's SharePoint
+  suffix** -- `other-tenant.sharepoint.com` passes for a `contoso` drive (a
+  Catch2 case records this). The check pins the cloud, not the tenant: it
+  stops non-SharePoint hosts, other clouds, userinfo / port / IP-literal
+  tricks and look-alike domains. That the label is *our* tenant rests on the
+  uploadUrl arriving in a TLS reply from the allow-listed Graph host -- the
+  same trust root as every other Graph answer. Exact-host pinning is **future
+  work**: it needs a host source independent of that reply (the drive's
+  `webUrl` comes from the same Graph reply, so it adds nothing), i.e. an
+  admin-scoped setting, never a session setting.
+  The sender's URL splitter (`SplitAbsoluteUrl` + `SplitHttpsOrigin`) and the
+  allow-list both end the authority at the first `/`, `?` or `#`; a Catch2
+  case asserts that for every allowed URL the sender reaches exactly the
+  checked host on 443. The refusal text (`UploadUrlRefusalMessage`) is pure
+  and Catch2-tested never to carry the path, query or userinfo. **Gap:** the
+  refusal path in `GraphClient` itself has no live test -- with no mocks, a
+  real tenant never hands out a non-matching uploadUrl, and pointing
+  `sharepoint_graph_endpoint` at another cloud fails at token / Graph level
+  before any session is opened. The DoD list also names `*.dps.mil`, which is not a tenant
   SharePoint host and is not allowed. **Custom (vanity) SharePoint domains are
   refused**: Graph hands out the tenant's `*.sharepoint.<cloud>` host for every
   drive we have seen, and allowing an arbitrary domain would defeat the check.

@@ -119,6 +119,16 @@ bool IsAllowedUploadUrl(const std::string &url, const std::string &graph_endpoin
 	return true;
 }
 
+std::string UploadUrlRefusalMessage(const std::string &url, const std::string &graph_endpoint) {
+	const std::string suffix = SharePointSuffixFor(graph_endpoint);
+	const std::string expected = suffix.empty() ? std::string("no SharePoint host (unknown Graph endpoint)")
+	                                            : "https://<tenant>" + suffix;
+	return "sharepoint: refusing upload session URL on '" + UrlOriginForDisplay(url) +
+	       "': not an https SharePoint host of the configured cloud (expected " + expected +
+	       " for sharepoint_graph_endpoint " + UrlOriginForDisplay(graph_endpoint) +
+	       "; custom domains, ports and userinfo are not supported). Nothing was uploaded.";
+}
+
 std::string UrlOriginForDisplay(const std::string &url) {
 	const std::size_t sep = url.find("://");
 	if (sep == std::string::npos || sep == 0 || url.find_first_of("/?#") < sep) {

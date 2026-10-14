@@ -33,10 +33,23 @@ bool IsAllowedLoginEndpoint(const std::string &url);
 //!   graph.microsoft.us (GCC High)   -> sharepoint.us
 //!   dod-graph.microsoft.us (DoD)    -> sharepoint-mil.us
 //!   microsoftgraph.chinacloudapi.cn -> sharepoint.cn
-//! A `graph_endpoint` that is no known Graph cloud allows nothing. Custom
-//! (vanity) SharePoint domains are refused: Graph hands out the tenant's
-//! *.sharepoint.<cloud> host for a drive, so none has been seen in practice.
+//! A `graph_endpoint` that is no known Graph cloud allows nothing.
+//!
+//! What this does NOT do: ANY tenant's host on the cloud's suffix is accepted
+//! ("other-tenant.sharepoint.com" passes for a contoso drive). It stops
+//! non-SharePoint hosts, other clouds, userinfo / port / IP tricks and
+//! look-alikes; trust that the label is OUR tenant rests on the uploadUrl
+//! arriving in a TLS reply from the allow-listed Graph host. Pinning the exact
+//! tenant host needs a source independent of that reply (an admin-scoped
+//! setting) and is future work (docs/hld.md 7a). Custom (vanity) SharePoint
+//! domains are refused: Graph hands out the *.sharepoint.<cloud> host for a
+//! drive, so none has been seen in practice.
 bool IsAllowedUploadUrl(const std::string &url, const std::string &graph_endpoint);
+
+//! The error text for an uploadUrl IsAllowedUploadUrl refused. It names only
+//! the URL's origin (UrlOriginForDisplay) and the expected suffix -- never the
+//! path, the signed query string or userinfo.
+std::string UploadUrlRefusalMessage(const std::string &url, const std::string &graph_endpoint);
 
 //! "scheme://host[:port]" of `url` -- no userinfo, path, query or fragment --
 //! for error messages about a pre-authenticated URL, whose signed query string
