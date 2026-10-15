@@ -147,6 +147,103 @@ the description: `authorization_pending`/`slow_down` keep polling;
 (refresh token expired/revoked → sign in again), `invalid_client`/`invalid_scope`
 each get a message naming the fix.
 
+### 5.2 Refresh-token rotation for CI (`RotateRefreshToken.yml`)
+
+The live CI job drives the delegated suite with the repo secret
+`SHAREPOINT_USER_REFRESH_TOKEN` (a test user's token from
+`scripts/delegated_login.py`). Entra rotates the token on every redemption and
+the extension rotates it in-process, but a job cannot write a repo secret, so
+the stored one would age out (~90 days unused, earlier on a policy revocation).
+
+`.github/workflows/RotateRefreshToken.yml` runs weekly (Mon 04:23 UTC) and on
+`workflow_dispatch` (with a `dry_run` input). It runs
+`scripts/rotate_refresh_token.py`, which:
+
+1. validates its inputs (the shared `delegated_login.endpoints()`), then
+   redeems the token at `{login}/{tenant}/oauth2/v2.0/token`,
+   `grant_type=refresh_token`, public client (no secret), scope
+   `<graph>/Files.ReadWrite.All <graph>/Sites.ReadWrite.All offline_access`,
+   over the same no-redirect POST as the login script; a reply that is not a
+   JSON object is treated as a failure;
+2. emits `::add-mask::<new token>` before any other line, checks the token's
+   shape (the login script's charset), and prints only SHA-256 fingerprints;
+3. writes it with `gh secret set SHAREPOINT_USER_REFRESH_TOKEN --repo …`, the
+   token on **stdin** (never argv), `GH_TOKEN` = `SECRETS_ROTATION_TOKEN`. The
+   `gh` child's environment is an **allowlist** (`PATH`, `HOME`, locale,
+   `TMPDIR`, CA and proxy variables, plus `GH_TOKEN`/`GH_PROMPT_DISABLED`), so
+   no runner token, OIDC request token or tenant credential reaches it.
+
+It fails loudly on `invalid_grant` (the token is dead: run
+`make delegated_login` as the test user, then
+`gh secret set SHAREPOINT_USER_REFRESH_TOKEN --repo DataZooDE/duckdb-sharepoint`
+with the token on stdin), and up front when `SECRETS_ROTATION_TOKEN` is
+missing. `--dry-run` redeems and validates but writes nothing (no PAT needed).
+Offline tests: `e2e/tests/test_rotate_refresh_token_script.py` (stubbed POST,
+stubbed and fake-executable `gh`, the CLI as a subprocess), run with the login
+script's tests by the credential-free `scripts-offline` job in `Checks.yml`, so
+fork PRs cover them too.
+
+**Where the credentials live, and why.** `workflow_dispatch` can target any
+branch, and the job runs that branch's copy of the script. A branch with a
+modified script must never see the PAT, which can write *every* secret of the
+repo. So:
+
+| Secret | Where | Who can read it |
+|---|---|---|
+| `SECRETS_ROTATION_TOKEN` | **only** the `secrets-rotation` environment | jobs on `main` (environment deployment branches: `main` only) |
+| `SHAREPOINT_USER_REFRESH_TOKEN`, `SHAREPOINT_TENANT_ID`, `SHAREPOINT_DELEGATED_CLIENT_ID` | repository secrets | the rotate job and the `Checks.yml` live job (which needs them) |
+
+The rotate job sets `environment: secrets-rotation` and also guards on
+`github.ref == 'refs/heads/main'` (defence in depth: a dispatch from another
+branch is skipped, never rejected half-way). A dispatch with `dry_run: true`
+does not put the PAT into the step's environment at all. The refresh token
+stays a repo secret, so it is exactly as exposed to same-repo branches as it
+was before this workflow (the live job already reads it); only the
+secrets-write PAT is fenced off.
+
+**`SECRETS_ROTATION_TOKEN`** — `GITHUB_TOKEN` can never write secrets, so the
+workflow needs its own credential. A fine-grained PAT: GitHub → Settings →
+Developer settings → Fine-grained tokens → Generate new token; *Resource
+owner* `DataZooDE` (the org must allow fine-grained PATs, and may require
+approval); *Expiration* as long as the org allows; *Repository access* → Only
+select repositories → `duckdb-sharepoint`; *Repository permissions* →
+**Secrets: Read and write** (Metadata: Read-only is added automatically);
+nothing else. Store it in Settings → Environments → `secrets-rotation` →
+Environment secrets (deployment branches: *Selected branches* → `main`), **not**
+as a repository secret. A GitHub App installation token with the same single
+permission on this one repository works equally.
+
+| PAT record | |
+|---|---|
+| Owner | Joachim Rosskopf (the account that created it; its removal from the org kills the PAT) |
+| Expires | *record the date here when the PAT is created or renewed* |
+
+**Failure alerting.** A failed scheduled run would otherwise notify one
+person at most. The `alert` job (`needs: rotate`, `if: failure()`, its own
+`permissions: issues: write`, no secret but `GITHUB_TOKEN`) opens the issue
+"Delegated refresh-token rotation failed", or comments on it if one is already
+open, with the run link and the two usual fixes (`invalid_grant` → re-login;
+`gh` 401/403 → PAT expired or under-scoped). The secrets-bearing job keeps
+`contents: read`.
+
+**Silent stops that alerting cannot see.**
+- GitHub **disables scheduled workflows in a repository with no activity for
+  60 days**; the weekly run then simply stops, so no run fails and no issue is
+  opened. The token then dies ~90 days after the last redemption (the last
+  rotation or live run). Re-enable the workflow in the Actions tab; any push
+  to the repo resets the 60-day clock.
+- An **expired PAT** does fail the run (gh 401) and is alerted, but only on the
+  next weekly run; renew it before the date in the table above.
+
+**Race with the live job, checked live (2026-10-14).** Entra does *not* revoke
+a refresh token when it is redeemed: the same stored token, redeemed twice in a
+row by `--dry-run`, succeeded both times and returned a different rotated token
+each time. So a live job that read the secret before a rotation wrote it keeps
+a working token, and the rotation never invalidates a token in flight. The
+`rotate-refresh-token` concurrency group stops two rotations overlapping. What
+does revoke every token of the lineage: a password reset, an admin "revoke
+sessions", a Conditional Access change, or 90 days without any redemption.
+
 ## 6. Read / write / mutate (`sharepoint_client.*`, `sharepoint_filesystem.*`)
 
 - **Read** — ranged `GET /items/{id}/content`. A shared block cache (as in
@@ -252,8 +349,10 @@ each get a message naming the fix.
    (`SHAREPOINT_INTERACTIVE=1 ... pytest -s -k interactive`); an interactive
    `authorization_code` sign-in has only been exercised up to the browser
    launch. Rotated refresh tokens are written back (§5.1); a secret unused for
-   ~90 days still needs a new sign-in, and the CI repo secret
-   `SHAREPOINT_USER_REFRESH_TOKEN` is not updated by runs.
+   ~90 days still needs a new sign-in. The CI repo secret
+   `SHAREPOINT_USER_REFRESH_TOKEN` is rotated weekly by
+   `RotateRefreshToken.yml` (§5.2), once `SECRETS_ROTATION_TOKEN` exists in
+   the `secrets-rotation` environment.
 6b. **DNS is not bounded by the pre-auth transport's deadline.** Connect,
    handshake, send and receive are; `getaddrinfo` inside `BIO_do_connect`
    blocks for the OS resolver timeout. Bounding it needs a resolver thread.
