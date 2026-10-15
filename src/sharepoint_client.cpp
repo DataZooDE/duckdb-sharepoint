@@ -4,6 +4,7 @@
 #include "sharepoint_client.hpp"
 #include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"
+#include "sharepoint_identity.hpp"
 #include "sharepoint_preauth.hpp"
 #include "sharepoint_rawhttp.hpp"
 #include "sharepoint_upload.hpp"
@@ -252,6 +253,19 @@ bool QueryUploadSession(const string &upload_url, uint64_t &next, bool &complete
 	return true;
 }
 
+//! Refuse an uploadUrl whose host is not the configured cloud's SharePoint
+//! host (IsAllowedUploadUrl) -- before any byte is sent to it. The message
+//! names only the URL's origin: its signed query string is a credential.
+//! InvalidInputException, not IOException, so no transport-retry loop
+//! mistakes it for a transient failure.
+void RequireAllowedUploadUrl(const string &upload_url, const string &graph_endpoint) {
+	if (!IsAllowedUploadUrl(upload_url, graph_endpoint)) {
+		// Pre-formatted, passed as the sole argument: no printf-style
+		// formatting is applied to the (untrusted) origin it contains.
+		throw InvalidInputException(UploadUrlRefusalMessage(upload_url, graph_endpoint));
+	}
+}
+
 } // namespace
 
 // Per-thread jitter so concurrent scan threads spread out.
@@ -468,16 +482,19 @@ void GraphClient::OpenUploadSession(const string &root_relative_path, GraphUploa
 	// DIFFERENT host than graph_endpoint. It carries NO Authorization header --
 	// the URL itself is the credential -- and is sent verbatim
 	// (PreauthenticatedRequest): it is signed over its exact query string.
+	// Because the URL alone authorises the upload, its host is allow-listed
+	// to the cloud's SharePoint domain before it is stored: a session that
+	// fails the check is never stored, so nothing -- no chunk, commit or
+	// DELETE -- is ever sent to it (docs/hld.md 7a).
 	const string upload_url = url_it->second.get<string>();
-	if (!IsHttpsUrl(upload_url)) {
-		throw IOException("sharepoint: createUploadSession returned a non-https uploadUrl");
-	}
+	RequireAllowedUploadUrl(upload_url, auth.graph_endpoint);
 	session.upload_url = upload_url;
 }
 
 void GraphClient::SendUploadChunk(GraphUploadSession &session, const ChunkedUploadBuffer &buf, bool final) {
 	const string &pending = buf.Pending();
 	const string &path = session.root_relative_path;
+	RequireAllowedUploadUrl(session.upload_url, auth.graph_endpoint); // defence in depth; checked at open
 	std::size_t skip = 0;
 	int failures = 0;
 	string last_transport_error;
@@ -554,6 +571,7 @@ void GraphClient::SendUploadChunk(GraphUploadSession &session, const ChunkedUplo
 
 DriveItemMeta GraphClient::CommitUploadSession(GraphUploadSession &session, uint64_t total) {
 	const string &path = session.root_relative_path;
+	RequireAllowedUploadUrl(session.upload_url, auth.graph_endpoint); // defence in depth; checked at open
 	// The commit's reply can be lost after Graph committed the file; the
 	// session is then gone, so a re-POST 404s. If the item now has our size
 	// and a different cTag (the CONTENT tag -- eTag also moves on a
@@ -633,6 +651,16 @@ void GraphClient::AbortUploadSession(GraphUploadSession &session) noexcept {
 	// 0-byte placeholder -- until Graph expires it (docs/hld.md 7a).
 	const string url = std::move(session.upload_url);
 	session.upload_url.clear();
+	if (!IsAllowedUploadUrl(url, auth.graph_endpoint)) {
+		// Unreachable by construction: OpenUploadSession is the only writer
+		// of upload_url and stores it only after the same check, and
+		// graph_endpoint is fixed for the client's lifetime. Kept so a future
+		// writer can never turn a discard into a DELETE to a foreign host. If
+		// it were ever hit, the session -- and a NEW file's 0-byte placeholder
+		// -- would stay until Graph expires the session, exactly as when the
+		// DELETE below fails; it is not counted as an upload_abort.
+		return;
+	}
 	for (int attempt = 1; attempt <= 2; attempt++) {
 		try {
 			auto res = PreauthenticatedRequest("DELETE", url, {}, "", 10, kUploadReplyMaxBytes);

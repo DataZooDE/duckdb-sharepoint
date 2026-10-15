@@ -59,6 +59,91 @@ bool IsAllowedLoginEndpoint(const std::string &url) {
 	                                   "login.partner.microsoftonline.cn", "login.chinacloudapi.cn"});
 }
 
+namespace {
+
+// The SharePoint host suffix (with its leading '.') for the Graph cloud
+// `graph_endpoint` belongs to, or empty for an unknown endpoint. Suffixes are
+// Microsoft's documented SharePoint Online endpoints per cloud (docs/hld.md 7a).
+std::string SharePointSuffixFor(const std::string &graph_endpoint) {
+	const std::string g = HttpsBareHost(graph_endpoint);
+	if (g == "graph.microsoft.com") {
+		return ".sharepoint.com";
+	}
+	if (g == "graph.microsoft.us") {
+		return ".sharepoint.us";
+	}
+	if (g == "dod-graph.microsoft.us") {
+		return ".sharepoint-mil.us";
+	}
+	if (g == "microsoftgraph.chinacloudapi.cn") {
+		return ".sharepoint.cn";
+	}
+	return std::string();
+}
+
+bool IsHostLabelChar(char c) {
+	return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+}
+
+} // namespace
+
+bool IsAllowedUploadUrl(const std::string &url, const std::string &graph_endpoint) {
+	const std::string suffix = SharePointSuffixFor(graph_endpoint);
+	if (suffix.empty()) {
+		return false;
+	}
+	static const std::string kScheme = "https://";
+	if (url.size() < kScheme.size() || Lower(url.substr(0, kScheme.size())) != kScheme) {
+		return false;
+	}
+	// The authority runs to the first '/', '?' or '#'. It must be a bare
+	// hostname: any '@' (userinfo), ':' (port), '[' (IPv6), '%' or '\' fails
+	// the label-character check below.
+	const std::size_t end = url.find_first_of("/?#", kScheme.size());
+	const std::string host =
+	    Lower(url.substr(kScheme.size(), end == std::string::npos ? std::string::npos : end - kScheme.size()));
+	if (host.size() <= suffix.size() || host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0) {
+		return false;
+	}
+	// Exactly one tenant label in front of the suffix ("contoso",
+	// "contoso-my"): letters, digits and '-', not starting or ending with '-'.
+	const std::string label = host.substr(0, host.size() - suffix.size());
+	if (label.empty() || label.size() > 63 || label.front() == '-' || label.back() == '-') {
+		return false;
+	}
+	for (char c : label) {
+		if (!IsHostLabelChar(c)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+std::string UploadUrlRefusalMessage(const std::string &url, const std::string &graph_endpoint) {
+	const std::string suffix = SharePointSuffixFor(graph_endpoint);
+	const std::string expected = suffix.empty() ? std::string("no SharePoint host (unknown Graph endpoint)")
+	                                            : "https://<tenant>" + suffix;
+	return "sharepoint: refusing upload session URL on '" + UrlOriginForDisplay(url) +
+	       "': not an https SharePoint host of the configured cloud (expected " + expected +
+	       " for sharepoint_graph_endpoint " + UrlOriginForDisplay(graph_endpoint) +
+	       "; custom domains, ports and userinfo are not supported). Nothing was uploaded.";
+}
+
+std::string UrlOriginForDisplay(const std::string &url) {
+	const std::size_t sep = url.find("://");
+	if (sep == std::string::npos || sep == 0 || url.find_first_of("/?#") < sep) {
+		return "<unparseable URL>";
+	}
+	const std::size_t start = sep + 3;
+	const std::size_t end = url.find_first_of("/?#", start);
+	std::string authority = url.substr(start, end == std::string::npos ? std::string::npos : end - start);
+	const std::size_t at = authority.rfind('@');
+	if (at != std::string::npos) {
+		authority = authority.substr(at + 1);
+	}
+	return Lower(url.substr(0, sep)) + "://" + authority;
+}
+
 bool IsValidTenantId(const std::string &tenant) {
 	if (tenant.empty() || tenant == "." || tenant == "..") {
 		return false;

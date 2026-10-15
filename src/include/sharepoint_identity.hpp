@@ -22,6 +22,40 @@ bool IsAllowedGraphEndpoint(const std::string &url);
 //! Same for the Entra ID login endpoint, which receives the CLIENT_SECRET.
 bool IsAllowedLoginEndpoint(const std::string &url);
 
+//! An upload session's uploadUrl the extension will send file content to
+//! (PUT chunks) and query / commit / discard (GET / POST / DELETE). The URL is
+//! pre-authenticated -- it is sent without a bearer token -- so this is what
+//! keeps a tampered or unexpected uploadUrl from receiving the file. Accepted
+//! only if it is https, its authority has no userinfo and no port, and its
+//! host is "<one label>.<suffix>" for the SharePoint suffix of the cloud
+//! `graph_endpoint` belongs to (docs/hld.md 7a):
+//!   graph.microsoft.com             -> sharepoint.com
+//!   graph.microsoft.us (GCC High)   -> sharepoint.us
+//!   dod-graph.microsoft.us (DoD)    -> sharepoint-mil.us
+//!   microsoftgraph.chinacloudapi.cn -> sharepoint.cn
+//! A `graph_endpoint` that is no known Graph cloud allows nothing.
+//!
+//! What this does NOT do: ANY tenant's host on the cloud's suffix is accepted
+//! ("other-tenant.sharepoint.com" passes for a contoso drive). It stops
+//! non-SharePoint hosts, other clouds, userinfo / port / IP tricks and
+//! look-alikes; trust that the label is OUR tenant rests on the uploadUrl
+//! arriving in a TLS reply from the allow-listed Graph host. Pinning the exact
+//! tenant host needs a source independent of that reply (an admin-scoped
+//! setting) and is future work (docs/hld.md 7a). Custom (vanity) SharePoint
+//! domains are refused: Graph hands out the *.sharepoint.<cloud> host for a
+//! drive, so none has been seen in practice.
+bool IsAllowedUploadUrl(const std::string &url, const std::string &graph_endpoint);
+
+//! The error text for an uploadUrl IsAllowedUploadUrl refused. It names only
+//! the URL's origin (UrlOriginForDisplay) and the expected suffix -- never the
+//! path, the signed query string or userinfo.
+std::string UploadUrlRefusalMessage(const std::string &url, const std::string &graph_endpoint);
+
+//! "scheme://host[:port]" of `url` -- no userinfo, path, query or fragment --
+//! for error messages about a pre-authenticated URL, whose signed query string
+//! is a credential. "<unparseable URL>" if there is no "scheme://".
+std::string UrlOriginForDisplay(const std::string &url);
+
 //! TENANT_ID is a GUID or a domain ("contoso.onmicrosoft.com"): letters,
 //! digits, '-' and '.', not "." / "..". It is spliced into the token URL path.
 bool IsValidTenantId(const std::string &tenant);

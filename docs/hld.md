@@ -351,6 +351,63 @@ Found while building streaming writes (2026-10-14):
   old file — exactly as on local disk. With the default tmp-file staging, the
   old file survives.
 
+- **The `uploadUrl` is on the tenant's SharePoint host, and is allow-listed.**
+  Observed live (2026-10-14, global cloud, app-only and delegated): a
+  SharePoint document library's session URL is
+  `https://<tenant>.sharepoint.com/[sites/<site>/]_api/v2.0/drives/<drive>/items/<item>/uploadSession?<signed query>`
+  and a OneDrive for Business drive's is
+  `https://<tenant>-my.sharepoint.com/personal/<user>/_api/v2.0/drive/items/<item>/uploadSession?<signed query>`
+  -- https, no port, no userinfo, one host label in front of `sharepoint.com`.
+  The query carries `guid`, `overwrite`, `rename`, `dc` and the `tempauth`
+  credential. The chunk `PUT`s, the state `GET`, the commit `POST` and the
+  discard `DELETE` (`204`) all go to that same URL. Since it is sent without a
+  bearer and the URL alone authorises the write, `IsAllowedUploadUrl`
+  (`sharepoint_identity.*`, Catch2-tested) refuses any URL off the cloud's
+  SharePoint suffix before it is stored -- so no chunk, commit or `DELETE`
+  can reach it -- with an
+  `InvalidInputException` naming only the origin, never the query string.
+  Rules: `https://`, an authority that is exactly `<label>.<suffix>` (label of
+  letters, digits and `-`; so no userinfo, no port -- not even `:443` -- no IP
+  literal, no trailing dot, no deeper subdomain), where the suffix follows
+  `sharepoint_graph_endpoint`, per Microsoft's documented SharePoint Online
+  endpoints:
+  `graph.microsoft.com` -> `sharepoint.com`
+  ([worldwide](https://learn.microsoft.com/en-us/microsoft-365/enterprise/urls-and-ip-address-ranges));
+  `graph.microsoft.us` (GCC High) -> `sharepoint.us`
+  ([GCC High](https://learn.microsoft.com/en-us/microsoft-365/enterprise/microsoft-365-u-s-government-gcc-high-endpoints));
+  `dod-graph.microsoft.us` -> `sharepoint-mil.us`
+  ([DoD](https://learn.microsoft.com/en-us/microsoft-365/enterprise/microsoft-365-u-s-government-dod-endpoints));
+  `microsoftgraph.chinacloudapi.cn` -> `sharepoint.cn`
+  ([21Vianet](https://learn.microsoft.com/en-us/microsoft-365/enterprise/urls-and-ip-address-ranges-21vianet)).
+  Only the global cloud is verified live; the national suffixes are from those
+  docs alone.
+  **What is accepted, plainly: ANY tenant's host on the cloud's SharePoint
+  suffix** -- `other-tenant.sharepoint.com` passes for a `contoso` drive (a
+  Catch2 case records this). The check pins the cloud, not the tenant: it
+  stops non-SharePoint hosts, other clouds, userinfo / port / IP-literal
+  tricks and look-alike domains. That the label is *our* tenant rests on the
+  uploadUrl arriving in a TLS reply from the allow-listed Graph host -- the
+  same trust root as every other Graph answer. Exact-host pinning is **future
+  work**: it needs a host source independent of that reply (the drive's
+  `webUrl` comes from the same Graph reply, so it adds nothing), i.e. an
+  admin-scoped setting, never a session setting.
+  The sender's URL splitter (`SplitAbsoluteUrl` + `SplitHttpsOrigin`) and the
+  allow-list both end the authority at the first `/`, `?` or `#`; a Catch2
+  case asserts that for every allowed URL the sender reaches exactly the
+  checked host on 443. The refusal text (`UploadUrlRefusalMessage`) is pure
+  and Catch2-tested never to carry the path, query or userinfo. **Gap:** the
+  refusal path in `GraphClient` itself has no live test -- with no mocks, a
+  real tenant never hands out a non-matching uploadUrl, and pointing
+  `sharepoint_graph_endpoint` at another cloud fails at token / Graph level
+  before any session is opened. The DoD list also names `*.dps.mil`, which is not a tenant
+  SharePoint host and is not allowed. **Custom (vanity) SharePoint domains are
+  refused**: Graph hands out the tenant's `*.sharepoint.<cloud>` host for every
+  drive we have seen, and allowing an arbitrary domain would defeat the check.
+  A tenant that ever gets one sees a clear refusal (nothing is uploaded, the
+  write fails) and it would need an explicit, admin-scoped opt-in -- not a
+  session setting, which any SQL user can change. The `/content` download
+  redirect is a read (no file content leaves the client) and is not covered.
+
 Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
 
 - **Discarding a session is one best-effort `DELETE`** (10 s timeout, one
@@ -361,9 +418,6 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   only discards that took.
 - **A retried `createUploadSession` whose first reply was lost** may leave an
   orphaned session (and placeholder) behind. Not verified live.
-- **The `uploadUrl` host is not allow-listed** -- only https is enforced. It
-  comes from a TLS reply of an allow-listed Graph host; an allow-list needs
-  every national cloud's upload-host suffix confirmed live first.
 - **Lost commit reply**: recognised by size + a changed **cTag** (the content
   tag); a concurrent writer of exactly the same size in that window is the
   remaining ambiguity. A 200/201 commit is success whatever its body says.
