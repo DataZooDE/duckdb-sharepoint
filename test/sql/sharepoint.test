@@ -4,11 +4,13 @@
 
 require sharepoint
 
-# The extension's own version scalar is present.
+# The extension's own version scalar reports the release. An exact value, not
+# IS NOT NULL: a stale string would otherwise pass while SELECT
+# sharepoint_version() reports the wrong release to a user filing a bug.
 query I
-SELECT sharepoint_version() IS NOT NULL;
+SELECT sharepoint_version();
 ----
-true
+2026.10.16
 
 # The scheme-generic mutation functions registered. (`query`, not
 # `statement ok`: a SELECT that returns 0 rows would pass `statement ok`.)

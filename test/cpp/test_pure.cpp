@@ -25,7 +25,7 @@ using namespace duckdb::sharepoint;
 
 TEST_CASE("version is CalVer", "[version]") {
 	auto v = SharepointVersion();
-	REQUIRE(v.size() == std::string("2026.08.05").size());
+	REQUIRE(v.size() == std::string("2026.10.16").size());
 	REQUIRE(v[4] == '.');
 }
 
