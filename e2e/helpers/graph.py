@@ -68,14 +68,44 @@ class Graph:
         return self._token
 
     def _req(self, method: str, url: str, **kw) -> requests.Response:
+        """One Graph call, retried through throttling and transient failure.
+
+        Every operation below is safe to repeat -- upload is a PUT by path,
+        mkdir uses conflictBehavior "replace", a replayed permanentDelete
+        answers 404 (which delete() treats as done) -- so a transport error or
+        a 5xx is retried for any method, not only 429. CI run 38550327207 lost
+        a test to one 504 on an upload. A 4xx other than 429 is the request's
+        own fault and is returned at once.
+        """
         headers = kw.pop("headers", {})
-        headers["Authorization"] = f"Bearer {self.token()}"
-        for attempt in range(5):
-            r = requests.request(method, url, headers=headers, timeout=120, **kw)
-            if r.status_code not in (429, 503) or attempt == 4:
+        attempts = 6
+        for attempt in range(attempts):
+            last = attempt == attempts - 1
+            headers["Authorization"] = f"Bearer {self.token()}"
+            try:
+                r = requests.request(method, url, headers=headers, timeout=120, **kw)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                if last:
+                    raise
+                time.sleep(self._backoff(attempt))
+                continue
+            if last or not (r.status_code == 429 or r.status_code >= 500):
                 return r
-            time.sleep(int(r.headers.get("Retry-After", "2")))
+            time.sleep(self._retry_after(r) or self._backoff(attempt))
         raise AssertionError("unreachable")
+
+    @staticmethod
+    def _backoff(attempt: int) -> float:
+        """1 s doubling to 16 s (31 s in all). One client, so no jitter."""
+        return float(2 ** attempt)
+
+    @staticmethod
+    def _retry_after(r: requests.Response) -> float:
+        """Retry-After in seconds, capped at 60; 0 when absent or not a number."""
+        try:
+            return min(60.0, max(0.0, float(r.headers.get("Retry-After", 0))))
+        except ValueError:
+            return 0.0
 
     def _item(self, path: str) -> str:
         return f"{GRAPH}/drives/{self.drive_id}/root:/{_quote_path(path)}"
