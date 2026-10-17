@@ -9,10 +9,11 @@
 
 #include "duckdb/common/exception.hpp"
 
-// Only for detail::load_system_certs_on_windows -- the same trust-store loader
-// httplib's own SSLClient uses there, so both transports trust the same roots.
+// Only for the trust-store loader httplib's own SSLClient uses, so both
+// transports trust the same roots (duckdb_compat::LoadSystemCerts).
 #define CPPHTTPLIB_OPENSSL_SUPPORT
 #include "httplib.hpp"
+#include "duckdb_compat/httplib.hpp"
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -52,11 +53,7 @@ SSL_CTX *SharedContext() {
 		}
 		SSL_CTX_set_min_proto_version(c, TLS1_2_VERSION);
 		SSL_CTX_set_verify(c, SSL_VERIFY_PEER, nullptr);
-		bool loaded = false;
-#ifdef _WIN32
-		loaded = duckdb_httplib_openssl::detail::load_system_certs_on_windows(SSL_CTX_get_cert_store(c));
-#endif
-		if (!loaded) {
+		if (!duckdb_compat::LoadSystemCerts(c)) {
 			SSL_CTX_set_default_verify_paths(c);
 		}
 		ctx = c;

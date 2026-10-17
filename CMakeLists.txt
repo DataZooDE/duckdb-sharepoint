@@ -124,6 +124,15 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(${LOADABLE_EXTENSION_NAME} posthog_telemetry datazoo_oauth2)
 endif()
 
+# DuckDB 2.0's bundled httplib reads the macOS keychain whenever it is built
+# with OpenSSL (CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN is automatic there),
+# so the link needs these frameworks; harmless on 1.x. See duckdb-compat README.
+if(APPLE)
+  foreach(t ${EXTENSION_NAME} ${LOADABLE_EXTENSION_NAME})
+    target_link_libraries(${t} "-framework CoreFoundation" "-framework Security")
+  endforeach()
+endif()
+
 install(
   TARGETS ${EXTENSION_NAME}
   EXPORT "${DUCKDB_EXPORT_SET}"
