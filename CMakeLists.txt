@@ -64,6 +64,12 @@ endif()
 # schedule. Native only, like posthog-telemetry: the loopback server and the
 # browser launcher have no meaning under emscripten.
 # ---------------------------------------------------------------------------
+# duckdb-compat: one source tree for DuckDB 1.4 LTS, 1.5 and 2.0. Header-only
+# API-shape shims (DataZooDE/duckdb-compat); no `#if` on DuckDB versions at
+# call sites. Before datazoo-oauth2, which takes its include path.
+add_subdirectory(duckdb-compat)
+include_directories(duckdb-compat/include)
+
 if(NOT EMSCRIPTEN)
     add_subdirectory(datazoo-oauth2)
 endif()

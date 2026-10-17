@@ -40,6 +40,10 @@ public:
 	~SharepointFileHandle() override;
 
 	void Close() override;
+	//! Discard an in-flight write WITHOUT committing it: the upload session
+	//! is discarded and a later Close() is a no-op. See
+	//! SharepointFileSystem::AbortFileWrite.
+	void CancelWrite() noexcept;
 
 	AuthContext auth;
 	//! Read path: resolved once at OpenFile and reused.
@@ -96,6 +100,20 @@ public:
 
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 	int64_t Write(FileHandle &handle, void *buffer, int64_t nr_bytes) override;
+
+	//! DuckDB 2.0 calls this when a COPY fails mid-write. The base default is
+	//! handle.Close() -- which here COMMITS the truncated file, and over an
+	//! existing file leaves it there (2.0's cleanup preserves pre-existing
+	//! targets). Discard instead. Deliberately NOT `override`: DuckDB 1.x has
+	//! no such hook, so there it is an uncalled method; on 2.0 it overrides.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winconsistent-missing-override"
+#endif
+	void AbortFileWrite(FileHandle &handle); // NOLINT(modernize-use-override)
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 	int64_t GetFileSize(FileHandle &handle) override;
 	string GetVersionTag(FileHandle &handle) override;

@@ -37,11 +37,12 @@ CREATE OR REPLACE SECRET sp_dc (TYPE sharepoint, PROVIDER device_code, TENANT_ID
 needs TENANT_ID and CLIENT_ID
 
 # A public client never holds a client secret: the option does not exist.
+# (DuckDB quotes the name 'client_secret' up to 1.5 and "client_secret" in 2.0.)
 statement error
 CREATE OR REPLACE SECRET sp_dc (TYPE sharepoint, PROVIDER device_code, TENANT_ID 't', CLIENT_ID 'c',
     CLIENT_SECRET 'nope', DRIVE_ID 'b!x');
 ----
-Unknown parameter 'client_secret'
+<REGEX>:.*Unknown parameter .client_secret.*
 
 # A refresh token from an earlier sign-in skips the interactive flow, and is
 # never displayed.

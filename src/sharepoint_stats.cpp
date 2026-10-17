@@ -9,6 +9,7 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include <cstdint>
+#include "duckdb_compat.hpp"
 
 namespace duckdb {
 namespace sharepoint {
@@ -20,7 +21,7 @@ struct StatsBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> StatsBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   duckdb_compat::BindNames &names) {
 	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT};
 	names = {"metric", "value"};
 	auto data = make_uniq<StatsBindData>();
@@ -53,7 +54,7 @@ void StatsScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 }
 
 unique_ptr<FunctionData> ResetBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
-                                   vector<string> &names) {
+                                   duckdb_compat::BindNames &names) {
 	return_types = {LogicalType::BOOLEAN};
 	names = {"success"};
 	return make_uniq<TableFunctionData>();
