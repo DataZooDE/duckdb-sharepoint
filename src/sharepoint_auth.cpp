@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include "duckdb_compat.hpp"
 
 namespace duckdb {
 namespace sharepoint {
@@ -454,7 +455,7 @@ SignInResult SignIn(optional_ptr<FileOpener> opener, const SecretMatch &match, c
                     const string &provider, const string &login_endpoint, const string &tenant,
                     const string &client_id, const string &scope,
                     const std::function<string(const string &)> &fingerprint_for) {
-	const string secret_name = match.GetSecret().GetName();
+	const string secret_name = duckdb_compat::Str(match.GetSecret().GetName());
 	auto client_context = FileOpener::TryGetClientContext(opener);
 	if (!client_context) {
 		throw IOException("sharepoint secret '%s' (PROVIDER %s) has no refresh token yet, and '%s' was opened "
@@ -496,7 +497,7 @@ SignInResult SignIn(optional_ptr<FileOpener> opener, const SecretMatch &match, c
 			cfg.timeout_seconds = timeout.GetValue<int64_t>();
 		}
 		ClientContext &ctx = *client_context;
-		tokens = RunDeviceCodeFlow(cfg, [&ctx]() { return ctx.interrupted.load(); });
+		tokens = RunDeviceCodeFlow(cfg, [&ctx]() { return duckdb_compat::IsInterrupted(ctx); });
 	} else {
 		const auto &kv = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
 		int port = 8020;
@@ -592,7 +593,7 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 		login_endpoint.pop_back();
 	}
 
-	const string provider = secret.GetProvider();
+	const string provider = duckdb_compat::Str(secret.GetProvider());
 	// The providers that sign a user in interactively (and own their secret's
 	// refresh token, writing it back).
 	const bool interactive = provider == "device_code" || provider == "authorization_code";
@@ -649,7 +650,7 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 		}
 		MintRequest req;
 		req.credential_fp = credential_fp;
-		req.secret_name = secret.GetName();
+		req.secret_name = duckdb_compat::Str(secret.GetName());
 		req.login_endpoint = login_endpoint;
 		req.tenant = tenant;
 		req.provider = provider;

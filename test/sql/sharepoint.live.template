@@ -231,9 +231,13 @@ COPY (SELECT i, md5(i::VARCHAR) AS h FROM range(100000) t(i))
      TO 'sharepoint://_duckdb_sharepoint_live/stream/s.csv' (HEADER);
 
 # An error MID-STREAM (chunks already uploaded) publishes nothing: the session
-# is discarded when the failed COPY drops its handle, so neither the target nor
-# DuckDB's tmp_ staging file exists afterwards. One thread, so the rows before
-# the error really are written (and chunked) before it is raised.
+# is discarded, so neither the target nor DuckDB's tmp_ staging file exists
+# afterwards. One thread, so the rows before the error really are written (and
+# chunked) before it is raised. ~16 MB before the error: DuckDB 2.0 writes COPY
+# output through an AsyncFileWriter that buffers several MB, so fewer rows
+# would fail before the first chunk and prove nothing. On 2.0 the discard
+# arrives through FileSystem::AbortFileWrite, whose default is Close() -- i.e.
+# COMMIT -- unless the filesystem overrides it.
 statement ok
 SET threads = 1;
 
@@ -241,8 +245,8 @@ statement ok
 CALL sharepoint_reset_stats();
 
 statement error
-COPY (SELECT i, CASE WHEN i < 90000 THEN md5(i::VARCHAR) ELSE error('boom mid-stream') END AS h
-      FROM range(100000) t(i))
+COPY (SELECT i, CASE WHEN i < 400000 THEN md5(i::VARCHAR) ELSE error('boom mid-stream') END AS h
+      FROM range(410000) t(i))
      TO 'sharepoint://_duckdb_sharepoint_live/stream/fail.csv' (HEADER);
 ----
 boom mid-stream
@@ -264,21 +268,33 @@ SELECT count(*) FROM glob('sharepoint://_duckdb_sharepoint_live/stream/*fail*');
 0
 
 # Overwriting an existing file and failing mid-stream leaves the OLD content
-# intact: COPY streams into its tmp_ staging file, whose session is discarded,
-# and the move onto the real name never happens. (With USE_TMP_FILE false,
-# DuckDB's own failure cleanup removes the target -- as it does on local disk.)
+# intact. DuckDB 1.x streams into a tmp_ staging file whose session is
+# discarded, and the move onto the real name never happens. 2.0 writes remote
+# targets in place (no staging file) and, as the target already existed, its
+# cleanup PRESERVES whatever is there -- so only a discard that never commits
+# keeps the original. A truncated overwrite is data loss.
 statement ok
 SET threads = 1;
 
+statement ok
+CALL sharepoint_reset_stats();
+
 statement error
-COPY (SELECT i, CASE WHEN i < 90000 THEN md5(i::VARCHAR) ELSE error('boom again') END AS h
-      FROM range(100000) t(i))
+COPY (SELECT i, CASE WHEN i < 400000 THEN md5(i::VARCHAR) ELSE error('boom again') END AS h
+      FROM range(410000) t(i))
      TO 'sharepoint://_duckdb_sharepoint_live/stream/s.csv' (HEADER);
 ----
 boom again
 
 statement ok
 RESET threads;
+
+query III
+SELECT (SELECT value >= 3 FROM sharepoint_stats() WHERE metric = 'upload_chunk'),
+       (SELECT value FROM sharepoint_stats() WHERE metric = 'upload_abort'),
+       (SELECT value FROM sharepoint_stats() WHERE metric = 'upload_commit');
+----
+true	1	0
 
 query I
 SELECT count(*) FROM read_csv('sharepoint://_duckdb_sharepoint_live/stream/s.csv');

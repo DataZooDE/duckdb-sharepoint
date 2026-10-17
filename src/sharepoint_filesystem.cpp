@@ -113,6 +113,24 @@ SharepointFileHandle::~SharepointFileHandle() {
 	}
 }
 
+void SharepointFileHandle::CancelWrite() noexcept {
+	if (!is_write) {
+		return;
+	}
+	// Same outcome as a failed Close(): nothing is committed, ever. Mark the
+	// handle so a Close() that still follows cannot publish what was written.
+	is_write = false;
+	write_failed = true;
+	if (session.IsOpen()) {
+		try {
+			GraphClient client(auth);
+			client.AbortUploadSession(session);
+		} catch (...) { // NOLINT: best effort; an abandoned session expires on its own
+		}
+	}
+	upload.reset();
+}
+
 void SharepointFileHandle::Close() {
 	if (!is_write) {
 		return;
@@ -635,6 +653,10 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 		}
 		return result;
 	});
+}
+
+void SharepointFileSystem::AbortFileWrite(FileHandle &handle) {
+	handle.Cast<SharepointFileHandle>().CancelWrite();
 }
 
 void SharepointFileSystem::FileSync(FileHandle &handle) {

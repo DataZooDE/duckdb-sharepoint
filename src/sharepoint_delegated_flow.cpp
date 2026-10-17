@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <thread>
+#include "duckdb_compat.hpp"
 
 namespace duckdb {
 namespace sharepoint {
@@ -210,7 +211,7 @@ bool SameConfiguration(const KeyValueSecret &a, const KeyValueSecret &b) {
 			if (entry.first == "refresh_token" || entry.first == "refresh_token_lineage") {
 				continue;
 			}
-			out[entry.first] = entry.second.IsNull() ? string("\x01NULL") : entry.second.ToString();
+			out[duckdb_compat::Str(entry.first)] = entry.second.IsNull() ? string("\x01NULL") : entry.second.ToString();
 		}
 		return out;
 	};
@@ -222,7 +223,7 @@ unique_ptr<SecretEntry> RefetchMatching(ClientContext &context, const SecretMatc
 	const auto &before = dynamic_cast<const KeyValueSecret &>(snapshot.GetSecret());
 	auto &secret_manager = SecretManager::Get(context);
 	auto transaction = CatalogTransaction::GetSystemCatalogTransaction(context);
-	auto entry = secret_manager.GetSecretByName(transaction, before.GetName(), snapshot.secret_entry->storage_mode);
+	auto entry = secret_manager.GetSecretByName(transaction, duckdb_compat::Str(before.GetName()), snapshot.secret_entry->storage_mode);
 	if (!entry || !entry->secret) {
 		return nullptr;
 	}
