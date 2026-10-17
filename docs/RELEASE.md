@@ -70,18 +70,21 @@ Then create the GitHub Release for the tag.
 
 ## Submitting
 
-**The first submission is a one-off. Every later release is a bump PR**: one
-changed `ref` (and `version`) on a branch cut from `upstream/main`, titled
-`sharepoint: bump to vYYYY.MM.DD`.
+**The first submission is a one-off. Every later release is a bump PR**:
+changed `ref`, `variegata` and `version` on a branch cut from `upstream/main`,
+titled `sharepoint: bump to vYYYY.MM.DD`.
 
 1. Copy `docs/community-extension-description.yml` to
    `community-extensions/extensions/sharepoint/description.yml`, dropping the
    staging header comment.
-2. Set `repo.ref` to the **tagged commit's full SHA**. Do not use the tag name
-   or `main`. Look the SHA up **in this repo**: the community-extensions clone
-   has no such tag, and an empty substitution still parses as valid YAML with a
-   null `ref`. Require 40 hex characters. Add `version: YYYY.MM.DD` under
-   `extension:`, which is what the gdrive descriptor upstream carries.
+2. Set `repo.ref` and `repo.variegata` to the **tagged commit's full SHA**.
+   Do not use the tag name or `main`. Look the SHA up **in this repo**: the
+   community-extensions clone has no such tag, and an empty substitution still
+   parses as valid YAML with a null `ref`. Require 40 hex characters. Check
+   that `extension.version` matches the tag.
+   - `ref` builds against DuckDB 2.0 (the community default since 2026-10-15),
+     `variegata` against v1.5.6 and `andium` against v1.4.5; a missing key
+     falls back to `ref`. One commit builds on all three (duckdb-compat).
 3. Open the PR from the `DataZooDE/community-extensions` fork.
 
 ## Excluded platforms, and why

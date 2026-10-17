@@ -48,6 +48,16 @@ def test_descriptor_ref_is_a_placeholder_or_a_full_sha():
     assert ref == "PLACEHOLDER_SET_AT_RELEASE" or re.fullmatch(r"[0-9a-f]{40}", ref), ref
 
 
+def test_descriptor_variegata_is_the_same_commit_as_ref():
+    # One commit builds on DuckDB 2.0 (ref) and v1.5.6 (variegata); a bump that
+    # moves only one of them ships two code lines under one version.
+    text = DESCRIPTOR.read_text()
+    ref = re.search(r"^  ref: (\S+)$", text, re.M)
+    variegata = re.search(r"^  variegata: (\S+)$", text, re.M)
+    assert ref and variegata, "descriptor needs both repo.ref and repo.variegata"
+    assert variegata.group(1) == ref.group(1)
+
+
 def test_hello_world_runs_against_a_real_tenant(graph, scratch, sql):
     # Seed exactly what the snippet reads.
     seed = "\n".join([
