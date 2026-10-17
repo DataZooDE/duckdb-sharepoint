@@ -1,10 +1,10 @@
 # Staged submission for duckdb/community-extensions.
 #
-# NOT yet submitted -- this extension is a scaffold. `ref` must point at a
-# tagged commit whose live suite has passed against a real Microsoft Graph
-# tenant before submission (the community build runs no live tests of ours).
-# Validate the substituted ref is 40 hex characters, not just that the
-# placeholder is gone.
+# `ref` stays a placeholder here; at submission it is set to the TAGGED
+# commit's full SHA (validate 40 hex characters, not just that the placeholder
+# is gone). The community build runs no live tests of ours, so every
+# `hello_world` statement is executed against a real tenant by
+# e2e/tests/test_community_descriptor.py. Procedure: docs/RELEASE.md.
 
 extension:
   name: sharepoint
@@ -12,8 +12,8 @@ extension:
   language: C++
   build: cmake
   license: MIT
-  # wasm: HTTPS calls to Microsoft Graph plus (future) a loopback redirect
-  # server for interactive OAuth -- neither works in a browser sandbox, and a
+  # wasm: HTTPS calls to Microsoft Graph plus a loopback redirect server for
+  # interactive OAuth -- neither works in a browser sandbox, and a
   # wasm side-module defers symbol resolution to load time, so it would build
   # green and then fail to LOAD.
   # mingw: vcpkg's OpenSSL port is fragile there; sibling extensions skip it.
@@ -48,7 +48,7 @@ docs:
     -- Glob a folder.
     SELECT * FROM read_parquet('sharepoint://exports/parts/*.parquet');
 
-    -- Write a whole file. Sequential only; Graph replaces whole files.
+    -- Write a file. Sequential only; streamed in bounded memory.
     COPY (SELECT * FROM t) TO 'sharepoint://reports/out.parquet' (FORMAT parquet);
 
   extended_description: |
@@ -59,9 +59,12 @@ docs:
     and DuckLake all inherit the scheme.
 
     Unlike Google Drive, Graph addresses items by path, so there is no
-    path-resolution cache and no duplicate-name ambiguity. Reads are ranged;
-    writes upload the whole file on close (Graph cannot write at a byte offset,
-    so positional writes raise rather than corrupt). Also registers the
+    path-resolution cache and no duplicate-name ambiguity. Reads are ranged
+    and served from a block cache. Writes stream through a Graph upload session
+    in bounded memory and the file appears when it is closed (Graph cannot
+    write at a byte offset, so positional writes raise rather than corrupt).
+    Besides app-only client credentials, a user can sign in with
+    `device_code` or `authorization_code`. Also registers the
     scheme-generic `write_blob`, `remove_file`, `move_file` and `file_size` SQL
     functions, which work for any filesystem DuckDB can reach.
 
