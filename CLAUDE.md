@@ -53,4 +53,5 @@ stats, banner/telemetry, glob syntax, shared VFS functions, e2e harness).
 Writes stream in bounded memory (one chunk, `deferCommit` upload session;
 2026-10-14, hld §7 item 6a). `docs/hld.md` §7/§7a has the remaining work and the Graph behaviours found
 live; `docs/exploratory-testing.md` the exploratory findings. Repo secrets
-`SHAREPOINT_*` must be set for the CI live job.
+`SHAREPOINT_*` must be set for the CI live job. First release: v2026.10.16;
+the release and community-extensions procedure is `docs/RELEASE.md`.
