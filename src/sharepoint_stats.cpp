@@ -50,7 +50,7 @@ void StatsScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 		state.cursor++;
 		out++;
 	}
-	output.SetCardinality(out);
+	duckdb_compat::SetChildCardinality(output, out);
 }
 
 unique_ptr<FunctionData> ResetBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &return_types,
@@ -63,12 +63,12 @@ unique_ptr<FunctionData> ResetBind(ClientContext &, TableFunctionBindInput &, ve
 void ResetScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	auto &state = input.global_state->Cast<CursorState>();
 	if (state.cursor > 0) {
-		output.SetCardinality(0);
+		duckdb_compat::SetChildCardinality(output, 0);
 		return;
 	}
 	ResetCounters();
 	state.cursor = 1;
-	output.SetCardinality(1);
+	duckdb_compat::SetChildCardinality(output, 1);
 	output.SetValue(0, 0, Value::BOOLEAN(true));
 }
 
