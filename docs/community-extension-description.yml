@@ -8,7 +8,7 @@
 
 extension:
   name: sharepoint
-  version: 2026.10.17
+  version: 2026.10.18
   description: Query files in SharePoint / OneDrive directly with a sharepoint:// filesystem
   language: C++
   build: cmake
