@@ -10,7 +10,7 @@ require sharepoint
 query I
 SELECT sharepoint_version();
 ----
-2026.10.17
+2026.10.18
 
 # The scheme-generic mutation functions registered. (`query`, not
 # `statement ok`: a SELECT that returns 0 rows would pass `statement ok`.)

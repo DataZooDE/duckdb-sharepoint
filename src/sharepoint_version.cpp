@@ -8,7 +8,7 @@ const char *SharepointVersionCString() {
 	// (gdrive, erpl, anofox-*, quack_oauth). Kept in step with the tag by
 	// scripts/check_extension_stamp.sh, which fails the build if HEAD is on a
 	// tag and this string is not it.
-	return "2026.10.17";
+	return "2026.10.18";
 }
 
 std::string SharepointVersion() {
