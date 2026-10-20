@@ -61,6 +61,12 @@ src, dst = sys.argv[1], sys.argv[2]
 names = ["SHAREPOINT_TENANT_ID", "SHAREPOINT_CLIENT_ID", "SHAREPOINT_CLIENT_SECRET", "SHAREPOINT_DRIVE_ID",
          "SHAREPOINT_DELEGATED_CLIENT_ID", "SHAREPOINT_USER_REFRESH_TOKEN"]
 text = open(src, "r", encoding="utf-8").read()
+# A per-run id for paths that must not collide with an earlier run's leftovers
+# (not a secret; only [0-9A-Za-z-], safe in a Graph item name and a SQL string).
+import datetime
+run_id = os.environ.get("SHAREPOINT_LIVE_RUN_ID") or (
+    datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + os.urandom(4).hex())
+text = text.replace("@RUN_ID@", run_id)
 for name in names:
     key = f"@{name}@"
     if key not in text:
