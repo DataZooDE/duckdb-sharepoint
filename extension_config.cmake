@@ -17,23 +17,6 @@
 set(CMAKE_CXX_STANDARD 17 CACHE STRING "C++ standard to enforce" FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON CACHE BOOL "" FORCE)
 
-# The 1.4 LTS build compiles sqlite3_api_wrapper.cpp, which pulls in the
-# Win-SDK headers; at C++17 on MSVC std::byte then clashes with the SDK's
-# global `byte`. Disable std::byte for the LTS line -- we do not use it.
-set(_sp_ddb_ver "$ENV{DUCKDB_GIT_VERSION}")
-if(NOT _sp_ddb_ver)
-  execute_process(
-    COMMAND git -C "${CMAKE_CURRENT_LIST_DIR}/duckdb" describe --tags
-    OUTPUT_VARIABLE _sp_ddb_ver OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
-endif()
-if(_sp_ddb_ver MATCHES "^v?1\\.4\\.")
-  add_compile_definitions(_HAS_STD_BYTE=0)
-  # FileSystem API that differs between the lines is guarded on this (e.g.
-  # CanonicalizePath, virtual only from 1.5).
-  add_compile_definitions(SHAREPOINT_DUCKDB_LTS=1)
-  message(STATUS "sharepoint: DuckDB ${_sp_ddb_ver} (1.4 LTS) -- defining _HAS_STD_BYTE=0, SHAREPOINT_DUCKDB_LTS")
-endif()
-
 # ---------------------------------------------------------------------------
 # Extension version, computed here rather than left to DuckDB.
 # duckdb_extension_generate_version() passes literal quotes to git and falls

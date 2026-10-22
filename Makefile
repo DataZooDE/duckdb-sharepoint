@@ -61,7 +61,7 @@ check_credentials:
 	@./scripts/check_no_credentials.sh
 
 # ---------------------------------------------------------------------------
-# musl (a 1.4 LTS distribution target) does not pull <cstdint> in
+# musl (an opt-in DuckDB distribution target) does not pull <cstdint> in
 # transitively the way glibc does; a missing include breaks only that target.
 # ---------------------------------------------------------------------------
 .PHONY: check_cstdint

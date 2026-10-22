@@ -16,7 +16,7 @@ into one database side by side.
 > **Status:** verified end to end against a real Microsoft 365 tenant —
 > the live SQL suite (`make test_live`) and the e2e harness (`make e2e`:
 > out-of-band changes, restarts, 16-thread scans, DuckLake, two drives) pass.
-> Built for DuckDB **v1.5.6** and the **v1.4.5 LTS** line.
+> Built for DuckDB **v1.5.6** and **2.0**.
 
 ## Why SharePoint is simpler than Drive
 

@@ -7,7 +7,7 @@
                 "Not on Windows, matching CMakeLists.txt: SHAREPOINT_BUILD_UNIT_TESTS",
                 "defaults OFF under MSVC (vcpkg's Catch2 uses the dynamic CRT, DuckDB the static",
                 "one -- LNK2038), so the test binary is never built there. Installing it anyway",
-                "costs a Catch2 build, and on the 1.4 vcpkg pin it 404s on a removed msys2",
+                "costs a Catch2 build, and on the old 1.4 vcpkg pin it 404'd on a removed msys2",
                 "runtime (see duckdb-gdrive vcpkg.json, 2026-09-01)."
             ],
             "name": "catch2",
