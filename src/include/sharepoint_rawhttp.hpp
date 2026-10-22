@@ -19,7 +19,7 @@ namespace sharepoint {
 // signs those URLs over the exact query string, so the reordered request is
 // rejected with 401 (verified live: only the original order is accepted).
 // DuckDB 1.4's httplib 0.14 sent the path verbatim, which is why this only
-// bites on the 1.5 line.
+// bites from the 1.5 line on.
 // ---------------------------------------------------------------------------
 
 using RawHeaders = std::vector<std::pair<std::string, std::string>>;
