@@ -128,12 +128,12 @@ SELECT x FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixtu
 statement error
 SELECT * FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Nope');
 ----
-table 'Nope' not found
+table 'Nope'
 
 statement error
 SELECT * FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Nope!A1:B2');
 ----
-worksheet 'Nope' not found
+worksheet 'Nope'
 
 statement error
 SELECT * FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'A1:B2');

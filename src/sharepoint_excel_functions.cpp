@@ -245,12 +245,8 @@ Value ToValue(const ExcelCell &cell, ExcelColumnType t) {
 }
 
 bool BoolOption(TableFunctionBindInput &input, const char *name, bool fallback) {
-	for (auto &kv : input.named_parameters) {
-		if (StringUtil::CIEquals(duckdb_compat::Str(kv.first), name)) {
-			return kv.second.IsNull() ? fallback : BooleanValue::Get(kv.second);
-		}
-	}
-	return fallback;
+	auto value = duckdb_compat::FindNamedParameter(input.named_parameters, name);
+	return (value && !value->IsNull()) ? BooleanValue::Get(*value) : fallback;
 }
 
 string StringArg(TableFunctionBindInput &input, idx_t i, const char *what) {
@@ -368,8 +364,10 @@ void ExcelScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	duckdb_compat::SetChildCardinality(output, out);
 }
 
-void Register(ExtensionLoader &loader, TableFunction fn, const string &description, const vector<string> &examples) {
-	fn.named_parameters["all_varchar"] = LogicalType::BOOLEAN;
+void Register(ExtensionLoader &loader, TableFunction fn, const vector<string> &parameters, const string &description,
+              const vector<string> &examples) {
+	duckdb_compat::NameParameters(fn, parameters);
+	duckdb_compat::AddNamedParameter(fn, "all_varchar", LogicalType::BOOLEAN);
 	CreateTableFunctionInfo info(fn);
 	FunctionDescription desc;
 	desc.description = description;
@@ -385,6 +383,7 @@ void RegisterExcelFunctions(ExtensionLoader &loader) {
 	Register(loader,
 	         TableFunction("read_excel_table", {LogicalType::VARCHAR, LogicalType::VARCHAR}, ExcelScan, TableBind,
 	                       CursorInit),
+	         {"path", "table"},
 	         "Read a named Excel table from an .xlsx in SharePoint / OneDrive, live through the Graph workbook API: "
 	         "the header row gives the column names, the values and number formats the types (dates included). "
 	         "The path is a sharepoint:// path (the scheme may be left out) or id:<itemId>. all_varchar := true "
@@ -393,8 +392,8 @@ void RegisterExcelFunctions(ExtensionLoader &loader) {
 
 	TableFunction range("read_excel_range", {LogicalType::VARCHAR, LogicalType::VARCHAR}, ExcelScan, RangeBind,
 	                    CursorInit);
-	range.named_parameters["header"] = LogicalType::BOOLEAN;
-	Register(loader, range,
+	duckdb_compat::AddNamedParameter(range, "header", LogicalType::BOOLEAN);
+	Register(loader, range, {"path", "range"},
 	         "Read a range of an .xlsx in SharePoint / OneDrive, live through the Graph workbook API: 'Sheet!A1:F200', "
 	         "or a sheet name for its used range. The first row is the header unless header := false. "
 	         "all_varchar := true reads every column as text.",
