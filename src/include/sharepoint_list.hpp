@@ -61,7 +61,8 @@ struct ListOutputColumn {
 //!    the system columns kept;
 //!  - every other column that is neither hidden nor read-only, in Graph's
 //!    order, named by its display name. ContentType and Attachments are left
-//!    out: list plumbing, not data;
+//!    out: list plumbing, not data. The built-in Title keeps the name `Title`
+//!    (its display name is localised, e.g. "Titel");
 //!  - text -> VARCHAR, number -> DOUBLE, currency -> DECIMAL, boolean ->
 //!    BOOLEAN, dateTime -> TIMESTAMP, choice -> VARCHAR (VARCHAR[] when
 //!    multi-valued), hyperlink -> VARCHAR (the URL), calculated -> by its
