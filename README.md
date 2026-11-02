@@ -116,7 +116,21 @@ BOOLEAN, BIGINT, DOUBLE, DATE, TIMESTAMP, TIME, or VARCHAR when a column mixes
 kinds. Empty cells and error values such as `#DIV/0!` are NULL.
 `all_varchar := true` reads every column as text, with dates as ISO text.
 Sheet names with spaces are quoted Excel-style: `'''My Sheet''!A1:B9'` in SQL.
-Writing results back into a workbook is next (#50).
+
+Write results back with `COPY`. The workbook is changed in place through the
+same API, never re-uploaded, so it can stay open in Excel:
+
+```sql
+-- Append rows to a table, matching columns by name; a missing table is
+-- created on a new sheet of its name (or SHEET '<name>').
+COPY (SELECT month, forecast FROM fc) TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast');
+
+-- Overwrite a block from its top-left cell, the column names first (HEADER false: data only).
+COPY (SELECT * FROM summary) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Summary!B2');
+```
+
+Dates, timestamps and times are written with a date format, so they read back
+typed. Text stays text: `=1+1` is not turned into a formula.
 
 ## Authentication
 

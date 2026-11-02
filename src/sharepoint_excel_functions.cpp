@@ -16,11 +16,15 @@
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/statement/copy_statement.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include <picojson.h>
 
+#include <cmath>
 #include <cstdint>
 #include "duckdb_compat.hpp"
 
@@ -377,6 +381,582 @@ void Register(ExtensionLoader &loader, TableFunction fn, const vector<string> &p
 	loader.RegisterFunction(std::move(info));
 }
 
+// ===========================================================================
+// COPY ... TO '<workbook>' (FORMAT excel_table, TABLE 'Forecast')
+// COPY ... TO '<workbook>' (FORMAT excel_range, RANGE 'Forecast!A1')
+//
+// Writes go through the workbook API (rows/add, a range PATCH), never by
+// replacing the file -- people can keep the workbook open in Excel while SQL
+// fills it.
+//
+// The public formats only rewrite the statement (CopyFunction::plan, as
+// DuckDB's own JSON writer does) to an internal format with USE_TMP_FILE
+// false. Without that, COPY to an EXISTING target writes "tmp_<name>" and
+// renames it over the target at the end -- here a MoveFile of the workbook
+// itself. See docs/hld.md §9.
+// ===========================================================================
+
+constexpr const char *kTableFormat = "excel_table";
+constexpr const char *kRangeFormat = "excel_range";
+constexpr const char *kTableFormatInternal = "__sharepoint_excel_table";
+constexpr const char *kRangeFormatInternal = "__sharepoint_excel_range";
+constexpr const char *kInPlaceMarker = "__sharepoint_in_place";
+
+//! How one column's values are written.
+enum class ExcelWriteKind { TEXT, NUMBER, BOOLEAN, DATE, TIMESTAMP, TIME };
+
+ExcelWriteKind WriteKindFor(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+		return ExcelWriteKind::BOOLEAN;
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::UHUGEINT:
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+	case LogicalTypeId::DECIMAL:
+		return ExcelWriteKind::NUMBER;
+	case LogicalTypeId::DATE:
+		return ExcelWriteKind::DATE;
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return ExcelWriteKind::TIMESTAMP;
+	case LogicalTypeId::TIME:
+		return ExcelWriteKind::TIME;
+	default:
+		return ExcelWriteKind::TEXT; // VARCHAR, and anything else as its text
+	}
+}
+
+//! The number format a column's cells get, or nullptr to leave it alone.
+const char *NumberFormatFor(ExcelWriteKind kind) {
+	switch (kind) {
+	case ExcelWriteKind::DATE:
+		return "yyyy-mm-dd";
+	case ExcelWriteKind::TIMESTAMP:
+		return "yyyy-mm-dd hh:mm:ss";
+	case ExcelWriteKind::TIME:
+		return "hh:mm:ss";
+	default:
+		return nullptr;
+	}
+}
+
+//! A value as the workbook API takes it. NULL and non-finite numbers clear
+//! the cell (""); text keeps its apostrophe guard (ExcelTextInput).
+picojson::value ToJsonCell(const Value &v, ExcelWriteKind kind) {
+	if (v.IsNull()) {
+		return picojson::value(string());
+	}
+	switch (kind) {
+	case ExcelWriteKind::BOOLEAN:
+		return picojson::value(BooleanValue::Get(v));
+	case ExcelWriteKind::NUMBER: {
+		const double d = v.GetValue<double>();
+		return std::isfinite(d) ? picojson::value(d) : picojson::value(string());
+	}
+	case ExcelWriteKind::DATE: {
+		const auto date = v.GetValue<date_t>();
+		if (!Value::IsFinite(date)) {
+			return picojson::value(string());
+		}
+		return picojson::value(ExcelSerialFromEpoch(date.days, 0));
+	}
+	case ExcelWriteKind::TIMESTAMP: {
+		const auto ts = v.DefaultCastAs(LogicalType::TIMESTAMP).GetValue<timestamp_t>();
+		if (!Value::IsFinite(ts)) {
+			return picojson::value(string());
+		}
+		const int64_t micros = Timestamp::GetEpochMicroSeconds(ts);
+		int64_t days = micros / Interval::MICROS_PER_DAY;
+		int64_t rest = micros % Interval::MICROS_PER_DAY;
+		if (rest < 0) {
+			rest += Interval::MICROS_PER_DAY;
+			days--;
+		}
+		return picojson::value(ExcelSerialFromEpoch(days, rest));
+	}
+	case ExcelWriteKind::TIME: {
+		// Time::Convert, not dtime_t's member: `micros` before 2.0, `value` in 2.0.
+		int32_t hour, minute, second, micros;
+		Time::Convert(v.GetValue<dtime_t>(), hour, minute, second, micros);
+		const int64_t of_day = ((hour * 60LL + minute) * 60 + second) * 1000000 + micros;
+		return picojson::value(ExcelSerialFromEpoch(-25569, of_day));
+	}
+	default:
+		return picojson::value(ExcelTextInput(v.ToString()));
+	}
+}
+
+template <class MAP>
+const vector<Value> *FindCopyOption(const MAP &options, const string &name) {
+	auto entry = options.find(typename MAP::key_type(name));
+	return entry == options.end() ? nullptr : &entry->second;
+}
+
+string CopyStringOption(const CopyInfo &info, const char *name) {
+	auto v = FindCopyOption(info.options, name);
+	if (!v || v->size() != 1 || (*v)[0].IsNull()) {
+		return string();
+	}
+	return (*v)[0].ToString();
+}
+
+bool CopyBoolOption(ClientContext &context, const CopyInfo &info, const char *name, bool fallback) {
+	auto v = FindCopyOption(info.options, name);
+	if (!v) {
+		return fallback;
+	}
+	// A bare `HEADER` means true, as in COPY's own options.
+	return v->empty() || (*v)[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>();
+}
+
+struct ExcelWriteBindData : public FunctionData {
+	bool table_mode = false;
+	string table;        // excel_table: the table to append to (or create)
+	string sheet;        // excel_table: where to create a missing table
+	ExcelAddress anchor; // excel_range: the top-left cell
+	bool header = true;  // excel_range: write the column names first
+	vector<string> names;
+	vector<ExcelWriteKind> kinds;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<ExcelWriteBindData>(*this);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<ExcelWriteBindData>();
+		return table_mode == other.table_mode && table == other.table && names == other.names;
+	}
+};
+
+unique_ptr<FunctionData> ExcelWriteBind(ClientContext &context, CopyFunctionBindInput &input,
+                                        const duckdb_compat::CopyBindNames &names, const vector<LogicalType> &sql_types,
+                                        bool table_mode) {
+	auto &info = input.info;
+	// Only reachable through the rewrite, which pins USE_TMP_FILE false and
+	// leaves this marker (the binder consumes USE_TMP_FILE itself before bind).
+	// A direct FORMAT __sharepoint_excel_* could otherwise rename over the file.
+	if (!FindCopyOption(info.options, kInPlaceMarker)) {
+		throw InvalidInputException("sharepoint: write workbooks with FORMAT %s",
+		                            table_mode ? kTableFormat : kRangeFormat);
+	}
+	auto data = make_uniq<ExcelWriteBindData>();
+	data->table_mode = table_mode;
+	if (table_mode) {
+		data->table = CopyStringOption(info, "table");
+		if (data->table.empty()) {
+			throw InvalidInputException("sharepoint: FORMAT excel_table needs TABLE '<name>'");
+		}
+		data->sheet = CopyStringOption(info, "sheet");
+		if (data->sheet.empty()) {
+			data->sheet = data->table;
+		}
+	} else {
+		const auto range = CopyStringOption(info, "range");
+		if (range.empty()) {
+			throw InvalidInputException("sharepoint: FORMAT excel_range needs RANGE 'Sheet!A1'");
+		}
+		auto parsed = ParseExcelAddress(range);
+		if (!parsed.ok) {
+			throw InvalidInputException("sharepoint: %s", parsed.error);
+		}
+		data->anchor = parsed.address;
+		data->header = CopyBoolOption(context, info, "header", true);
+	}
+	for (idx_t i = 0; i < sql_types.size(); i++) {
+		data->names.push_back(duckdb_compat::Str(names[i]));
+		data->kinds.push_back(WriteKindFor(sql_types[i]));
+	}
+	return std::move(data);
+}
+
+unique_ptr<FunctionData> ExcelTableWriteBind(ClientContext &context, CopyFunctionBindInput &input,
+                                             const duckdb_compat::CopyBindNames &names,
+                                             const vector<LogicalType> &sql_types) {
+	return ExcelWriteBind(context, input, names, sql_types, true);
+}
+
+unique_ptr<FunctionData> ExcelRangeWriteBind(ClientContext &context, CopyFunctionBindInput &input,
+                                             const duckdb_compat::CopyBindNames &names,
+                                             const vector<LogicalType> &sql_types) {
+	return ExcelWriteBind(context, input, names, sql_types, false);
+}
+
+struct ExcelWriteGlobalState : public GlobalFunctionData {
+	Workbook wb;
+	string session_id;
+	//! Where the next block goes. Range mode: the next free row of the block.
+	//! Table mode: the table's columns on its sheet, and the row after its body.
+	ExcelAddress target;
+	int64_t next_row = 0;
+	//! Range writes into a fresh sheet; the table is created around them at
+	//! the end (a missing excel_table target).
+	bool create_table = false;
+	//! Table mode: the table column each COPY column goes to.
+	vector<idx_t> column_of;
+	idx_t width = 0;
+	bool any_number_format = false;
+	picojson::array pending_values;
+	picojson::array pending_formats;
+	idx_t pending_cells = 0;
+	idx_t first_data_row = 0; // created table: the header row
+};
+
+string WorksheetResource(const string &sheet) {
+	return "worksheets/" + EncodeWorkbookName(sheet);
+}
+
+string RangeResource(const ExcelAddress &block) {
+	const string cells = ExcelColumnLetters(block.first_col) + std::to_string(block.first_row) + ":" +
+	                     ExcelColumnLetters(block.last_col) + std::to_string(block.last_row);
+	return WorksheetResource(block.sheet) + "/range(address='" + EncodeWorkbookName(cells) + "')";
+}
+
+//! Make sure `sheet` exists; true if it was created (so it is empty).
+bool EnsureWorksheet(GraphClient &client, ExcelWriteGlobalState &g, const string &sheet) {
+	int status = 0;
+	const string what = Quoted("worksheet", sheet, g.wb);
+	client.WorkbookCall("GET", g.wb.item_id, WorksheetResource(sheet) + "?$select=name", string(), g.session_id, what,
+	                    true, &status);
+	if (status != 404) {
+		return false;
+	}
+	picojson::object body;
+	body["name"] = picojson::value(sheet);
+	client.WorkbookCall("POST", g.wb.item_id, "worksheets/add", picojson::value(body).serialize(), g.session_id, what,
+	                    false);
+	return true;
+}
+
+//! True if `sheet` holds no values (its used range is one empty cell).
+bool WorksheetIsEmpty(GraphClient &client, ExcelWriteGlobalState &g, const string &sheet) {
+	const string what = Quoted("worksheet", sheet, g.wb);
+	const auto used =
+	    ParseObject(client.WorkbookCall("GET", g.wb.item_id,
+	                                    WorksheetResource(sheet) + "/usedRange(valuesOnly=true)?$select=address,values",
+	                                    string(), g.session_id, what, true),
+	                what);
+	const auto address = ParseGraphAddress(used, what);
+	if (address.RowCount() != 1 || address.ColCount() != 1) {
+		return false;
+	}
+	auto v = At(ArrayField(used, "values"), 0, 0);
+	return !v || (v->is<string>() && v->get<string>().empty());
+}
+
+void QueueRow(ExcelWriteGlobalState &g, picojson::array values, picojson::array formats) {
+	g.pending_cells += values.size();
+	g.pending_values.emplace_back(std::move(values));
+	g.pending_formats.emplace_back(std::move(formats));
+}
+
+void FlushPending(ExcelWriteGlobalState &g, const ExcelWriteBindData &bind, bool table_append) {
+	if (g.pending_values.empty()) {
+		return;
+	}
+	GraphClient client(g.wb.auth);
+	const auto rows = static_cast<int64_t>(g.pending_values.size());
+	ExcelAddress block = g.target;
+	block.first_row = g.next_row;
+	block.last_row = g.next_row + rows - 1;
+	if (table_append) {
+		const string what = Quoted("table", bind.table, g.wb);
+		picojson::object body;
+		body["values"] = picojson::value(g.pending_values);
+		ParseObject(client.WorkbookCall("POST", g.wb.item_id, "tables/" + EncodeWorkbookName(bind.table) + "/rows/add",
+		                                picojson::value(body).serialize(), g.session_id, what, false),
+		            what);
+		// Dates are written as serials; give the new rows their formats.
+		if (g.any_number_format) {
+			picojson::object formats;
+			formats["numberFormat"] = picojson::value(g.pending_formats);
+			client.WorkbookCall("PATCH", g.wb.item_id, RangeResource(block), picojson::value(formats).serialize(),
+			                    g.session_id, what, true);
+		}
+	} else {
+		string error;
+		if (!ExcelBlockAt(block, rows, g.target.ColCount(), block, error)) {
+			throw InvalidInputException("sharepoint: %s", error);
+		}
+		picojson::object body;
+		body["values"] = picojson::value(g.pending_values);
+		if (g.any_number_format) {
+			body["numberFormat"] = picojson::value(g.pending_formats);
+		}
+		client.WorkbookCall("PATCH", g.wb.item_id, RangeResource(block), picojson::value(body).serialize(),
+		                    g.session_id, Quoted("range", FormatExcelAddress(block), g.wb), true);
+	}
+	g.next_row += rows;
+	g.pending_values.clear();
+	g.pending_formats.clear();
+	g.pending_cells = 0;
+}
+
+//! Closes the COPY's workbook session if initialisation throws after opening
+//! it; disarmed once initialisation succeeds (finalize closes it then).
+struct SessionGuard {
+	ExcelWriteGlobalState &g;
+	bool armed = true;
+	~SessionGuard() {
+		if (!armed || g.session_id.empty()) {
+			return;
+		}
+		try {
+			GraphClient client(g.wb.auth);
+			client.WorkbookCall("POST", g.wb.item_id, "closeSession", "{}", g.session_id, "workbook session", true);
+		} catch (...) {
+			// Best effort: an unclosed session expires on its own.
+		}
+		g.session_id.clear();
+	}
+};
+
+unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, FunctionData &bind_p,
+                                                    const string &file_path) {
+	auto &bind = bind_p.Cast<ExcelWriteBindData>();
+	auto g = make_uniq<ExcelWriteGlobalState>();
+	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
+		g->wb = OpenWorkbook(context, file_path);
+		GraphClient client(g->wb.auth);
+		// One persistent session for the whole COPY: fewer workbook opens, and
+		// every write lands in the saved file. Retried like a read: a second
+		// session after a lost reply is harmless (it expires unused), and
+		// Graph does answer createSession with a transient 504 (live CI).
+		const auto session =
+		    ParseObject(client.WorkbookCall("POST", g->wb.item_id, "createSession", "{\"persistChanges\":true}",
+		                                    string(), "workbook session for '" + g->wb.path + "'", true),
+		                "workbook session");
+		auto id = session.find("id");
+		if (id != session.end() && id->second.is<string>()) {
+			g->session_id = id->second.get<string>();
+		}
+		for (auto kind : bind.kinds) {
+			g->any_number_format = g->any_number_format || NumberFormatFor(kind) != nullptr;
+		}
+		// A COPY that fails from here on must not leave its session open: an
+		// open session keeps the workbook locked (HTTP 423) for minutes.
+		SessionGuard guard {*g};
+
+		ExcelAddress anchor;
+		bool write_header = false;
+		if (bind.table_mode) {
+			const string what = Quoted("table", bind.table, g->wb);
+			const string base = "tables/" + EncodeWorkbookName(bind.table);
+			int status = 0;
+			const auto header_body = client.WorkbookCall("GET", g->wb.item_id, base + "/headerRowRange?$select=values",
+			                                             string(), g->session_id, what, true, &status);
+			if (status == 404) {
+				// No such table: create it on its own sheet, header first.
+				if (!EnsureWorksheet(client, *g, bind.sheet) && !WorksheetIsEmpty(client, *g, bind.sheet)) {
+					throw InvalidInputException("sharepoint: table '%s' does not exist, and worksheet '%s' in '%s' "
+					                            "already holds data; name an empty or new sheet with SHEET '<name>'",
+					                            bind.table, bind.sheet, g->wb.path);
+				}
+				g->create_table = true;
+				anchor.sheet = bind.sheet;
+				write_header = true;
+			} else {
+				// Append: map COPY columns onto the table's columns by name.
+				auto header = ParseObject(header_body, what);
+				auto values = ArrayField(header, "values");
+				const auto body =
+				    ParseObject(client.WorkbookCall("GET", g->wb.item_id, base + "/dataBodyRange?$select=address",
+				                                    string(), g->session_id, what, true),
+				                what);
+				g->target = ParseGraphAddress(body, what);
+				g->next_row = g->target.last_row + 1;
+				g->width = static_cast<idx_t>(g->target.ColCount());
+				vector<string> table_names;
+				for (idx_t c = 0; c < g->width; c++) {
+					table_names.push_back(ExcelCellText(ToCell(At(values, 0, c), nullptr, nullptr)));
+				}
+				for (auto &name : bind.names) {
+					idx_t found = DConstants::INVALID_INDEX;
+					for (idx_t c = 0; c < table_names.size(); c++) {
+						if (StringUtil::CIEquals(table_names[c], name)) {
+							found = c;
+						}
+					}
+					if (found == DConstants::INVALID_INDEX) {
+						throw InvalidInputException("sharepoint: table '%s' in '%s' has no column \"%s\" (it has: %s)",
+						                            bind.table, g->wb.path, name, StringUtil::Join(table_names, ", "));
+					}
+					g->column_of.push_back(found);
+				}
+				guard.armed = false;
+				return std::move(g);
+			}
+		} else {
+			anchor = bind.anchor;
+			EnsureWorksheet(client, *g, anchor.sheet);
+			write_header = bind.header;
+		}
+		// Range writing (excel_range, or a table being created).
+		g->width = bind.names.size();
+		string error;
+		if (!ExcelBlockAt(anchor, 1, static_cast<int64_t>(g->width), g->target, error)) {
+			throw InvalidInputException("sharepoint: %s", error);
+		}
+		g->next_row = g->target.first_row;
+		g->first_data_row = static_cast<idx_t>(g->target.first_row);
+		if (write_header) {
+			picojson::array values, formats;
+			for (auto &name : bind.names) {
+				values.emplace_back(ExcelTextInput(name));
+				formats.emplace_back(); // null: leave the format alone
+			}
+			QueueRow(*g, std::move(values), std::move(formats));
+		}
+		guard.armed = false;
+	});
+	return std::move(g);
+}
+
+unique_ptr<LocalFunctionData> ExcelWriteInitLocal(ExecutionContext &, FunctionData &) {
+	return make_uniq<LocalFunctionData>();
+}
+
+void ExcelWriteSink(ExecutionContext &context, FunctionData &bind_p, GlobalFunctionData &gstate_p, LocalFunctionData &,
+                    DataChunk &input) {
+	auto &bind = bind_p.Cast<ExcelWriteBindData>();
+	auto &g = gstate_p.Cast<ExcelWriteGlobalState>();
+	const bool append = bind.table_mode && !g.create_table;
+	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
+		for (idx_t r = 0; r < input.size(); r++) {
+			picojson::array values(g.width, picojson::value(string()));
+			picojson::array formats(g.width);
+			for (idx_t c = 0; c < input.ColumnCount(); c++) {
+				const idx_t to = append ? g.column_of[c] : c;
+				values[to] = ToJsonCell(input.GetValue(c, r), bind.kinds[c]);
+				if (auto format = NumberFormatFor(bind.kinds[c])) {
+					formats[to] = picojson::value(string(format));
+				}
+			}
+			QueueRow(g, std::move(values), std::move(formats));
+			if (g.pending_cells >= static_cast<idx_t>(kCellsPerRequest)) {
+				FlushPending(g, bind, append);
+			}
+		}
+	});
+}
+
+void ExcelWriteCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
+}
+
+void ExcelWriteFinalize(ClientContext &context, FunctionData &bind_p, GlobalFunctionData &gstate_p) {
+	auto &bind = bind_p.Cast<ExcelWriteBindData>();
+	auto &g = gstate_p.Cast<ExcelWriteGlobalState>();
+	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
+		FlushPending(g, bind, bind.table_mode && !g.create_table);
+		GraphClient client(g.wb.auth);
+		if (g.create_table) {
+			// The header and rows are on the sheet; make them the table.
+			ExcelAddress block = g.target;
+			block.first_row = static_cast<int64_t>(g.first_data_row);
+			block.last_row = std::max<int64_t>(g.next_row - 1, block.first_row);
+			const string what = Quoted("table", bind.table, g.wb);
+			picojson::object add;
+			add["address"] = picojson::value(FormatExcelAddress(block));
+			add["hasHeaders"] = picojson::value(true);
+			const auto created =
+			    ParseObject(client.WorkbookCall("POST", g.wb.item_id, "tables/add", picojson::value(add).serialize(),
+			                                    g.session_id, what, false),
+			                what);
+			auto id = created.find("id");
+			if (id == created.end() || !id->second.is<string>()) {
+				throw IOException("sharepoint: creating %s returned no table id", what);
+			}
+			picojson::object rename;
+			rename["name"] = picojson::value(bind.table);
+			client.WorkbookCall("PATCH", g.wb.item_id, "tables/" + EncodeWorkbookName(id->second.get<string>()),
+			                    picojson::value(rename).serialize(), g.session_id, what, true);
+		}
+		if (!g.session_id.empty()) {
+			client.WorkbookCall("POST", g.wb.item_id, "closeSession", "{}", g.session_id,
+			                    "workbook session for '" + g.wb.path + "'", true);
+			g.session_id.clear();
+		}
+	});
+}
+
+CopyFunctionExecutionMode ExcelWriteExecutionMode(bool, bool) {
+	// One writer, rows in query order: a workbook range has no "later".
+	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
+}
+
+template <class MAP>
+void AddCopyOption(MAP &options, const char *name, const LogicalType &type) {
+	options[typename MAP::key_type(name)] = CopyOption(type, CopyOptionMode::WRITE_ONLY);
+}
+
+void ExcelTableCopyOptions(ClientContext &, CopyOptionsInput &input) {
+	AddCopyOption(input.options, kInPlaceMarker, LogicalType::BOOLEAN);
+	AddCopyOption(input.options, "table", LogicalType::VARCHAR);
+	AddCopyOption(input.options, "sheet", LogicalType::VARCHAR);
+}
+
+void ExcelRangeCopyOptions(ClientContext &, CopyOptionsInput &input) {
+	AddCopyOption(input.options, kInPlaceMarker, LogicalType::BOOLEAN);
+	AddCopyOption(input.options, "range", LogicalType::VARCHAR);
+	AddCopyOption(input.options, "header", LogicalType::BOOLEAN);
+}
+
+//! FORMAT excel_table / excel_range: rebind as the internal format with
+//! USE_TMP_FILE false (see the top of this section).
+BoundStatement RewriteExcelCopy(Binder &binder, CopyStatement &stmt, const char *internal_format) {
+	auto copy = stmt.Copy();
+	auto &info = *copy->Cast<CopyStatement>().info;
+	auto tmp = FindCopyOption(info.options, "use_tmp_file");
+	if (tmp && (tmp->empty() || (*tmp)[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>())) {
+		throw InvalidInputException("sharepoint: USE_TMP_FILE is not supported for workbook writes: they change the "
+		                            "workbook in place");
+	}
+	info.format = internal_format;
+	using Key = typename std::decay<decltype(info.options)>::type::key_type;
+	info.options[Key("use_tmp_file")] = {Value::BOOLEAN(false)};
+	info.options[Key(kInPlaceMarker)] = {Value::BOOLEAN(true)};
+	return binder.Bind(*copy);
+}
+
+BoundStatement ExcelTableCopyPlan(Binder &binder, CopyStatement &stmt) {
+	return RewriteExcelCopy(binder, stmt, kTableFormatInternal);
+}
+
+BoundStatement ExcelRangeCopyPlan(Binder &binder, CopyStatement &stmt) {
+	return RewriteExcelCopy(binder, stmt, kRangeFormatInternal);
+}
+
+CopyFunction MakeExcelWriter(const char *name, copy_to_bind_t bind, copy_options_t options) {
+	CopyFunction fn(duckdb_compat::FunctionName(name));
+	fn.copy_options = options;
+	fn.copy_to_bind = bind;
+	fn.copy_to_initialize_global = ExcelWriteInitGlobal;
+	fn.copy_to_initialize_local = ExcelWriteInitLocal;
+	fn.copy_to_sink = ExcelWriteSink;
+	fn.copy_to_combine = ExcelWriteCombine;
+	fn.copy_to_finalize = ExcelWriteFinalize;
+	fn.execution_mode = ExcelWriteExecutionMode;
+	fn.extension = "xlsx";
+	return fn;
+}
+
+CopyFunction MakeExcelFrontend(const char *name, copy_to_plan_t plan) {
+	CopyFunction fn(duckdb_compat::FunctionName(name));
+	fn.plan = plan;
+	fn.extension = "xlsx";
+	return fn;
+}
+
 } // namespace
 
 void RegisterExcelFunctions(ExtensionLoader &loader) {
@@ -399,6 +979,11 @@ void RegisterExcelFunctions(ExtensionLoader &loader) {
 	         "all_varchar := true reads every column as text.",
 	         {"SELECT * FROM read_excel_range('Finance/plan.xlsx', 'Input!A1:F200')",
 	          "SELECT * FROM read_excel_range('Finance/plan.xlsx', 'Input', header := false)"});
+
+	loader.RegisterFunction(MakeExcelFrontend(kTableFormat, ExcelTableCopyPlan));
+	loader.RegisterFunction(MakeExcelFrontend(kRangeFormat, ExcelRangeCopyPlan));
+	loader.RegisterFunction(MakeExcelWriter(kTableFormatInternal, ExcelTableWriteBind, ExcelTableCopyOptions));
+	loader.RegisterFunction(MakeExcelWriter(kRangeFormatInternal, ExcelRangeWriteBind, ExcelRangeCopyOptions));
 }
 
 } // namespace sharepoint

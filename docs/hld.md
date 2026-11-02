@@ -391,10 +391,11 @@ sessions", a Conditional Access change, or 90 days without any redemption.
 
 8. **Excel workbooks (#50, #52).** Read side implemented 2026-11-02:
    `read_excel_table` / `read_excel_range` (§9). Open: verified live in CI
-   (`test/sql/sharepoint_excel.live.template`, `e2e/tests/test_excel_workbook.py`);
-   write back (`COPY ... (FORMAT excel_table|excel_range)`: append rows to a
-   table, overwrite a range, in a `persistChanges` workbook session); README.
-   Then SharePoint lists (#49).
+   (`test/sql/sharepoint_excel.live.template`, `e2e/tests/test_excel_workbook.py`).
+   Write side implemented 2026-11-02: `COPY ... (FORMAT excel_table|excel_range)`
+   (§9.1). Open: replacing a table's rows (today a table only grows -- rerun
+   into a range, or a fresh table), clearing cells beyond a shorter rewrite of
+   a range, the 1904 date system. Then SharePoint lists (#49).
 
 ## 7a. Discovered on the first live runs (2026-10-10)
 
@@ -584,4 +585,54 @@ step) needs too.
 - **Header.** A table's header row; for a range the first row unless
   `header := false`. Empty names become `column<N>`, duplicates get `_2`
   (case-insensitive, as DuckDB names are).
+
+### 9.1 Writing back: `COPY ... (FORMAT excel_table | excel_range)`
+
+```sql
+COPY (SELECT ...) TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast');   -- append; create if missing
+COPY (SELECT ...) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Out!B2');     -- overwrite from B2
+```
+
+- **In place, never by replacing the file.** Writes go through the workbook
+  API inside one `createSession` (`persistChanges: true`) per COPY, so people
+  can keep the workbook open in Excel. Nothing ever uploads or renames the
+  `.xlsx`.
+- **Why the public formats are a rewrite.** DuckDB's COPY TO an *existing*
+  target defaults to `USE_TMP_FILE`: the writer is handed `tmp_<name>` and the
+  operator `MoveFile`s it over the target at the end (bind_copy.cpp: the
+  default is "file exists and not a known remote prefix" -- and
+  `sharepoint://` is not one). For a workbook that rename would be our
+  filesystem moving `tmp_plan.xlsx` over `plan.xlsx`. So `excel_table` /
+  `excel_range` carry only `CopyFunction::plan` (the hook DuckDB's own JSON
+  writer uses): it copies the statement, sets `USE_TMP_FILE false` plus a
+  private marker option, points FORMAT at `__sharepoint_excel_table|range`,
+  and calls `Binder::Bind` again. The internal writers refuse to bind without
+  the marker (the binder strips `USE_TMP_FILE` itself before `copy_to_bind`),
+  and an explicit `USE_TMP_FILE true` is refused. Same hook and option flow on
+  1.5.6 and 2.0 (2.0's options are keyed by Identifier).
+- **excel_range.** The block starts at RANGE's top-left cell (A1 for a bare
+  sheet); a missing sheet is created (`worksheets/add`). `HEADER` (default
+  true) writes the column names first. Rows go out as `PATCH .../range(...)`
+  in windows of <= 20k cells, in query order (`REGULAR_COPY_TO_FILE`: one
+  writer). Cells beyond what is written are left as they were.
+- **excel_table.** An existing table: COPY columns are matched to the table's
+  columns **by name** (case-insensitive, any order); one not in the table is
+  an error that lists the table's columns, a table column not in the COPY
+  stays empty. Rows go out as `POST tables/{name}/rows/add`. A missing table
+  is created: on the sheet named by `SHEET` (default: the table's name),
+  created if missing and refused if it already holds data, the header and
+  rows written as a range, then `tables/add` + a rename.
+- **Values.** Numbers and booleans as such; NULL and non-finite numbers clear
+  the cell. DATE / TIMESTAMP / TIME go out as serials with a number format
+  (`yyyy-mm-dd`, `yyyy-mm-dd hh:mm:ss`, `hh:mm:ss`) so they read back typed;
+  for an appended table block the formats are a second PATCH over the new
+  rows. Text is written with a leading apostrophe (`ExcelTextInput`): Graph
+  sets values *as if typed*, so `=1+1` would become a formula and `00123` a
+  number. Other types are written as their text. TIMESTAMPTZ is written in
+  UTC. Excel keeps 15 significant digits.
+- **Retries.** `rows/add`, `tables/add` and `worksheets/add` are not
+  idempotent: they are re-sent only after throttling (429/503: not applied),
+  never after a 5xx or a lost reply, which may have been applied and would
+  append the rows twice (`IsRetryableWhenNotIdempotent`). A range PATCH is
+  idempotent and retried like any read.
 

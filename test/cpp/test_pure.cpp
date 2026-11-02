@@ -427,6 +427,17 @@ TEST_CASE("a plain 400 is the caller's bad request, not 'error'", "[errors]") {
 	REQUIRE(ClassifyGraphError(418, "") == GraphErrorKind::OTHER);
 }
 
+TEST_CASE("a request that is not idempotent is re-sent only when Graph refused it", "[errors]") {
+	// Throttling (429/503) means Graph did not apply the request: safe to send
+	// again. A 5xx may have been applied before it failed -- re-sending a
+	// rows/add would append the rows twice.
+	REQUIRE(IsRetryableWhenNotIdempotent(GraphErrorKind::THROTTLED));
+	REQUIRE_FALSE(IsRetryableWhenNotIdempotent(GraphErrorKind::SERVER));
+	REQUIRE_FALSE(IsRetryableWhenNotIdempotent(GraphErrorKind::BAD_REQUEST));
+	REQUIRE_FALSE(IsRetryableWhenNotIdempotent(GraphErrorKind::OTHER));
+	REQUIRE(IsRetryable(GraphErrorKind::SERVER)); // unchanged for idempotent requests
+}
+
 TEST_CASE("errors map to DuckDB exception types", "[errors]") {
 	REQUIRE(ExceptionTypeFor(GraphErrorKind::FORBIDDEN) == GraphExceptionType::PERMISSION);
 	REQUIRE(ExceptionTypeFor(GraphErrorKind::BAD_REQUEST) == GraphExceptionType::INVALID_INPUT);

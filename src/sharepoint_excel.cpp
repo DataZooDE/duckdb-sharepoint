@@ -391,6 +391,40 @@ void ExcelSerialToEpoch(double serial, int64_t &days_since_epoch, int64_t &micro
 	micros_of_day = millis * 1000;
 }
 
+double ExcelSerialFromEpoch(int64_t days_since_epoch, int64_t micros_of_day) {
+	// Inverse of ExcelSerialToEpoch: serials 1..59 are one day "later".
+	const bool before_phantom = days_since_epoch >= -25567 && days_since_epoch <= -25509;
+	const auto serial_day = static_cast<double>(days_since_epoch + (before_phantom ? 25568 : 25569));
+	return serial_day + static_cast<double>(micros_of_day) / 86400000000.0;
+}
+
+std::string ExcelTextInput(const std::string &text) {
+	return text.empty() ? text : "'" + text;
+}
+
+bool ExcelBlockAt(const ExcelAddress &anchor, int64_t rows, int64_t cols, ExcelAddress &block, std::string &error) {
+	if (rows < 1 || cols < 1) {
+		error = "nothing to write";
+		return false;
+	}
+	block.sheet = anchor.sheet;
+	block.first_row = anchor.HasCells() ? anchor.first_row : 1;
+	block.first_col = anchor.HasCells() ? anchor.first_col : 1;
+	block.last_row = block.first_row + rows - 1;
+	block.last_col = block.first_col + cols - 1;
+	if (block.last_row > kExcelMaxRows) {
+		error = std::to_string(rows) + " rows from row " + std::to_string(block.first_row) +
+		        " run past Excel's last row (" + std::to_string(kExcelMaxRows) + ")";
+		return false;
+	}
+	if (block.last_col > kExcelMaxColumns) {
+		error = std::to_string(cols) + " columns from column " + ExcelColumnLetters(block.first_col) +
+		        " run past Excel's last column (XFD)";
+		return false;
+	}
+	return true;
+}
+
 ExcelColumnType InferExcelColumnType(const std::vector<const ExcelCell *> &cells) {
 	bool any_string = false, any_bool = false, any_number = false;
 	bool plain = false, date = false, datetime = false, time = false, all_integral = true;

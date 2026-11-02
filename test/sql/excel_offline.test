@@ -43,3 +43,45 @@ statement error
 SELECT * FROM read_excel_table('sharepoint://', 'Sales');
 ----
 not a workbook
+
+# ---------------------------------------------------------------------------
+# COPY ... (FORMAT excel_table | excel_range): options are checked at bind,
+# before any Graph call; the workbook is changed in place, never via a temp
+# file renamed over it.
+# ---------------------------------------------------------------------------
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_table);
+----
+needs TABLE
+
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_range);
+----
+needs RANGE
+
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'A1');
+----
+names no worksheet
+
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Out!A1', USE_TMP_FILE true);
+----
+USE_TMP_FILE is not supported
+
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Out!A1', BOGUS 1);
+----
+Unrecognized option
+
+# The internal writer is reachable only through the rewrite.
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT __sharepoint_excel_range, RANGE 'Out!A1');
+----
+write workbooks with FORMAT excel_range
+
+# Past the bind: the secret lookup, as for reads.
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast');
+----
+no `sharepoint` secret configured for 'sharepoint://Finance/plan.xlsx'
