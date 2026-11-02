@@ -262,7 +262,27 @@ statement ok
 COPY (SELECT i AS n FROM range(5) t(i)) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_range, RANGE 'Short!A1');
 
 statement ok
+CALL sharepoint_reset_stats();
+
+statement ok
 COPY (SELECT 9 AS n) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_range, RANGE 'Short!A1', OVERWRITE);
+
+# Session, sheet lookup, used range, clear, one PATCH, close.
+query I
+SELECT value FROM sharepoint_stats() WHERE metric = 'workbook';
+----
+6
+
+# The raw cells: header, the new row, then four cleared ones.
+query I
+SELECT coalesce(column1, '<empty>') FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Short!A1:A6', header := false, all_varchar := true);
+----
+n
+9
+<empty>
+<empty>
+<empty>
+<empty>
 
 query I
 SELECT n FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Short');
