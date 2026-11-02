@@ -671,6 +671,10 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- /sites/Sales o
 - **Calls.** `lists/{name|id}?$select=id` (Graph takes the list's name in
   place of its id), `lists/{id}/columns`, then
   `lists/{id}/items?$expand=fields&$top=999`, following `@odata.nextLink`.
+  The page size is `sharepoint_list_page_size` (default 999); the e2e test
+  pages a 300-item fixture 50 at a time instead of building a 5,000-item list:
+  creating that many items is throttled to a crawl, and nextLink paging is the
+  same at any size.
   Paging alone works past the 5,000-item list view threshold; a filter would
   need indexed columns, so there is no pushdown yet. Counted as `list` in
   `sharepoint_stats()`. Like the Excel reads, everything is read at bind --

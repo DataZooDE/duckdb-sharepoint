@@ -151,6 +151,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    }
 	    });
 
+	// read_sharepoint_list() pages through items this many at a time. Mostly
+	// for tests: a small page exercises paging without a huge list.
+	loader.GetDatabaseInstance().config.AddExtensionOption(
+	    "sharepoint_list_page_size",
+	    "Items per Graph page when reading a SharePoint list (default 999, between 1 and 999).",
+	    LogicalType::BIGINT, Value::BIGINT(999), [](ClientContext &, SetScope, Value &parameter) {
+		    const auto v = parameter.GetValue<int64_t>();
+		    if (v < 1 || v > 999) {
+			    throw InvalidInputException("sharepoint_list_page_size must be between 1 and 999");
+		    }
+	    });
+
 	sharepoint::RegisterSharepointSecrets(loader);
 
 	// write_blob()/remove_file()/move_file()/file_size(): the FileSystem
