@@ -52,8 +52,10 @@ def test_large_table_by_path_and_by_id(graph, scratch, sql, secret_sql, tmp_path
         SELECT count(*), sum(id), count(note), min(day), max(day), max(stamp), sum(amount),
                count(*) FILTER (WHERE flag) FROM t;
     """).splitlines()
-    # Header row + body address, then the rows in windows of <= 20k cells.
-    assert int(out[-3]) == 2 + math.ceil(ROWS * COLS / CELLS_PER_REQUEST)
+    # Header row + body address, then the rows in windows of whole rows,
+    # <= 20k cells each: 20000 // 6 = 3333 rows a window -> 4 windows.
+    rows_per_window = CELLS_PER_REQUEST // COLS
+    assert int(out[-3]) == 2 + math.ceil(ROWS / rows_per_window)
     # Alphabetical: amount, day, flag, id, note, stamp.
     assert out[-2] == "DOUBLE,DATE,BOOLEAN,BIGINT,VARCHAR,TIMESTAMP"
     expected_notes = ROWS - math.ceil(ROWS / 7)
