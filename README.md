@@ -91,6 +91,33 @@ SELECT write_blob('sharepoint://notes/readme.md', '# Title'::BLOB);
 SELECT remove_file('sharepoint://notes/readme.md');   -- true, then false
 ```
 
+## Excel workbooks, live
+
+`read_excel_table` and `read_excel_range` read an `.xlsx` in SharePoint or
+OneDrive through the Microsoft Graph workbook API. They return the values the
+workbook holds now, without downloading the file, and use the same secret as
+`sharepoint://`.
+
+```sql
+-- A named Excel table: the header row gives the column names.
+SELECT * FROM read_excel_table('Finance/plan.xlsx', 'Sales');
+
+-- A range, or a sheet name for its used range.
+SELECT * FROM read_excel_range('Finance/plan.xlsx', 'Input!A1:F200');
+SELECT * FROM read_excel_range('Finance/plan.xlsx', 'Input', header := false);
+
+-- By driveItem id, stable across a rename.
+SELECT * FROM read_excel_table('id:01ABCDEF23456789', 'Sales');
+```
+
+The path is a `sharepoint://` path (the scheme may be left out) or `id:…`.
+Each column gets one type, inferred from the values and number formats:
+BOOLEAN, BIGINT, DOUBLE, DATE, TIMESTAMP, TIME, or VARCHAR when a column mixes
+kinds. Empty cells and error values such as `#DIV/0!` are NULL.
+`all_varchar := true` reads every column as text, with dates as ISO text.
+Sheet names with spaces are quoted Excel-style: `'''My Sheet''!A1:B9'` in SQL.
+Writing results back into a workbook is next (#50).
+
 ## Authentication
 
 | provider | use | fields |

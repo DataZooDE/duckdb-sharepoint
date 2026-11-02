@@ -48,6 +48,11 @@ struct ChildEntry {
 //! Retry-After as a floor). Used by every retry loop that talks to Microsoft.
 void SleepBeforeRetry(int failed_attempt, int retry_after_seconds);
 
+//! Percent-encode one path segment of a workbook resource (a table or
+//! worksheet name, a range address): everything but unreserved characters,
+//! '/' included.
+string EncodeWorkbookName(const string &name);
+
 //! One open upload session. `upload_url` is a credential (pre-authenticated)
 //! and is empty once the session is committed or aborted.
 struct GraphUploadSession {
@@ -108,6 +113,14 @@ public:
 	//! List the immediate children of a folder given by root-relative path,
 	//! following @odata.nextLink pages.
 	vector<ChildEntry> ListChildren(const string &folder_root_relative_path, bool *found = nullptr);
+
+	//! GET a workbook resource of an .xlsx item and return its JSON body:
+	//! /drives/{drive}/items/{item_id}/workbook/{resource}. `resource` is sent
+	//! as given, so the caller percent-encodes names in it (EncodeWorkbookName).
+	//! Sessionless: each call opens the saved workbook. A 404 throws an
+	//! InvalidInputException naming `what` ("table 'Sales'"), since there it
+	//! means the user named something that is not in the workbook.
+	string WorkbookGet(const string &item_id, const string &resource, const string &what);
 
 private:
 	const AuthContext &auth;

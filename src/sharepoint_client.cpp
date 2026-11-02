@@ -48,6 +48,22 @@ string EncodePath(const string &path) {
 	return out;
 }
 
+} // namespace
+
+string EncodeWorkbookName(const string &name) {
+	string out;
+	for (char c : EncodePath(name)) {
+		if (c == '/') {
+			out += "%2F";
+		} else {
+			out += c;
+		}
+	}
+	return out;
+}
+
+namespace {
+
 // One keep-alive connection per Graph origin per thread, as in the sibling
 // gdrive: a TLS handshake per request roughly doubles the latency of every
 // small call (stat, list, a cached block miss). Per thread, so no locking and
@@ -860,6 +876,27 @@ vector<ChildEntry> GraphClient::ListChildren(const string &folder_root_relative_
 		}
 	}
 	return out;
+}
+
+string GraphClient::WorkbookGet(const string &item_id, const string &resource, const string &what) {
+	IncrementCounter(Counter::WORKBOOK);
+	auto &cli = GraphConnection(auth.graph_endpoint);
+	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.tokens->Token()}};
+	const string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id + "/workbook/" + resource;
+	auto res = SendWithRetry(*auth.tokens, h, [&] { return cli.Get(path.c_str(), h); });
+	if (!res) {
+		throw IOException("sharepoint: reading %s failed at the transport layer", what.c_str());
+	}
+	if (res->status == 404) {
+		string code, message;
+		ParseGraphError(res->body, code, message);
+		throw InvalidInputException("sharepoint: %s not found (Graph %s: %s)", what.c_str(), code.c_str(),
+		                            message.c_str());
+	}
+	if (res->status < 200 || res->status >= 300) {
+		ThrowGraph("read " + what, res->status, res->body);
+	}
+	return res->body;
 }
 
 } // namespace sharepoint

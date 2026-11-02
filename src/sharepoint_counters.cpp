@@ -58,6 +58,8 @@ const char *CounterName(Counter c) {
 		return "meta_cache_hits";
 	case Counter::AUTH_REFRESH:
 		return "auth_refresh";
+	case Counter::WORKBOOK:
+		return "workbook";
 	default:
 		return "unknown";
 	}

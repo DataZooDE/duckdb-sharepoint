@@ -1,0 +1,152 @@
+# name: test/sql/sharepoint_excel.live.template
+# description: read_excel_table / read_excel_range against a REAL workbook
+#              through the Microsoft Graph workbook API. Materialised and run by
+#              scripts/run_live_tests.sh (`make test_live`), like
+#              sharepoint.live.template. The workbook is
+#              test/data/excel/fixture.xlsx (scripts/make_excel_fixture.py).
+# group: [sharepoint]
+
+require sharepoint
+
+require-env SHAREPOINT_TENANT_ID
+
+# As in sharepoint.live.template: no Graph failure may be skipped as "HTTP".
+set ignore_error_messages __sharepoint_never_ignore__
+
+statement ok
+CREATE OR REPLACE SECRET sp_live (
+    TYPE sharepoint,
+    PROVIDER client_credentials,
+    TENANT_ID '@SHAREPOINT_TENANT_ID@',
+    CLIENT_ID '@SHAREPOINT_CLIENT_ID@',
+    CLIENT_SECRET '@SHAREPOINT_CLIENT_SECRET@',
+    DRIVE_ID '@SHAREPOINT_DRIVE_ID@'
+);
+
+# One folder per run: Excel for the web keeps a workbook it has opened busy
+# for a while, so a fixed path could make the next run's upload fail.
+statement ok
+SELECT write_blob('sharepoint://_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx',
+                  (SELECT content FROM read_blob('test/data/excel/fixture.xlsx')));
+
+# ---------------------------------------------------------------------------
+# 1. A named table: header row -> column names, one type per column inferred
+#    from the values and number formats.
+# ---------------------------------------------------------------------------
+query II
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT * FROM read_excel_table('sharepoint://_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Sales'));
+----
+Region	VARCHAR
+Month	DATE
+Revenue	DOUBLE
+Units	BIGINT
+Active	BOOLEAN
+Note	VARCHAR
+Updated	TIMESTAMP
+Start	TIME
+Ratio	DOUBLE
+
+# Empty cells and the #DIV/0! of =1/0 read as NULL.
+query IIIIIIIII
+SELECT * FROM read_excel_table('sharepoint://_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Sales');
+----
+North	2025-01-01	1200.5	10	true	ok	2025-01-01 08:30:00	09:00:00	0.5
+South	2025-02-01	980.25	7	false	NULL	2025-02-01 17:45:00	13:30:00	2.0
+East	2025-03-01	NULL	12	true	late	2025-03-01 00:00:00	07:15:00	NULL
+
+# The scheme is optional; the secret's drive is implied.
+query I
+SELECT count(*) FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Sales');
+----
+3
+
+# all_varchar: untyped text; dates as ISO text, not serial numbers.
+query III
+SELECT Month, Units, Active FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Sales', all_varchar := true) LIMIT 1;
+----
+2025-01-01	10	TRUE
+
+# Cost: one stat, then header, body address and ONE block of values.
+statement ok
+CALL sharepoint_reset_stats();
+
+statement ok
+SELECT * FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Sales');
+
+query II
+SELECT (SELECT value FROM sharepoint_stats() WHERE metric = 'stat'),
+       (SELECT value FROM sharepoint_stats() WHERE metric = 'workbook');
+----
+1	3
+
+# ---------------------------------------------------------------------------
+# 2. A range: an explicit address, a bare sheet (its used range), no header,
+#    and a sheet name that needs quoting.
+# ---------------------------------------------------------------------------
+query III
+SELECT * FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Input!B3:D6');
+----
+widget	3	2.5
+gadget	4	10.0
+doohickey	NULL	1.25
+
+query II
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT * FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Input!B3:D6'));
+----
+product	VARCHAR
+qty	BIGINT
+price	DOUBLE
+
+query III
+SELECT * FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Input!B4:D5', header := false);
+----
+widget	3	2.5
+gadget	4	10.0
+
+query I
+SELECT string_agg(column_name, ',')
+FROM (DESCRIBE SELECT * FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Input!B4:D5', header := false));
+----
+column1,column2,column3
+
+# A bare sheet name reads its used range, A1:D6 here (the title in A1).
+query I
+SELECT count(*) FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Input', header := false);
+----
+6
+
+query I
+SELECT x FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', '''My Sheet''!A1:A2');
+----
+1
+
+# ---------------------------------------------------------------------------
+# 3. Errors name what is missing.
+# ---------------------------------------------------------------------------
+statement error
+SELECT * FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Nope');
+----
+table 'Nope'
+
+statement error
+SELECT * FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Nope!A1:B2');
+----
+worksheet 'Nope'
+
+statement error
+SELECT * FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'A1:B2');
+----
+names no worksheet
+
+statement error
+SELECT * FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/missing.xlsx', 'Sales');
+----
+not found
+
+# ---------------------------------------------------------------------------
+# Cleanup. Best effort: the folder itself is swept by `make sweep_orphans`.
+# ---------------------------------------------------------------------------
+statement ok
+SELECT remove_file('sharepoint://_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx');
