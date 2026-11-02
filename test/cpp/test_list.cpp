@@ -144,6 +144,7 @@ TEST_CASE("PlanListWrite: COPY columns onto list fields", "[list][write]") {
 	REQUIRE_FALSE(PlanListWrite({"Title", "Nope"}, plan, out, error));
 	REQUIRE(error.find("\"Nope\"") != std::string::npos);
 	REQUIRE(error.find("Amount") != std::string::npos); // lists what there is
+}
 
 TEST_CASE("PlanListColumns: built-in Title keeps its name in any site language", "[list]") {
 	// A German site shows Title as "Titel"; queries must not depend on that.
