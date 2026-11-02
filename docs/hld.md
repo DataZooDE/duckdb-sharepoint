@@ -536,6 +536,37 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   marks the write failed (nothing is published). No DuckDB writer is known to
   do it; it is refused rather than allowed to desync the stream.
 
+
+### Discovered on the first live runs of the workbook and list features (2026-11-02)
+
+- **Excel for the web keeps a workbook it has opened locked.** A `DELETE` of
+  the item right after workbook-API writes got HTTP 423 (`notAllowed`,
+  "resource ... is locked"). The live suite therefore leaves its run folder to
+  the nightly sweep (`LIVE_EXCEL_ROOT`, 24 h). An open session holds the lock
+  longer, so a COPY that fails after `createSession` closes the session
+  (`SessionGuard`).
+- **`createSession` answers a transient HTTP 504 (`UnknownError`).** It is
+  retried like a read; a duplicate session after a lost reply is harmless
+  (it expires unused).
+- **A missing workbook table is a 404 `ItemNotFound`**, with the message in
+  the tenant's language ("Die angeforderte Ressource ist nicht vorhanden."),
+  so tests match the name we put in the message, never Graph's text.
+- **Read windows hold whole rows**: at 20,000 cells and 6 columns a window is
+  3,333 rows, so 10,000 rows take four requests, not ⌈60,000 / 20,000⌉ = 3.
+- **Creating a list needs `Sites.Manage.All`.** With only `Sites.ReadWrite.All`
+  (application), `POST /sites/{id}/lists` is 403 `accessDenied`; reading and
+  writing items is not. Only the e2e fixtures create lists.
+- **Concurrent live runs share the suite's fixed paths.** CI concurrency is
+  per branch, so several PRs run against the tenant at once; four re-runs
+  started together made one run's `big.bin` disappear under another
+  (404 `itemNotFound` on a read by id). Not a product bug -- stagger re-runs,
+  and give new suites run-unique paths (`@RUN_ID@`), as the Excel suite does.
+- **Delegated-app setup failures**, met recreating the public-client app for
+  #47: `AADSTS700016` (client ID and tenant from different places -- take both
+  from the app's Overview page), `AADSTS7000218` (*Allow public client flows*
+  off; it must be switched on *and saved*), `AADSTS50173` (the stored refresh
+  token expired; `make delegated_login` again).
+
 ## 8. Two-actor note
 
 The extension binary is built and released from **this** repo (ghcr / the
