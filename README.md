@@ -8,6 +8,10 @@ everything layered on it inherits the scheme: `read_parquet`, `read_csv`,
 `COPY`, `glob`, `ATTACH` of a DuckDB database file, and table formats such as
 DuckLake whose `DATA_PATH` lives on SharePoint.
 
+Next to the filesystem, with the same secret, Excel workbooks are read and
+written live (`read_excel_table`, `read_excel_range`, `COPY ... (FORMAT
+excel_table | excel_range)`).
+
 It is the sibling of [`duckdb-gdrive`](https://github.com/DataZooDE/duckdb-gdrive)
 and shares its design, its glob syntax and its scheme-generic `write_blob` /
 `remove_file` / `move_file` / `file_size` SQL functions. Both extensions load
@@ -17,6 +21,19 @@ into one database side by side.
 > the live SQL suite (`make test_live`) and the e2e harness (`make e2e`:
 > out-of-band changes, restarts, 16-thread scans, DuckLake, two drives) pass.
 > Built for DuckDB **v1.5.6** and **2.0**.
+
+## Example: forecast an Excel workbook in SharePoint
+
+```sql
+CREATE TABLE sales AS SELECT * FROM read_excel_table('Finance/sales.xlsx', 'Sales');     -- live from the workbook
+CREATE TABLE forecast AS                                                                -- anofox_forecast
+SELECT product, ds AS month, yhat AS forecast, yhat_lower AS low, yhat_upper AS high
+FROM ts_forecast_by('sales', product, month, revenue, 'AutoETS', 12, '1mo');
+COPY forecast TO 'Finance/sales.xlsx' (FORMAT excel_range, RANGE 'Forecast!A1');        -- back into it, in place
+```
+
+The whole example, with a sample workbook, is in
+[`examples/excel-forecast/`](examples/excel-forecast/).
 
 ## Why SharePoint is simpler than Drive
 
