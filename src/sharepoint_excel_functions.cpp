@@ -736,10 +736,12 @@ unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, Func
 		g->wb = OpenWorkbook(context, file_path);
 		GraphClient client(g->wb.auth);
 		// One persistent session for the whole COPY: fewer workbook opens, and
-		// every write lands in the saved file.
+		// every write lands in the saved file. Retried like a read: a second
+		// session after a lost reply is harmless (it expires unused), and
+		// Graph does answer createSession with a transient 504 (live CI).
 		const auto session =
 		    ParseObject(client.WorkbookCall("POST", g->wb.item_id, "createSession", "{\"persistChanges\":true}",
-		                                    string(), "workbook session for '" + g->wb.path + "'", false),
+		                                    string(), "workbook session for '" + g->wb.path + "'", true),
 		                "workbook session");
 		auto id = session.find("id");
 		if (id != session.end() && id->second.is<string>()) {
