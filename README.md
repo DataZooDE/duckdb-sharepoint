@@ -1,4 +1,12 @@
-# duckdb-sharepoint
+<h1 align="center">duckdb-sharepoint</h1>
+<p align="center"><strong>Microsoft 365 business data in SQL: files, Excel workbooks and SharePoint lists for DuckDB</strong></p>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://duckdb.org"><img src="https://img.shields.io/badge/DuckDB-1.5.6%20%7C%202.0-green.svg" alt="DuckDB 1.5.6 | 2.0"></a>
+  <a href="https://duckdb.org/community_extensions/extensions/sharepoint"><img src="https://img.shields.io/badge/DuckDB-community%20extension-yellow.svg" alt="DuckDB community extension"></a>
+  <a href="https://github.com/DataZooDE/duckdb-sharepoint/actions/workflows/MainDistributionPipeline.yml"><img src="https://github.com/DataZooDE/duckdb-sharepoint/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=main" alt="Build"></a>
+</p>
 
 **Microsoft 365 business data in SQL.** Query files, Excel workbooks and
 SharePoint lists in SharePoint and OneDrive directly from DuckDB, and write
@@ -30,7 +38,8 @@ One install, one secret, and app-only or user sign-in. Built for DuckDB
 - [Excel workbooks](#excel-workbooks)
 - [SharePoint lists](#sharepoint-lists)
 - [Installation](#installation) · [Authentication](#authentication) · [Settings](#settings) · [Diagnostics](#diagnostics) · [Limitations](#limitations)
-- [How it works](#how-it-works) · [Building and testing](#building-and-testing)
+- [Network and privacy](#network-and-privacy) · [How it works](#how-it-works) · [Building and testing](#building-and-testing)
+- [Support and feedback](#support-and-feedback) · [License](#license) · [Citation](#citation)
 
 ## Quick start
 
@@ -353,6 +362,23 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
   - A date-only column comes back as midnight in the site's time zone,
     converted to UTC.
 
+## Network and privacy
+
+Your data goes only between DuckDB and Microsoft:
+
+| what | where | opt out |
+|---|---|---|
+| Files, workbooks, lists | Microsoft Graph (`graph.microsoft.com`, or your national cloud) | — |
+| Sign-in and token refresh | Entra ID (`login.microsoftonline.com`, or your national cloud) | — |
+| File downloads and upload chunks | your tenant's own SharePoint host, via pre-authenticated URLs Graph hands out | — |
+| Telemetry | one anonymous `extension_loaded` event to PostHog EU: the extension's name, version and platform, and a random installation id | `SET sharepoint_telemetry_enabled = false`, or `DATAZOO_DISABLE_TELEMETRY=1` to stop the load event too |
+
+Only Microsoft hosts are accepted as endpoints, so a setting can't send your
+credentials elsewhere. Access tokens are held in memory only. Refresh tokens
+are stored only in a `PERSISTENT` secret, in DuckDB's secret directory (see
+[Authentication](#authentication)). Telemetry never includes your data,
+paths, table or list names, or SQL.
+
 ## How it works
 
 Google Drive has **no path addressing**: resolving `a/b/c.parquet` costs one
@@ -414,6 +440,37 @@ It prints only SHA-256 fingerprints of the old and rotated tokens. If it
 reports `invalid_grant`, sign in again with `make delegated_login` and update
 the secret. Details: [docs/hld.md §5.2](docs/hld.md).
 
+## Support and feedback
+
+- Design notes and the Graph behaviours found along the way: [docs/hld.md](docs/hld.md)
+- Issues: [GitHub Issues](https://github.com/DataZooDE/duckdb-sharepoint/issues)
+
+If `sharepoint` misbehaves, please [open an issue](https://github.com/DataZooDE/duckdb-sharepoint/issues).
+That includes a sign-in that won't complete, a workbook or list that reads
+wrong, or a write that doesn't land. SharePoint behaves differently with
+tenant settings, permissions and throttling in ways we can't reproduce here,
+so a report with your setup is the fastest path to a fix. Errors end with
+that link.
+
+If it saved you time, a star on the repo helps other people find it.
+
+The first time you load the extension in an interactive terminal each day, a
+small banner says the same. It never prints when output is piped, in notebooks
+or in CI. Silence it with `SET datazoo_banner = false;` or `DATAZOO_NO_BANNER=1`.
+
 ## License
 
-MIT © 2026 DataZoo GmbH.
+MIT © 2026 DataZoo GmbH. See [LICENSE](LICENSE).
+
+## Citation
+
+If you use this extension in research, please cite:
+
+```bibtex
+@software{duckdb_sharepoint,
+  title  = {duckdb-sharepoint: Microsoft 365 Business Data in SQL for DuckDB},
+  author = {Joachim Rosskopf and DataZoo GmbH},
+  year   = {2026},
+  url    = {https://github.com/DataZooDE/duckdb-sharepoint}
+}
+```
