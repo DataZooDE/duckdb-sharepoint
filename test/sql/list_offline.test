@@ -1,0 +1,33 @@
+# name: test/sql/list_offline.test
+# description: read_sharepoint_list without credentials: registered, and bad
+#              input fails before any Graph call. Reading a real list is
+#              e2e/tests/test_sharepoint_list.py.
+# group: [sharepoint]
+
+require sharepoint
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'read_sharepoint_list' AND function_type = 'table';
+----
+1
+
+statement error
+SELECT * FROM read_sharepoint_list(NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM read_sharepoint_list('id:');
+----
+name a list
+
+# No secret: a configuration error, as for files.
+statement error
+SELECT * FROM read_sharepoint_list('Orders');
+----
+no `sharepoint` secret configured
+
+statement error
+SELECT * FROM read_sharepoint_list('Orders', site := 'Sales');
+----
+no `sharepoint` secret configured

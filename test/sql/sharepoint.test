@@ -24,7 +24,7 @@ WHERE function_name IN ('write_blob', 'remove_file', 'move_file', 'file_size');
 query I
 SELECT count(*) FROM sharepoint_stats();
 ----
-20
+21
 
 statement ok
 CALL sharepoint_reset_stats();

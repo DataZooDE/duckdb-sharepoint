@@ -132,6 +132,23 @@ COPY (SELECT * FROM summary) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE '
 Dates, timestamps and times are written with a date format, so they read back
 typed. Text stays text: `=1+1` is not turned into a formula.
 
+## SharePoint lists
+
+`read_sharepoint_list` reads a SharePoint list as a table, one row per item,
+with the same secret:
+
+```sql
+SELECT * FROM read_sharepoint_list('Orders');                  -- a list on the secret's site
+SELECT * FROM read_sharepoint_list('id:4f2c…');                -- by list id
+SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- another site on the same host
+```
+
+Columns are named by their display names and typed: text, number, currency
+(DECIMAL), yes/no, date and time (TIMESTAMP, UTC), choice (VARCHAR, or
+VARCHAR[] for several choices). A lookup column gives its value and
+`<name>_id`, and a person column `<name>_id`. Every row also has `id`,
+`created` and `modified`. Lists of any size are read page by page.
+
 ## Authentication
 
 | provider | use | fields |

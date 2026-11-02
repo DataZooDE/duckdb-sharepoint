@@ -92,6 +92,7 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_token_policy.cpp
     src/sharepoint_delegated.cpp
     src/sharepoint_excel.cpp
+    src/sharepoint_list.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -109,6 +110,7 @@ file(GLOB DUCKDB_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_filesystem.cpp
     src/sharepoint_vfs_functions.cpp
     src/sharepoint_excel_functions.cpp
+    src/sharepoint_list_functions.cpp
 )
 
 set(EXTENSION_SOURCES ${PURE_SOURCES} ${DUCKDB_SOURCES})

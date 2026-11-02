@@ -60,6 +60,8 @@ const char *CounterName(Counter c) {
 		return "auth_refresh";
 	case Counter::WORKBOOK:
 		return "workbook";
+	case Counter::SHAREPOINT_LIST:
+		return "list";
 	default:
 		return "unknown";
 	}

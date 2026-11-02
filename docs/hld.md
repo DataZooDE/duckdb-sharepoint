@@ -395,7 +395,12 @@ sessions", a Conditional Access change, or 90 days without any redemption.
    Write side implemented 2026-11-02: `COPY ... (FORMAT excel_table|excel_range)`
    (§9.1). Open: replacing a table's rows (today a table only grows -- rerun
    into a range, or a fresh table), clearing cells beyond a shorter rewrite of
-   a range, the 1904 date system. Then SharePoint lists (#49).
+   a range, the 1904 date system.
+9. **SharePoint lists (#49).** Read side implemented 2026-11-02:
+   `read_sharepoint_list` (§10). Open: verified live (e2e, which needs the
+   app's Sites.Manage.All to create its fixture lists once); multi-choice and
+   person columns untested live; writing (`COPY ... (FORMAT sharepoint_list)`:
+   append, then update by id); filter pushdown on indexed columns.
 
 ## 7a. Discovered on the first live runs (2026-10-10)
 
@@ -635,4 +640,42 @@ COPY (SELECT ...) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Out!B2');  
   never after a 5xx or a lost reply, which may have been applied and would
   append the rows twice (`IsRetryableWhenNotIdempotent`). A range PATCH is
   idempotent and retried like any read.
+
+## 10. SharePoint lists: `read_sharepoint_list` (#49)
+
+Decided 2026-11-02 (#52): in this extension, names as proposed in #49, after
+the Excel functions.
+
+```sql
+SELECT * FROM read_sharepoint_list('Orders');                  -- the secret's site
+SELECT * FROM read_sharepoint_list('id:4f2c...');              -- by list id
+SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- /sites/Sales on the same host
+```
+
+- **Which site.** The secret names a drive (DRIVE_ID, or SITE_ID's default
+  library), so the default site is the drive's: `GET /drives/{d}/list` ->
+  `parentReference.siteId`. `site :=` takes a Graph site id (`host,guid,guid`),
+  `host:/sites/x`, or a path on the same host (`Sales` = `sites/Sales`,
+  `teams/Ops`). Lists have no path, so the secret used is the one in scope for
+  `sharepoint://` (an unscoped one).
+- **Calls.** `lists/{name|id}?$select=id` (Graph takes the list's name in
+  place of its id), `lists/{id}/columns`, then
+  `lists/{id}/items?$expand=fields&$top=999`, following `@odata.nextLink`.
+  Paging alone works past the 5,000-item list view threshold; a filter would
+  need indexed columns, so there is no pushdown yet. Counted as `list` in
+  `sharepoint_stats()`. Like the Excel reads, everything is read at bind --
+  here because a choice column is multi-valued only if its data says so.
+- **Columns** (pure, `sharepoint_list.*`): `id` first, `created` / `modified`
+  last (UTC); every column neither hidden nor read-only, named by its display
+  name, ContentType and Attachments left out. The system names win a clash
+  (a user column "Created" becomes `Created_2`).
+- **Types.** text -> VARCHAR, number -> DOUBLE, currency -> DECIMAL(18,4),
+  boolean -> BOOLEAN, dateTime -> TIMESTAMP (Graph returns UTC; a date-only
+  column is midnight in the *site's* time zone, so it can read as the evening
+  before -- not corrected yet), choice -> VARCHAR or VARCHAR[], hyperlink ->
+  the URL, calculated -> by its output type, other -> VARCHAR (JSON text).
+  Lookup -> the display value plus `<name>_id` (`<internal>LookupId`); person
+  -> only `<name>_id`, since Graph gives a person's id in the user information
+  list, not a name. A field missing from an item (Graph omits empty ones) is
+  NULL.
 
