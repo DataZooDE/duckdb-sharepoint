@@ -48,6 +48,11 @@ GraphErrorKind ClassifyGraphError(int http_status, const std::string &graph_erro
 //! refresh, which is a different path, so it is NOT included here.
 bool IsRetryable(GraphErrorKind kind);
 
+//! For a request that must not be applied twice (a workbook rows/add or
+//! tables/add): re-send only when Graph refused it (throttling), never after a
+//! 5xx or a lost reply, which may have been applied.
+bool IsRetryableWhenNotIdempotent(GraphErrorKind kind);
+
 //! A short, stable, credential-free label for a kind -- used to build
 //! exception messages on the DuckDB side.
 const char *GraphErrorKindName(GraphErrorKind kind);

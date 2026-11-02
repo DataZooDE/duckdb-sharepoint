@@ -278,3 +278,50 @@ TEST_CASE("ExcelHeaderNames", "[excel][header]") {
 	names = ExcelHeaderNames({Str("column2"), Empty()});
 	REQUIRE(names == std::vector<std::string> {"column2", "column2_2"});
 }
+
+TEST_CASE("ExcelSerialFromEpoch inverts ExcelSerialToEpoch", "[excel][write]") {
+	REQUIRE(ExcelSerialFromEpoch(0, 0) == 25569);     // 1970-01-01
+	REQUIRE(ExcelSerialFromEpoch(20089, 0) == 45658); // 2025-01-01
+	REQUIRE(ExcelSerialFromEpoch(20089, 18LL * 3600 * 1000000) == 45658.75);
+	REQUIRE(ExcelSerialFromEpoch(-25509, 0) == 59);                      // 1900-02-28, before the phantom day
+	REQUIRE(ExcelSerialFromEpoch(-25508, 0) == 61);                      // 1900-03-01
+	REQUIRE(ExcelSerialFromEpoch(-25569, 12LL * 3600 * 1000000) == 0.5); // a time of day alone
+	for (double serial : {1.0, 59.0, 61.0, 45658.0, 45658.5, 2958465.0}) {
+		int64_t days, micros;
+		ExcelSerialToEpoch(serial, days, micros);
+		REQUIRE(ExcelSerialFromEpoch(days, micros) == serial);
+	}
+}
+
+TEST_CASE("ExcelTextInput keeps text as text", "[excel][write]") {
+	// Graph sets values as if typed: '=1+1' would become a formula, '00123'
+	// a number, 'TRUE' a boolean, '1/2' a date. A leading apostrophe makes
+	// Excel store the rest as text; it is not part of the value.
+	REQUIRE(ExcelTextInput("=1+1") == "'=1+1");
+	REQUIRE(ExcelTextInput("00123") == "'00123");
+	REQUIRE(ExcelTextInput("North") == "'North");
+	REQUIRE(ExcelTextInput("'quoted") == "''quoted");
+	REQUIRE(ExcelTextInput("").empty()); // empty clears the cell
+}
+
+TEST_CASE("ExcelBlockAt: the cells a write covers from its anchor", "[excel][write]") {
+	ExcelAddress block;
+	std::string error;
+	auto anchor = ParseExcelAddress("Out!B3").address;
+	REQUIRE(ExcelBlockAt(anchor, 10, 4, block, error));
+	REQUIRE(FormatExcelAddress(block) == "Out!B3:E12");
+
+	// A full range as anchor: only its top-left cell counts.
+	REQUIRE(ExcelBlockAt(ParseExcelAddress("Out!C5:Z99").address, 1, 1, block, error));
+	REQUIRE(FormatExcelAddress(block) == "Out!C5:C5");
+
+	// A bare sheet anchors at A1.
+	REQUIRE(ExcelBlockAt(ParseExcelAddress("Out").address, 2, 2, block, error));
+	REQUIRE(FormatExcelAddress(block) == "Out!A1:B2");
+
+	// Past Excel's last row or column is an error, not a wrap.
+	REQUIRE_FALSE(ExcelBlockAt(ParseExcelAddress("S!A1048576").address, 2, 1, block, error));
+	REQUIRE(error.find("1048576") != std::string::npos);
+	REQUIRE_FALSE(ExcelBlockAt(ParseExcelAddress("S!XFD1").address, 1, 2, block, error));
+	REQUIRE_FALSE(ExcelBlockAt(anchor, 0, 4, block, error)); // nothing to write
+}

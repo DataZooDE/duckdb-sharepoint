@@ -81,6 +81,23 @@ ExcelNumberKind ClassifyExcelNumberFormat(const std::string &format);
 //! on 1899-12-30, Excel's day 0.
 void ExcelSerialToEpoch(double serial, int64_t &days_since_epoch, int64_t &micros_of_day);
 
+//! The inverse of ExcelSerialToEpoch: the serial Excel stores for a date
+//! (days since 1970-01-01) and a time of day. 1900-01-01..1900-02-28 count
+//! from 1899-12-31, as Excel does.
+double ExcelSerialFromEpoch(int64_t days_since_epoch, int64_t micros_of_day);
+
+//! The input that stores `text` as text. Graph sets values as if typed, so
+//! "=1+1" would become a formula and "00123" a number; a leading apostrophe
+//! keeps the rest as text and is not part of the value. Empty stays empty
+//! (it clears the cell).
+std::string ExcelTextInput(const std::string &text);
+
+//! The block of `rows` x `cols` cells a write anchored at `anchor` covers:
+//! the anchor's top-left cell (A1 for a bare sheet) down and right. False,
+//! with `error` set, when there is nothing to write or the block would run
+//! past Excel's last row (1048576) or column (XFD).
+bool ExcelBlockAt(const ExcelAddress &anchor, int64_t rows, int64_t cols, ExcelAddress &block, std::string &error);
+
 //! One cell from the workbook API.
 enum class ExcelCellKind { EMPTY, NUMBER, STRING, BOOLEAN, ERROR };
 

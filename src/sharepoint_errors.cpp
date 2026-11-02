@@ -47,6 +47,10 @@ bool IsRetryable(GraphErrorKind kind) {
 	return kind == GraphErrorKind::THROTTLED || kind == GraphErrorKind::SERVER;
 }
 
+bool IsRetryableWhenNotIdempotent(GraphErrorKind kind) {
+	return kind == GraphErrorKind::THROTTLED;
+}
+
 const char *GraphErrorKindName(GraphErrorKind kind) {
 	switch (kind) {
 	case GraphErrorKind::OK:

@@ -122,6 +122,15 @@ public:
 	//! means the user named something that is not in the workbook.
 	string WorkbookGet(const string &item_id, const string &resource, const string &what);
 
+	//! Any workbook request: `method` GET, POST or PATCH, `json_body` sent as
+	//! application/json, `session_id` as the workbook-session-id header when
+	//! not empty. `idempotent = false` for a request that must not be applied
+	//! twice (rows/add, tables/add): it is re-sent only after throttling.
+	//! With `status` given, a 404 is returned in-band (empty body) instead of
+	//! thrown; every other non-2xx throws.
+	string WorkbookCall(const string &method, const string &item_id, const string &resource, const string &json_body,
+	                    const string &session_id, const string &what, bool idempotent, int *status = nullptr);
+
 private:
 	const AuthContext &auth;
 };

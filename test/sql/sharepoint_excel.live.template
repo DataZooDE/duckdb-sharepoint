@@ -146,6 +146,116 @@ SELECT * FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/missi
 not found
 
 # ---------------------------------------------------------------------------
+# 4. Write back: COPY ... (FORMAT excel_range) into a new sheet, typed.
+#    Text stays text ('=1+1' is no formula, '00123' no number).
+# ---------------------------------------------------------------------------
+statement ok
+CALL sharepoint_reset_stats();
+
+statement ok
+COPY (SELECT * FROM (VALUES
+        ('a', 1, 2.5, DATE '2026-01-31', TIMESTAMP '2026-01-31 13:45:00', TIME '07:30:00', true, '=1+1'),
+        ('b', 2, NULL, DATE '2026-02-28', TIMESTAMP '2026-02-28 00:00:00', TIME '23:59:59', false, '00123'))
+      t(name, n, x, d, ts, tm, flag, raw))
+TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_range, RANGE 'Out!B2');
+
+# One stat; session, sheet lookup, sheet add, one PATCH, close.
+query II
+SELECT (SELECT value FROM sharepoint_stats() WHERE metric = 'stat'),
+       (SELECT value FROM sharepoint_stats() WHERE metric = 'workbook');
+----
+1	5
+
+query II
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT * FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Out!B2:I4'));
+----
+name	VARCHAR
+n	BIGINT
+x	DOUBLE
+d	DATE
+ts	TIMESTAMP
+tm	TIME
+flag	BOOLEAN
+raw	VARCHAR
+
+query IIIIIIII
+SELECT * FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Out!B2:I4');
+----
+a	1	2.5	2026-01-31	2026-01-31 13:45:00	07:30:00	true	=1+1
+b	2	NULL	2026-02-28	2026-02-28 00:00:00	23:59:59	false	00123
+
+# Re-running overwrites the same cells; HEADER false writes data only.
+statement ok
+COPY (SELECT 'c' AS name, 3 AS n) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_range, RANGE 'Out!B3', HEADER false);
+
+query II
+SELECT name, n FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Out!B2:C4');
+----
+c	3
+b	2
+
+# ---------------------------------------------------------------------------
+# 5. COPY ... (FORMAT excel_table): append to an existing table, by column
+#    name (any order, any case; columns not given stay empty), keeping types.
+# ---------------------------------------------------------------------------
+statement ok
+COPY (SELECT 4 AS units, 'West' AS region, DATE '2025-04-01' AS month, TIMESTAMP '2025-04-01 09:15:00' AS updated)
+TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_table, TABLE 'Sales');
+
+query I
+SELECT count(*) FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Sales');
+----
+4
+
+query IIIII
+SELECT Region, Month, Units, Updated, Note FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Sales') WHERE Region = 'West';
+----
+West	2025-04-01	4	2025-04-01 09:15:00	NULL
+
+query II
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT * FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Sales')) WHERE column_name IN ('Month', 'Updated');
+----
+Month	DATE
+Updated	TIMESTAMP
+
+# A table that does not exist is created, on a new sheet of its name.
+statement ok
+COPY (SELECT (DATE '2026-01-01' + INTERVAL (i) MONTH)::DATE AS month, 100.5 + i AS forecast FROM range(12) t(i))
+TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_table, TABLE 'Forecast');
+
+query III
+SELECT count(*), min(month), max(forecast) FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Forecast');
+----
+12	2026-01-01	111.5
+
+# ... and a second COPY appends to it.
+statement ok
+COPY (SELECT DATE '2027-01-01' AS month, 200.5 AS forecast) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_table, TABLE 'Forecast');
+
+query I
+SELECT count(*) FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Forecast');
+----
+13
+
+statement error
+COPY (SELECT 1 AS nope) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_table, TABLE 'Sales');
+----
+has no column "nope"
+
+# A missing table is never created on top of existing data.
+statement error
+COPY (SELECT 1 AS a) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_table, TABLE 'NewOne', SHEET 'Input');
+----
+already holds data
+
+statement error
+COPY (SELECT 1 AS a, 2 AS b) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_range, RANGE 'Out!XFD1');
+----
+past Excel's last column
+
+# ---------------------------------------------------------------------------
 # Cleanup. Best effort: the folder itself is swept by `make sweep_orphans`.
 # ---------------------------------------------------------------------------
 statement ok

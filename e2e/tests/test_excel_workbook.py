@@ -69,3 +69,29 @@ def test_large_table_by_path_and_by_id(graph, scratch, sql, secret_sql, tmp_path
     """).splitlines()
     assert out[-2] == f"{ROWS}|{ROWS - 1}"
     assert out[-1] == "100"
+
+
+def test_copy_changes_the_workbook_in_place(graph, scratch, sql, secret_sql, tmp_path):
+    """COPY ... (FORMAT excel_range | excel_table) writes through the workbook
+    API: the same driveItem afterwards (same id), and no tmp_ file renamed
+    over it -- DuckDB's default for COPY onto an existing file (docs/hld.md §9)."""
+    local = tmp_path / "w.xlsx"
+    wb = openpyxl.Workbook()
+    wb.active.title = "Data"
+    wb.save(local)
+    path = f"{scratch}/w.xlsx"
+    sql(f"{secret_sql} SELECT write_blob('sharepoint://{path}', content) FROM read_blob('{local}');")
+    before = graph.stat(path)["id"]
+
+    out = sql(f"""{secret_sql}
+        COPY (SELECT i AS n, 'r' || i AS s FROM range(25000) t(i))
+        TO 'sharepoint://{path}' (FORMAT excel_range, RANGE 'Data!A1');
+        COPY (SELECT i AS n FROM range(3) t(i)) TO 'sharepoint://{path}' (FORMAT excel_table, TABLE 'T');
+        SELECT count(*), sum(n) FROM read_excel_range('{path}', 'Data!A1:B25001');
+        SELECT count(*) FROM read_excel_table('{path}', 'T');
+    """).splitlines()
+    # 25,000 x 2 cells: three PATCH windows of <= 20k cells, in row order.
+    assert out[-2] == f"25000|{25000 * 24999 // 2}"
+    assert out[-1] == "3"
+    assert graph.stat(path)["id"] == before
+    assert graph.stat(f"{scratch}/tmp_w.xlsx") is None

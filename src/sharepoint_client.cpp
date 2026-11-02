@@ -166,8 +166,14 @@ string ErrorCode(const string &body) {
 // A 401 means the token was revoked or expired early: the token source mints
 // a fresh one (once) and the request is re-sent with it. `h` carries the
 // Authorization header and is updated in place.
+//
+// `idempotent = false` (a workbook rows/add, tables/add): re-sent only when
+// Graph refused it (throttling). A 5xx or a lost reply may have been applied,
+// and sending it again would append the rows twice -- so it is returned (or
+// its transport failure reported) instead.
 template <class Send>
-duckdb_httplib_openssl::Result SendWithRetry(TokenSource &tokens, duckdb_httplib_openssl::Headers &h, Send send) {
+duckdb_httplib_openssl::Result SendWithRetry(TokenSource &tokens, duckdb_httplib_openssl::Headers &h, Send send,
+                                             bool idempotent = true) {
 	bool refreshed = false;
 	for (int attempt = 1;; attempt++) {
 		auto res = send();
@@ -188,7 +194,8 @@ duckdb_httplib_openssl::Result SendWithRetry(TokenSource &tokens, duckdb_httplib
 		if (kind == GraphErrorKind::THROTTLED) {
 			IncrementCounter(Counter::THROTTLED);
 		}
-		const bool retryable = !res || IsRetryable(kind);
+		const bool retryable =
+		    idempotent ? (!res || IsRetryable(kind)) : (res && IsRetryableWhenNotIdempotent(kind));
 		if (!retryable || attempt >= kMaxGraphAttempts) {
 			return res;
 		}
@@ -878,14 +885,37 @@ vector<ChildEntry> GraphClient::ListChildren(const string &folder_root_relative_
 	return out;
 }
 
-string GraphClient::WorkbookGet(const string &item_id, const string &resource, const string &what) {
+string GraphClient::WorkbookCall(const string &method, const string &item_id, const string &resource,
+                                 const string &json_body, const string &session_id, const string &what, bool idempotent,
+                                 int *status) {
 	IncrementCounter(Counter::WORKBOOK);
 	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.tokens->Token()}};
+	if (!session_id.empty()) {
+		h.emplace("workbook-session-id", session_id);
+	}
 	const string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id + "/workbook/" + resource;
-	auto res = SendWithRetry(*auth.tokens, h, [&] { return cli.Get(path.c_str(), h); });
+	auto res = SendWithRetry(
+	    *auth.tokens, h,
+	    [&] {
+		    if (method == "POST") {
+			    return cli.Post(path.c_str(), h, json_body, "application/json");
+		    }
+		    if (method == "PATCH") {
+			    return cli.Patch(path.c_str(), h, json_body, "application/json");
+		    }
+		    return cli.Get(path.c_str(), h);
+	    },
+	    idempotent);
 	if (!res) {
-		throw IOException("sharepoint: reading %s failed at the transport layer", what.c_str());
+		throw IOException("sharepoint: %s %s failed at the transport layer%s", method.c_str(), what.c_str(),
+		                  idempotent ? "" : " (it may or may not have been applied)");
+	}
+	if (status) {
+		*status = res->status;
+		if (res->status == 404) {
+			return string();
+		}
 	}
 	if (res->status == 404) {
 		string code, message;
@@ -894,9 +924,13 @@ string GraphClient::WorkbookGet(const string &item_id, const string &resource, c
 		                            message.c_str());
 	}
 	if (res->status < 200 || res->status >= 300) {
-		ThrowGraph("read " + what, res->status, res->body);
+		ThrowGraph((method == "GET" ? "read " : "write ") + what, res->status, res->body);
 	}
 	return res->body;
+}
+
+string GraphClient::WorkbookGet(const string &item_id, const string &resource, const string &what) {
+	return WorkbookCall("GET", item_id, resource, string(), string(), what, true, nullptr);
 }
 
 } // namespace sharepoint
