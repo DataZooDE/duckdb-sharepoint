@@ -20,6 +20,7 @@ DEFAULT_MAX_AGE_HOURS = 24
 
 SITE_SCRATCH_ROOT = "_duckdb_sharepoint_e2e_site"  # test_secret_scoping, on the site's own drive
 LIVE_STREAM_ROOT = "_duckdb_sharepoint_live/stream"  # make test_live: one run-<id> folder per run
+LIVE_EXCEL_ROOT = "_duckdb_sharepoint_live/excel"  # make test_live: workbooks Excel for the web keeps locked a while
 
 
 def site_drive_graph(graph: Graph) -> Graph | None:
@@ -54,6 +55,7 @@ if __name__ == "__main__":
         main_graph = Graph.from_env()
         sweep(main_graph, hours)
         sweep(main_graph, hours, LIVE_STREAM_ROOT)
+        sweep(main_graph, hours, LIVE_EXCEL_ROOT)
         other = site_drive_graph(main_graph)
         if other is not None:
             sweep(other, hours, SITE_SCRATCH_ROOT)

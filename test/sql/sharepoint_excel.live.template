@@ -255,8 +255,6 @@ COPY (SELECT 1 AS a, 2 AS b) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixt
 ----
 past Excel's last column
 
-# ---------------------------------------------------------------------------
-# Cleanup. Best effort: the folder itself is swept by `make sweep_orphans`.
-# ---------------------------------------------------------------------------
-statement ok
-SELECT remove_file('sharepoint://_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx');
+# No cleanup: Excel for the web keeps a workbook it has opened locked for a
+# while (HTTP 423 on delete). The nightly sweep (e2e/helpers/sweep.py,
+# LIVE_EXCEL_ROOT) removes run folders older than 24 h.
