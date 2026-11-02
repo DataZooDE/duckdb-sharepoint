@@ -31,3 +31,8 @@ statement error
 SELECT * FROM read_sharepoint_list('Orders', site := 'Sales');
 ----
 no `sharepoint` secret configured
+
+statement error
+SET sharepoint_list_page_size = 0;
+----
+between 1 and 999

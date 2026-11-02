@@ -2,8 +2,11 @@
 a lookup, paging past the 5,000-item list view threshold, by name and by id,
 on the secret's site and by an explicit site.
 
-The fixture lists are provisioned once and then reused (creating 5,100 items
-takes a few hundred $batch calls): `_duckdb_sharepoint_e2e_customers` and
+Paging is exercised with a small page (sharepoint_list_page_size) rather
+than a 5,000-item list: nextLink paging is the same at any size, and the
+5,000-item threshold matters only for filters and sorting, which
+read_sharepoint_list does not use. The fixture lists are provisioned once and
+then reused: `_duckdb_sharepoint_e2e_customers` and
 `_duckdb_sharepoint_e2e_orders` on the site of SHAREPOINT_DRIVE_ID. Bump
 FIXTURE_VERSION when their content changes -- an older pair is deleted and
 rebuilt. Creating lists needs the app's Sites.Manage.All (or FullControl)."""
@@ -12,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import time
 
 import pytest
 
@@ -19,10 +23,11 @@ from helpers.graph import GRAPH
 
 pytestmark = pytest.mark.live
 
-FIXTURE_VERSION = "1"
+FIXTURE_VERSION = "2"
 ORDERS = f"_duckdb_sharepoint_e2e_orders_v{FIXTURE_VERSION}"
 CUSTOMERS = f"_duckdb_sharepoint_e2e_customers_v{FIXTURE_VERSION}"
-ITEMS = 5_100  # past the 5,000-item list view threshold
+ITEMS = 300
+PAGE = 50  # sharepoint_list_page_size: six pages, the same nextLink paging a 5,000+ item list takes
 STATUSES = ["open", "shipped", "closed"]
 
 
@@ -49,13 +54,16 @@ def _batch_post(graph, site, list_id, fields_list):
         reqs = [{"id": str(i), "method": "POST", "url": f"/sites/{site}/lists/{list_id}/items",
                  "headers": {"Content-Type": "application/json"}, "body": {"fields": f}}
                 for i, f in enumerate(fields_list[start:start + 20])]
-        for attempt in range(6):
+        for attempt in range(8):
             out = _ok(graph._req("POST", f"{GRAPH}/$batch", json={"requests": reqs}), "batch")
-            failed = {x["id"] for x in out["responses"] if x["status"] >= 300}
+            failed = [x for x in out["responses"] if x["status"] >= 300]
             if not failed:
                 break
-            # Throttled or failed parts only; the rest were created.
-            reqs = [q for q in reqs if q["id"] in failed]
+            # Throttled or failed parts only; the rest were created. SharePoint
+            # throttles bulk item creation: wait as long as it asks.
+            wait = max([float((x.get("headers") or {}).get("Retry-After", 0) or 0) for x in failed] + [2.0 ** attempt])
+            time.sleep(min(wait, 60.0))
+            reqs = [q for q in reqs if q["id"] in {x["id"] for x in failed}]
         else:
             raise AssertionError(f"batch kept failing: {out['responses'][:2]}")
 
@@ -97,6 +105,7 @@ def fixture_lists(graph):
 def test_list_types_paging_and_lookup(fixture_lists, sql, secret_sql):
     site, orders, _ = fixture_lists
     out = sql(f"""{secret_sql}
+        SET sharepoint_list_page_size = {PAGE};
         CALL sharepoint_reset_stats();
         CREATE TABLE o AS SELECT * FROM read_sharepoint_list('{ORDERS}');
         SELECT (SELECT value FROM sharepoint_stats() WHERE metric = 'list');
@@ -108,7 +117,9 @@ def test_list_types_paging_and_lookup(fixture_lists, sql, secret_sql):
     assert out[0] == "true"  # sharepoint_reset_stats()
     out = out[1:]
     pages = int(out[0])
-    assert pages >= 3 + math.ceil(ITEMS / 999), f"{pages} Graph calls"
+    # drive -> site, list, columns, then one call per page
+    # (plus possibly one empty last page when ITEMS is a multiple of PAGE)
+    assert 3 + math.ceil(ITEMS / PAGE) <= pages <= 4 + math.ceil(ITEMS / PAGE), f"{pages} Graph calls"
     assert out[1] == ("id BIGINT, Title VARCHAR, Amount DOUBLE, Price DECIMAL(18,4), Done BOOLEAN, "
                       "Due TIMESTAMP, Status VARCHAR, Customer VARCHAR, Customer_id BIGINT, "
                       "created TIMESTAMP, modified TIMESTAMP")

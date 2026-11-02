@@ -27,9 +27,19 @@ namespace sharepoint {
 
 namespace {
 
-//! Items per page. Graph pages list items with @odata.nextLink; paging alone
-//! works past the 5,000-item list view threshold (no filter, no order).
-constexpr int kItemsPerPage = 999;
+//! Items per page by default (sharepoint_list_page_size). Graph pages list
+//! items with @odata.nextLink; paging alone works past the 5,000-item list
+//! view threshold (no filter, no order).
+constexpr int64_t kItemsPerPage = 999;
+
+int64_t ListPageSize(ClientContext &context) {
+	Value v;
+	auto opener = ClientData::Get(context).file_opener.get();
+	if (duckdb_compat::TryGetSetting(opener, "sharepoint_list_page_size", v) && !v.IsNull()) {
+		return v.GetValue<int64_t>();
+	}
+	return kItemsPerPage;
+}
 //! A nextLink chain longer than this is a server bug, not a list.
 constexpr int kMaxItemPages = 100000;
 
@@ -298,7 +308,7 @@ unique_ptr<FunctionData> ListBind(ClientContext &context, TableFunctionBindInput
 		// Every item first: whether a choice column is multi-valued shows only
 		// in the data.
 		vector<picojson::object> items;
-		string next = base + "/items?$expand=fields&$top=" + std::to_string(kItemsPerPage);
+		string next = base + "/items?$expand=fields&$top=" + std::to_string(ListPageSize(context));
 		for (int pages = 0; !next.empty(); pages++) {
 			if (pages >= kMaxItemPages) {
 				throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxItemPages);
