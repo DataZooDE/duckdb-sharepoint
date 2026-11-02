@@ -52,6 +52,8 @@ struct ListOutputColumn {
 	ListColumnType type = ListColumnType::VARCHAR;
 	//! CHOICE: becomes VARCHAR_LIST if any item holds several values.
 	bool may_be_multi = false;
+	//! A lookup's display value: read-only (it is written through `<name>_id`).
+	bool lookup_value = false;
 };
 
 //! The result columns for a list:
@@ -73,6 +75,30 @@ std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &
 //! Parse Graph's RFC 3339 timestamps ("2026-01-31T08:15:00Z", with optional
 //! fraction or a +hh:mm offset) into microseconds since 1970-01-01 UTC.
 bool ParseIsoTimestamp(const std::string &text, int64_t &micros_since_epoch);
+
+//! Microseconds since 1970-01-01 UTC as Graph writes them: "2026-01-31T08:15:00Z"
+//! (".250000" added when there is a fraction).
+std::string FormatIsoTimestamp(int64_t micros_since_epoch);
+
+//! Where one COPY column goes when writing items.
+enum class ListWriteTarget { FIELD, ID, SKIP };
+
+struct ListWriteColumn {
+	ListWriteTarget target = ListWriteTarget::SKIP;
+	std::string field; // FIELD: the key in the item's fields
+};
+
+//! Map COPY column names onto a list's columns (as PlanListColumns names them,
+//! case-insensitively; the internal field name works too):
+//!  - `id` -> ID: a row with an id updates that item, a NULL id creates one;
+//!  - `created`, `modified` and a lookup's display column -> SKIP: Graph sets
+//!    them (a lookup is written through `<name>_id`), so a list read back with
+//!    read_sharepoint_list can be written back unchanged;
+//!  - any other list column -> FIELD.
+//! False, with `error` naming the column and the list's columns, for a name
+//! the list does not have.
+bool PlanListWrite(const std::vector<std::string> &copy_names, const std::vector<ListOutputColumn> &plan,
+                   std::vector<ListWriteColumn> &out, std::string &error);
 
 } // namespace sharepoint
 } // namespace duckdb

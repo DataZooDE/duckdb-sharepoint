@@ -129,3 +129,57 @@ def test_list_types_paging_and_lookup(fixture_lists, sql, secret_sql):
 def test_missing_list_names_it(sql, secret_sql):
     out = sql(f"{secret_sql} SELECT * FROM read_sharepoint_list('_no_such_list_');", expect_error=True)
     assert "list '_no_such_list_'" in out and "not found" in out
+
+
+def test_copy_creates_and_updates_items(graph, fixture_lists, sql, secret_sql):
+    """COPY ... (FORMAT sharepoint_list): rows without an id create items (in
+    $batch calls of 20), rows with one update that item, and a
+    read_sharepoint_list result can be written back as it is."""
+    site, _, customers = fixture_lists
+    import uuid
+    name = f"_duckdb_sharepoint_e2e_write_{uuid.uuid4().hex[:8]}"
+    created = _ok(graph._req("POST", f"{GRAPH}/sites/{site}/lists", json={
+        "displayName": name, "list": {"template": "genericList"},
+        "columns": [
+            {"name": "Amount", "number": {}},
+            {"name": "Due", "dateTime": {"format": "dateTime"}},
+            {"name": "Done", "boolean": {}},
+            {"name": "Status", "choice": {"choices": STATUSES}},
+            {"name": "Customer", "lookup": {"listId": customers, "columnName": "Title"}},
+        ]}), "create write list")["id"]
+    try:
+        out = sql(f"""{secret_sql}
+            COPY (SELECT 'row ' || i AS Title, i * 1.5 AS Amount,
+                         TIMESTAMP '2026-03-01 12:00:00' + INTERVAL (i) DAY AS Due, i % 2 = 0 AS Done,
+                         ['open', 'shipped', 'closed'][1 + i % 3] AS Status, 1 + i % 3 AS Customer_id
+                  FROM range(45) t(i))
+            TO '{name}' (FORMAT sharepoint_list);
+            SELECT count(*), sum(Amount), min(Due), max(Due), count(*) FILTER (WHERE Done),
+                   count(DISTINCT Status), string_agg(DISTINCT Customer, ',' ORDER BY Customer)
+            FROM read_sharepoint_list('{name}');
+        """).splitlines()
+        assert out[-1] == (f"45|{sum(i * 1.5 for i in range(45))}|2026-03-01 12:00:00|2026-04-14 12:00:00|23|3|"
+                           "Acme,Globex,Initech")
+
+        # Update by id: double the large amounts; nothing is added.
+        out = sql(f"""{secret_sql}
+            COPY (SELECT id, Amount * 2 AS Amount FROM read_sharepoint_list('{name}') WHERE Amount >= 30)
+            TO '{name}' (FORMAT sharepoint_list);
+            SELECT count(*), sum(Amount) FROM read_sharepoint_list('{name}');
+        """).splitlines()
+        expected = sum(i * 1.5 * (2 if i * 1.5 >= 30 else 1) for i in range(45))
+        assert out[-1] == f"45|{expected}"
+
+        # A read result written back as it is (created, modified and the
+        # lookup's display value are Graph's): an update, not a copy.
+        out = sql(f"""{secret_sql}
+            COPY (SELECT * REPLACE ('renamed' AS Title) FROM read_sharepoint_list('{name}') WHERE Title = 'row 0')
+            TO '{name}' (FORMAT sharepoint_list);
+            SELECT count(*), count(*) FILTER (WHERE Title = 'renamed') FROM read_sharepoint_list('{name}');
+        """).splitlines()
+        assert out[-1] == "45|1"
+
+        out = sql(f"{secret_sql} COPY (SELECT 1 AS nope) TO '{name}' (FORMAT sharepoint_list);", expect_error=True)
+        assert 'has no column "nope"' in out
+    finally:
+        graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}")

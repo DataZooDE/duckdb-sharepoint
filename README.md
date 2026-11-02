@@ -149,6 +149,19 @@ VARCHAR[] for several choices). A lookup column gives its value and
 `<name>_id`, and a person column `<name>_id`. Every row also has `id`,
 `created` and `modified`. Lists of any size are read page by page.
 
+Write items back with `COPY`. A row with an `id` updates that item, a row
+without one creates an item, and columns are matched by name:
+
+```sql
+COPY (SELECT 'A-17' AS Title, 120.0 AS Amount, 2 AS Customer_id) TO 'Orders' (FORMAT sharepoint_list);
+COPY (SELECT id, Amount * 1.1 AS Amount FROM read_sharepoint_list('Orders') WHERE Status = 'open')
+TO 'Orders' (FORMAT sharepoint_list);
+```
+
+`created`, `modified` and a lookup's display column are skipped (set a lookup
+through `<name>_id`), so a list read with `read_sharepoint_list` can be
+changed and written back as it is.
+
 ## Authentication
 
 | provider | use | fields |

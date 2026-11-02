@@ -31,3 +31,27 @@ statement error
 SELECT * FROM read_sharepoint_list('Orders', site := 'Sales');
 ----
 no `sharepoint` secret configured
+
+# ---------------------------------------------------------------------------
+# COPY ... TO '<list>' (FORMAT sharepoint_list): rewritten in place like the
+# workbook writers; the internal writer is reachable only through it.
+# ---------------------------------------------------------------------------
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, USE_TMP_FILE true);
+----
+USE_TMP_FILE is not supported for list writes
+
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, BOGUS 1);
+----
+Unrecognized option
+
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT __sharepoint_list);
+----
+write lists with FORMAT sharepoint_list
+
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, SITE 'Sales');
+----
+no `sharepoint` secret configured

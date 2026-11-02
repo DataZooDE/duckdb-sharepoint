@@ -140,6 +140,12 @@ public:
 	//! in-band (empty body); every other non-2xx throws, naming `what`.
 	string GraphGet(const string &path, const string &what, int *status = nullptr);
 
+	//! POST or PATCH a JSON body to any Graph path and return the reply's
+	//! body; non-2xx throws, naming `what`. `idempotent = false` (a $batch
+	//! that creates items): re-sent only after throttling.
+	string GraphSend(const string &method, const string &path, const string &json_body, const string &what,
+	                 bool idempotent);
+
 private:
 	const AuthContext &auth;
 };

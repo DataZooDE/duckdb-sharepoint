@@ -965,6 +965,28 @@ string GraphClient::GraphGet(const string &path, const string &what, int *status
 	return res->body;
 }
 
+string GraphClient::GraphSend(const string &method, const string &path, const string &json_body, const string &what,
+                              bool idempotent) {
+	IncrementCounter(Counter::SHAREPOINT_LIST);
+	auto &cli = GraphConnection(auth.graph_endpoint);
+	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.tokens->Token()}};
+	auto res = SendWithRetry(
+	    *auth.tokens, h,
+	    [&] {
+		    return method == "PATCH" ? cli.Patch(path.c_str(), h, json_body, "application/json")
+		                             : cli.Post(path.c_str(), h, json_body, "application/json");
+	    },
+	    idempotent);
+	if (!res) {
+		throw IOException("sharepoint: %s %s failed at the transport layer%s", method.c_str(), what.c_str(),
+		                  idempotent ? "" : " (it may or may not have been applied)");
+	}
+	if (res->status < 200 || res->status >= 300) {
+		ThrowGraph("write " + what, res->status, res->body);
+	}
+	return res->body;
+}
+
 string GraphClient::WorkbookGet(const string &item_id, const string &resource, const string &what) {
 	return WorkbookCall("GET", item_id, resource, string(), string(), what, true, nullptr);
 }

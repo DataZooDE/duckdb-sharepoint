@@ -106,3 +106,42 @@ TEST_CASE("ParseIsoTimestamp", "[list]") {
 	REQUIRE_FALSE(ParseIsoTimestamp("2026-13-01T00:00:00Z", us));
 	REQUIRE_FALSE(ParseIsoTimestamp("yesterday", us));
 }
+
+TEST_CASE("FormatIsoTimestamp round-trips ParseIsoTimestamp", "[list][write]") {
+	REQUIRE(FormatIsoTimestamp(0) == "1970-01-01T00:00:00Z");
+	REQUIRE(FormatIsoTimestamp(1769847300LL * 1000000) == "2026-01-31T08:15:00Z");
+	REQUIRE(FormatIsoTimestamp(1769847300LL * 1000000 + 250000) == "2026-01-31T08:15:00.250000Z");
+	REQUIRE(FormatIsoTimestamp(-2203891200LL * 1000000) == "1900-03-01T00:00:00Z");
+	REQUIRE(FormatIsoTimestamp(-1) == "1969-12-31T23:59:59.999999Z");
+	for (int64_t us : {0LL, 1769847300250000LL, -2203891200000000LL, 253402300799000000LL}) {
+		int64_t back = 0;
+		REQUIRE(ParseIsoTimestamp(FormatIsoTimestamp(us), back));
+		REQUIRE(back == us);
+	}
+}
+
+TEST_CASE("PlanListWrite: COPY columns onto list fields", "[list][write]") {
+	auto plan = PlanListColumns({Col("Title", "Title", ListFacet::TEXT), Col("Amount0", "Amount", ListFacet::NUMBER),
+	                             Col("Customer", "Customer", ListFacet::LOOKUP)});
+	std::vector<ListWriteColumn> out;
+	std::string error;
+	// A read_sharepoint_list result written back as-is.
+	REQUIRE(
+	    PlanListWrite({"id", "Title", "amount", "Customer", "Customer_id", "created", "modified"}, plan, out, error));
+	REQUIRE(out.size() == 7);
+	REQUIRE(out[0].target == ListWriteTarget::ID);
+	REQUIRE((out[1].target == ListWriteTarget::FIELD && out[1].field == "Title"));
+	REQUIRE((out[2].target == ListWriteTarget::FIELD && out[2].field == "Amount0")); // by display name, any case
+	REQUIRE(out[3].target == ListWriteTarget::SKIP);                                 // lookup value: via _id
+	REQUIRE((out[4].target == ListWriteTarget::FIELD && out[4].field == "CustomerLookupId"));
+	REQUIRE(out[5].target == ListWriteTarget::SKIP);
+	REQUIRE(out[6].target == ListWriteTarget::SKIP);
+
+	// The internal name works too.
+	REQUIRE(PlanListWrite({"Amount0"}, plan, out, error));
+	REQUIRE(out[0].field == "Amount0");
+
+	REQUIRE_FALSE(PlanListWrite({"Title", "Nope"}, plan, out, error));
+	REQUIRE(error.find("\"Nope\"") != std::string::npos);
+	REQUIRE(error.find("Amount") != std::string::npos); // lists what there is
+}

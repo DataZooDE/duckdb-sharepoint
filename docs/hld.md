@@ -399,8 +399,8 @@ sessions", a Conditional Access change, or 90 days without any redemption.
 9. **SharePoint lists (#49).** Read side implemented 2026-11-02:
    `read_sharepoint_list` (§10). Open: verified live (e2e, which needs the
    app's Sites.Manage.All to create its fixture lists once); multi-choice and
-   person columns untested live; writing (`COPY ... (FORMAT sharepoint_list)`:
-   append, then update by id); filter pushdown on indexed columns.
+   person columns untested live; filter pushdown on indexed columns. Write
+   side implemented 2026-11-02: `COPY ... (FORMAT sharepoint_list)` (§10.1).
 
 ## 7a. Discovered on the first live runs (2026-10-10)
 
@@ -678,4 +678,34 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- /sites/Sales o
   -> only `<name>_id`, since Graph gives a person's id in the user information
   list, not a name. A field missing from an item (Graph omits empty ones) is
   NULL.
+
+### 10.1 Writing: `COPY ... TO '<list>' (FORMAT sharepoint_list)`
+
+```sql
+COPY (SELECT 'A-17' AS Title, 120.0 AS Amount, 2 AS Customer_id) TO 'Orders' (FORMAT sharepoint_list);   -- create
+COPY (SELECT id, Amount * 1.1 AS Amount FROM read_sharepoint_list('Orders') WHERE Status = 'open')
+TO 'Orders' (FORMAT sharepoint_list);                                                                   -- update by id
+```
+
+- **Create or update, per row.** A row with an `id` updates that item
+  (`PATCH items/{id}/fields`, only the columns given); a row without one -- no
+  `id` column, or a NULL id -- creates an item (`POST items`). The COPY target
+  is the list's name (or `id:<listId>`), `SITE` as for reading.
+- **Columns** are matched like the Excel table writer: by result name, any
+  case, or by internal name (`PlanListWrite`, pure). `created`, `modified` and
+  a lookup's display column are skipped -- Graph sets them, and a lookup is
+  set through `<name>_id` -- so a `read_sharepoint_list` result can be changed
+  and written back as it is. Any other name the list lacks is an error that
+  lists its columns.
+- **Values.** NULL clears the field; dates and timestamps as RFC 3339 UTC;
+  numbers and booleans as such; a lookup id as a string (as Graph takes it); a
+  LIST as a multi-choice value with its `@odata.type` annotation.
+- **Requests.** `$batch` calls of 20 (Graph's limit). Each part is checked on
+  its own: throttled parts are re-sent; an update that failed with a 5xx too
+  (idempotent); a create that failed with a 5xx is reported, not re-sent --
+  it may have been applied, and re-sending would create the item twice. A
+  batch holding any create is itself sent as non-idempotent.
+- **In place.** The target is a list, not a file, but COPY's temp-file rename
+  would still be attempted for a name that exists as a local file; the same
+  rewrite as the Excel writers (`sharepoint_copy_rewrite.hpp`) rules it out.
 

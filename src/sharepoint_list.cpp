@@ -3,6 +3,7 @@
 #include "sharepoint_list.hpp"
 
 #include <cctype>
+#include <cstdio>
 #include <cstdint>
 #include <set>
 
@@ -103,6 +104,7 @@ std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &
 				ListOutputColumn value;
 				value.name = Claim(used, base);
 				value.field = def.name;
+				value.lookup_value = true;
 				out.push_back(value);
 			}
 			ListOutputColumn key;
@@ -129,6 +131,83 @@ std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &
 	modified.field = "Modified";
 	out.push_back(modified);
 	return out;
+}
+
+std::string FormatIsoTimestamp(int64_t micros) {
+	int64_t seconds = micros / 1000000;
+	int64_t frac = micros % 1000000;
+	if (frac < 0) {
+		frac += 1000000;
+		seconds--;
+	}
+	int64_t days = seconds / 86400;
+	int64_t rest = seconds % 86400;
+	if (rest < 0) {
+		rest += 86400;
+		days--;
+	}
+	// Civil from days (Howard Hinnant).
+	int64_t z = days + 719468;
+	const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+	const int64_t doe = z - era * 146097;
+	const int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+	const int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+	const int64_t mp = (5 * doy + 2) / 153;
+	const int64_t d = doy - (153 * mp + 2) / 5 + 1;
+	const int64_t m = mp < 10 ? mp + 3 : mp - 9;
+	const int64_t y = yoe + era * 400 + (m <= 2 ? 1 : 0);
+	char buf[48];
+	std::snprintf(buf, sizeof(buf), "%04lld-%02lld-%02lldT%02lld:%02lld:%02lld", static_cast<long long>(y),
+	              static_cast<long long>(m), static_cast<long long>(d), static_cast<long long>(rest / 3600),
+	              static_cast<long long>(rest / 60 % 60), static_cast<long long>(rest % 60));
+	std::string out = buf;
+	if (frac) {
+		std::snprintf(buf, sizeof(buf), ".%06lld", static_cast<long long>(frac));
+		out += buf;
+	}
+	return out + "Z";
+}
+
+bool PlanListWrite(const std::vector<std::string> &copy_names, const std::vector<ListOutputColumn> &plan,
+                   std::vector<ListWriteColumn> &out, std::string &error) {
+	out.clear();
+	for (auto &name : copy_names) {
+		const auto lname = Lower(name);
+		const ListOutputColumn *match = nullptr;
+		for (auto &col : plan) {
+			if (Lower(col.name) == lname) {
+				match = &col;
+				break;
+			}
+		}
+		if (!match) {
+			for (auto &col : plan) {
+				if (Lower(col.field) == lname && col.field != "id") {
+					match = &col;
+					break;
+				}
+			}
+		}
+		ListWriteColumn w;
+		if (!match) {
+			std::string have;
+			for (auto &col : plan) {
+				have += (have.empty() ? "" : ", ") + col.name;
+			}
+			error = "the list has no column \"" + name + "\" (it has: " + have + ")";
+			return false;
+		}
+		if (match->field == "id") {
+			w.target = ListWriteTarget::ID;
+		} else if (match->lookup_value || match->name == "created" || match->name == "modified") {
+			w.target = ListWriteTarget::SKIP;
+		} else {
+			w.target = ListWriteTarget::FIELD;
+			w.field = match->field;
+		}
+		out.push_back(w);
+	}
+	return true;
 }
 
 bool ParseIsoTimestamp(const std::string &s, int64_t &micros) {
