@@ -26,6 +26,9 @@ namespace sharepoint {
 
 //! Declared by every internal writer, set only by RewriteCopyInPlace.
 constexpr const char *kInPlaceMarker = "__sharepoint_in_place";
+//! COPY's own OVERWRITE, carried past the binder (which would consume it as a
+//! file option) for the writers that support it (the Excel ones).
+constexpr const char *kOverwriteMarker = "__sharepoint_overwrite";
 
 //! A COPY option's values, or nullptr; the map's key is a string before 2.0
 //! and an Identifier in 2.0.
@@ -46,9 +49,11 @@ inline bool IsRewrittenInPlace(const CopyInfo &info) {
 }
 
 //! Rebind `stmt` as `internal_format`, in place (USE_TMP_FILE false). `what`
-//! names the target in the error for an explicit USE_TMP_FILE true.
+//! names the target in errors. With `supports_overwrite`, COPY's OVERWRITE is
+//! carried as kOverwriteMarker (it never reaches DuckDB's file handling);
+//! without, it is refused. OVERWRITE_OR_IGNORE and APPEND are always refused.
 inline BoundStatement RewriteCopyInPlace(Binder &binder, CopyStatement &stmt, const char *internal_format,
-                                         const char *what) {
+                                         const char *what, bool supports_overwrite = false) {
 	auto copy = stmt.Copy();
 	auto &info = *copy->Cast<CopyStatement>().info;
 	auto tmp = FindCopyOption(info.options, "use_tmp_file");
@@ -59,6 +64,21 @@ inline BoundStatement RewriteCopyInPlace(Binder &binder, CopyStatement &stmt, co
 	}
 	info.format = internal_format;
 	using Key = typename std::decay<decltype(info.options)>::type::key_type;
+	for (const char *mode : {"overwrite_or_ignore", "append"}) {
+		if (FindCopyOption(info.options, mode)) {
+			throw InvalidInputException("sharepoint: %s is a file option, not supported for %s writes", mode, what);
+		}
+	}
+	auto overwrite = FindCopyOption(info.options, "overwrite");
+	const bool replace =
+	    overwrite && (overwrite->empty() || (*overwrite)[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>());
+	if (overwrite && !supports_overwrite) {
+		throw InvalidInputException("sharepoint: OVERWRITE is not supported for %s writes", what);
+	}
+	info.options.erase(Key("overwrite"));
+	if (replace) {
+		info.options[Key(kOverwriteMarker)] = {Value::BOOLEAN(true)};
+	}
 	info.options[Key("use_tmp_file")] = {Value::BOOLEAN(false)};
 	info.options[Key(kInPlaceMarker)] = {Value::BOOLEAN(true)};
 	return binder.Bind(*copy);

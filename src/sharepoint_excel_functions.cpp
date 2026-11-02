@@ -519,6 +519,9 @@ struct ExcelWriteBindData : public FunctionData {
 	string sheet;        // excel_table: where to create a missing table
 	ExcelAddress anchor; // excel_range: the top-left cell
 	bool header = true;  // excel_range: write the column names first
+	//! OVERWRITE: excel_table replaces the table's rows; excel_range first
+	//! clears from the anchor down and right (ExcelClearRegion).
+	bool overwrite = false;
 	vector<string> names;
 	vector<ExcelWriteKind> kinds;
 
@@ -565,6 +568,7 @@ unique_ptr<FunctionData> ExcelWriteBind(ClientContext &context, CopyFunctionBind
 		data->anchor = parsed.address;
 		data->header = CopyBoolOption(context, info, "header", true);
 	}
+	data->overwrite = FindCopyOption(info.options, kOverwriteMarker) != nullptr;
 	for (idx_t i = 0; i < sql_types.size(); i++) {
 		data->names.push_back(duckdb_compat::Str(names[i]));
 		data->kinds.push_back(WriteKindFor(sql_types[i]));
@@ -757,6 +761,20 @@ unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, Func
 				g->create_table = true;
 				anchor.sheet = bind.sheet;
 				write_header = true;
+			} else if (bind.overwrite) {
+				// Replace: turn the table back into cells, clear them, and
+				// create it anew from its old top-left cell (the create path).
+				const auto range =
+				    ParseObject(client.WorkbookCall("GET", g->wb.item_id, base + "/range?$select=address", string(),
+				                                    g->session_id, what, true),
+				                what);
+				const auto old_block = ParseGraphAddress(range, what);
+				client.WorkbookCall("POST", g->wb.item_id, base + "/convertToRange", "{}", g->session_id, what, false);
+				client.WorkbookCall("POST", g->wb.item_id, RangeResource(old_block) + "/clear", "{\"applyTo\":\"All\"}",
+				                    g->session_id, what, true);
+				g->create_table = true;
+				anchor = old_block;
+				write_header = true;
 			} else {
 				// Append: map COPY columns onto the table's columns by name.
 				auto header = ParseObject(header_body, what);
@@ -790,8 +808,21 @@ unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, Func
 			}
 		} else {
 			anchor = bind.anchor;
-			EnsureWorksheet(client, *g, anchor.sheet);
+			const bool created = EnsureWorksheet(client, *g, anchor.sheet);
 			write_header = bind.header;
+			if (bind.overwrite && !created) {
+				const string what = Quoted("worksheet", anchor.sheet, g->wb);
+				const auto used = ParseObject(
+				    client.WorkbookCall("GET", g->wb.item_id,
+				                        WorksheetResource(anchor.sheet) + "/usedRange(valuesOnly=true)?$select=address",
+				                        string(), g->session_id, what, true),
+				    what);
+				ExcelAddress region;
+				if (ExcelClearRegion(anchor, ParseGraphAddress(used, what), region)) {
+					client.WorkbookCall("POST", g->wb.item_id, RangeResource(region) + "/clear",
+					                    "{\"applyTo\":\"Contents\"}", g->session_id, what, true);
+				}
+			}
 		}
 		// Range writing (excel_range, or a table being created).
 		g->width = bind.names.size();
@@ -888,22 +919,24 @@ CopyFunctionExecutionMode ExcelWriteExecutionMode(bool, bool) {
 
 void ExcelTableCopyOptions(ClientContext &, CopyOptionsInput &input) {
 	AddCopyOption(input.options, kInPlaceMarker, LogicalType::BOOLEAN);
+	AddCopyOption(input.options, kOverwriteMarker, LogicalType::BOOLEAN);
 	AddCopyOption(input.options, "table", LogicalType::VARCHAR);
 	AddCopyOption(input.options, "sheet", LogicalType::VARCHAR);
 }
 
 void ExcelRangeCopyOptions(ClientContext &, CopyOptionsInput &input) {
 	AddCopyOption(input.options, kInPlaceMarker, LogicalType::BOOLEAN);
+	AddCopyOption(input.options, kOverwriteMarker, LogicalType::BOOLEAN);
 	AddCopyOption(input.options, "range", LogicalType::VARCHAR);
 	AddCopyOption(input.options, "header", LogicalType::BOOLEAN);
 }
 
 BoundStatement ExcelTableCopyPlan(Binder &binder, CopyStatement &stmt) {
-	return RewriteCopyInPlace(binder, stmt, kTableFormatInternal, "workbook");
+	return RewriteCopyInPlace(binder, stmt, kTableFormatInternal, "workbook", true);
 }
 
 BoundStatement ExcelRangeCopyPlan(Binder &binder, CopyStatement &stmt) {
-	return RewriteCopyInPlace(binder, stmt, kRangeFormatInternal, "workbook");
+	return RewriteCopyInPlace(binder, stmt, kRangeFormatInternal, "workbook", true);
 }
 
 CopyFunction MakeExcelWriter(const char *name, copy_to_bind_t bind, copy_options_t options) {

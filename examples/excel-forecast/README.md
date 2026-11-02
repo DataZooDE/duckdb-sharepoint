@@ -23,12 +23,12 @@ can stay open in Excel while the query runs.
    duckdb < forecast.sql
    ```
 
-The workbook gets a `Forecast` sheet with `product`, `month`, `forecast`,
-`low`, `high` (a 90% prediction interval) and `model`. Running it again
-overwrites the same cells.
+The workbook gets an Excel table `Forecast`, on a sheet of its own, with
+`product`, `month`, `forecast`, `low`, `high` (a 90% prediction interval) and
+`model`. Running it again replaces the table's rows (`OVERWRITE`).
 
 | step | function |
 |---|---|
 | read the Excel table | `read_excel_table('Finance/sales.xlsx', 'Sales')` |
 | forecast per product | `ts_forecast_by('sales', product, month, revenue, 'AutoETS', 12, '1mo')` |
-| write it back | `COPY forecast TO 'Finance/sales.xlsx' (FORMAT excel_range, RANGE 'Forecast!A1')` |
+| write it back | `COPY forecast TO 'Finance/sales.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE)` |

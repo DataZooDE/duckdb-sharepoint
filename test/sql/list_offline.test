@@ -55,3 +55,9 @@ statement error
 COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, SITE 'Sales');
 ----
 no `sharepoint` secret configured
+
+# OVERWRITE has no meaning for a list (yet): refused, not passed on.
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, OVERWRITE);
+----
+OVERWRITE is not supported for list writes

@@ -9,7 +9,7 @@ copies to keep in sync.
 SELECT * FROM 'sharepoint://Finance/2026/actuals.parquet';           -- files
 SELECT * FROM read_excel_table('Finance/plan.xlsx', 'Sales');         -- Excel, live
 SELECT * FROM read_sharepoint_list('Orders');                         -- SharePoint lists
-COPY results TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Forecast!A1');   -- and back
+COPY results TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE);   -- and back
 ```
 
 | | read | write |
@@ -68,7 +68,7 @@ back.
 
 | example | from | with | back to |
 |---|---|---|---|
-| [**Sales forecast**](examples/excel-forecast/) | Excel table of monthly sales | [anofox_forecast](https://github.com/DataZooDE/anofox-forecast): AutoETS, 12 months ahead per product | a `Forecast` sheet in the same workbook |
+| [**Sales forecast**](examples/excel-forecast/) | Excel table of monthly sales | [anofox_forecast](https://github.com/DataZooDE/anofox-forecast): AutoETS, 12 months ahead per product | a `Forecast` table in the same workbook |
 | [**Marketing-mix regression**](examples/excel-statistics/) | Excel table of spend and sales | [anofox_statistics](https://github.com/DataZooDE/anofox-statistics): OLS with CIs and p-values | a `Model` sheet in the same workbook |
 | [**PII and data quality**](examples/list-data-quality/) | SharePoint list of customers | [anofox_tabular](https://github.com/DataZooDE/anofox-tabular): PII scan, email/phone/VAT/IBAN checks | an `Issues` column on every item, plus a masked Parquet copy |
 | [**Lead scoring**](examples/list-lead-scoring/) | SharePoint list of leads | [anofox_tabfm](https://github.com/DataZooDE/anofox-tabfm): zero-shot classification, no training | `Prediction` and `Score` on every open lead |
@@ -80,7 +80,7 @@ CREATE TABLE sales AS SELECT * FROM read_excel_table('Finance/sales.xlsx', 'Sale
 CREATE TABLE forecast AS                                                                -- anofox_forecast
 SELECT product, ds AS month, yhat AS forecast, yhat_lower AS low, yhat_upper AS high
 FROM ts_forecast_by('sales', product, month, revenue, 'AutoETS', 12, '1mo');
-COPY forecast TO 'Finance/sales.xlsx' (FORMAT excel_range, RANGE 'Forecast!A1');        -- back into it, in place
+COPY forecast TO 'Finance/sales.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE); -- back, as an Excel table
 ```
 
 ## Files: `sharepoint://`
@@ -152,6 +152,15 @@ COPY (SELECT month, forecast FROM fc) TO 'Finance/plan.xlsx' (FORMAT excel_table
 
 -- Overwrite a block from its top-left cell, column names first (HEADER false: data only).
 COPY (SELECT * FROM summary) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Summary!B2');
+```
+
+Add `OVERWRITE` to replace instead: a table's rows are replaced (same name,
+same place), and a range is cleared from its top-left cell down and right
+before it is written, so a shorter result leaves nothing stale behind. Either
+way a re-run gives the same workbook:
+
+```sql
+COPY forecast TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE);
 ```
 
 Dates, timestamps and times are written with a date format, so they read back
@@ -227,8 +236,9 @@ between two drives is refused rather than silently landing in one of them.
 Lists have no path, so they use the secret in scope for `sharepoint://`.
 
 **App-only.** Register an app in Entra ID and grant it the
-`Sites.ReadWrite.All` (or `Files.ReadWrite.All`) **application** permission,
-with admin consent:
+`Sites.ReadWrite.All` **application** permission, with admin consent.
+`Files.ReadWrite.All` is enough for files and Excel workbooks, but SharePoint
+lists need `Sites.ReadWrite.All`:
 
 ```sql
 CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,
@@ -272,6 +282,22 @@ a token from `make delegated_login`, which writes it to the git-ignored
 Tokens are cached per **fingerprint of the credentials**, never per secret
 name, so a secret recreated under the same name with different credentials
 authenticates afresh.
+
+**Where the IDs come from.** All of them are on the app registration's
+*Overview* page in the Entra admin center (*App registrations → All
+applications → your app*): **Application (client) ID** is `CLIENT_ID`, and
+**Directory (tenant) ID** is `TENANT_ID` (a verified domain such as
+`contoso.onmicrosoft.com` works too). The *Object ID* is not used. `DRIVE_ID`
+and `SITE_ID` are SharePoint's, not Entra's.
+
+**When a sign-in fails**, Entra's error code says what to fix:
+
+| error | meaning | fix |
+|---|---|---|
+| `AADSTS700016` | no app with this client ID in this tenant | copy both IDs from the same app's *Overview* page; use the *Application (client) ID*, not the *Object ID* |
+| `AADSTS7000218` | the app is not a public client | *Authentication → Allow public client flows* → **Enabled**, then **Save** |
+| `AADSTS50173` / `invalid_grant` | the refresh token expired or was revoked | sign in again (recreate the secret without `REFRESH_TOKEN`) |
+| HTTP 403 `accessDenied` | the app lacks a permission | add it under *API permissions* and click **Grant admin consent** (it shows *Not granted* until then) |
 
 > The option is `GRAPH_SCOPE`, **not** `SCOPE`: DuckDB's `CREATE SECRET`
 > grammar reserves `SCOPE` for the secret's path-prefix list. An OAuth scope
@@ -320,8 +346,6 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
 - **Excel.**
   - Workbooks are read whole when the query is planned, which suits Excel's
     sizes; a sheet of millions of cells belongs in Parquet.
-  - A table only grows: there is no "replace the rows" yet. To overwrite,
-    write a range.
   - Workbooks in the 1904 date system (old Mac files) read four years early.
 - **Lists.**
   - No filter pushdown yet.
@@ -362,7 +386,11 @@ make check_pin check_credentials check_cstdint check_stamp smoke_loadable
 ```
 
 There are no mocks: everything Graph-facing is proven against a real
-Microsoft 365 tenant. Live tests read `SHAREPOINT_TENANT_ID`,
+Microsoft 365 tenant. The test tenant needs two apps: an **app-only** one
+with the application permissions `Sites.ReadWrite.All` and
+`Sites.Manage.All` (the e2e harness creates its own fixture lists once; the
+extension itself never needs it), and a **public-client** one for the
+delegated tests (see [Authentication](#authentication)). Live tests read `SHAREPOINT_TENANT_ID`,
 `SHAREPOINT_CLIENT_ID`, `SHAREPOINT_CLIENT_SECRET` and `SHAREPOINT_DRIVE_ID`
 from the environment, or from a git-ignored `.env.sharepoint` (see
 `.env.sharepoint.example`).

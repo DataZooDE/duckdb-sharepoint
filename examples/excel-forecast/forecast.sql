@@ -2,7 +2,7 @@
 --
 -- sales.xlsx (make_sample_workbook.py) holds monthly revenue per product in
 -- the Excel table "Sales". This reads it live, forecasts the next 12 months
--- per product, and writes the forecast into the workbook's "Forecast" sheet --
+-- per product, and writes the forecast into the workbook as the table "Forecast" --
 -- in place, so the workbook can stay open in Excel while it runs.
 
 INSTALL sharepoint FROM community;
@@ -31,11 +31,10 @@ SELECT product, ds AS month, round(yhat, 2) AS forecast,
 FROM ts_forecast_by('sales', product, month, revenue, 'AutoETS', 12, '1mo')
 ORDER BY product, month;
 
--- 3. Back into the workbook, from Forecast!A1 (the sheet is created if it is
---    missing). Re-running overwrites the same cells. To keep the forecast as
---    an Excel table instead -- which a re-run appends to -- use
---    (FORMAT excel_table, TABLE 'Forecast').
-COPY forecast TO 'Finance/sales.xlsx' (FORMAT excel_range, RANGE 'Forecast!A1');
+-- 3. Back into the workbook as the Excel table "Forecast" (created on a sheet
+--    of its name the first time). OVERWRITE replaces its rows, so a re-run
+--    gives the same workbook instead of appending a second forecast.
+COPY forecast TO 'Finance/sales.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE);
 
 SELECT product, min(month) AS first, max(month) AS last, round(sum(forecast)) AS next_12_months
 FROM forecast GROUP BY product ORDER BY product;

@@ -98,6 +98,12 @@ std::string ExcelTextInput(const std::string &text);
 //! past Excel's last row (1048576) or column (XFD).
 bool ExcelBlockAt(const ExcelAddress &anchor, int64_t rows, int64_t cols, ExcelAddress &block, std::string &error);
 
+//! What COPY ... (FORMAT excel_range, OVERWRITE) clears before writing:
+//! everything from the anchor's top-left cell (A1 for a bare sheet) down and
+//! right, up to the bottom-right corner of the sheet's used range. False when
+//! the used range ends above or left of the anchor (nothing to clear).
+bool ExcelClearRegion(const ExcelAddress &anchor, const ExcelAddress &used, ExcelAddress &region);
+
 //! One cell from the workbook API.
 enum class ExcelCellKind { EMPTY, NUMBER, STRING, BOOLEAN, ERROR };
 
