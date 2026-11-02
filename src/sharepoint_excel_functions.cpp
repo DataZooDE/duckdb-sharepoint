@@ -467,14 +467,14 @@ picojson::value ToJsonCell(const Value &v, ExcelWriteKind kind) {
 	}
 	case ExcelWriteKind::DATE: {
 		const auto date = v.GetValue<date_t>();
-		if (!Date::IsFinite(date)) {
+		if (!Value::IsFinite(date)) {
 			return picojson::value(string());
 		}
 		return picojson::value(ExcelSerialFromEpoch(date.days, 0));
 	}
 	case ExcelWriteKind::TIMESTAMP: {
 		const auto ts = v.DefaultCastAs(LogicalType::TIMESTAMP).GetValue<timestamp_t>();
-		if (!Timestamp::IsFinite(ts)) {
+		if (!Value::IsFinite(ts)) {
 			return picojson::value(string());
 		}
 		const int64_t micros = Timestamp::GetEpochMicroSeconds(ts);
@@ -486,8 +486,13 @@ picojson::value ToJsonCell(const Value &v, ExcelWriteKind kind) {
 		}
 		return picojson::value(ExcelSerialFromEpoch(days, rest));
 	}
-	case ExcelWriteKind::TIME:
-		return picojson::value(ExcelSerialFromEpoch(-25569, v.GetValue<dtime_t>().micros));
+	case ExcelWriteKind::TIME: {
+		// Time::Convert, not dtime_t's member: `micros` before 2.0, `value` in 2.0.
+		int32_t hour, minute, second, micros;
+		Time::Convert(v.GetValue<dtime_t>(), hour, minute, second, micros);
+		const int64_t of_day = ((hour * 60LL + minute) * 60 + second) * 1000000 + micros;
+		return picojson::value(ExcelSerialFromEpoch(-25569, of_day));
+	}
 	default:
 		return picojson::value(ExcelTextInput(v.ToString()));
 	}
