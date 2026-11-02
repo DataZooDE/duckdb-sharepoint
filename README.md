@@ -129,6 +129,15 @@ COPY (SELECT month, forecast FROM fc) TO 'Finance/plan.xlsx' (FORMAT excel_table
 COPY (SELECT * FROM summary) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Summary!B2');
 ```
 
+Add `OVERWRITE` to replace instead: a table's rows are replaced (same name,
+same place), and a range is cleared from its top-left cell down and right
+before it is written, so a shorter result leaves nothing stale behind. Either
+way a re-run gives the same workbook:
+
+```sql
+COPY forecast TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE);
+```
+
 Dates, timestamps and times are written with a date format, so they read back
 typed. Text stays text: `=1+1` is not turned into a formula.
 

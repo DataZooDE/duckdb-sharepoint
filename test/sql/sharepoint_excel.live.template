@@ -239,6 +239,36 @@ SELECT count(*) FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID
 ----
 13
 
+# OVERWRITE replaces the table's rows, so re-running a forecast does not
+# append: same name, same top-left cell, the old rows gone.
+statement ok
+COPY (SELECT DATE '2028-01-01' AS month, 1.5 AS forecast UNION ALL SELECT DATE '2028-02-01', 2.5)
+TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE);
+
+query III
+SELECT count(*), min(month), max(forecast) FROM read_excel_table('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Forecast');
+----
+2	2028-01-01	2.5
+
+# The sheet holds the new table and nothing of the old 13 rows.
+query I
+SELECT count(*) FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Forecast', header := false);
+----
+3
+
+# excel_range with OVERWRITE clears from the anchor down and right first,
+# so a shorter rewrite leaves no stale rows below it.
+statement ok
+COPY (SELECT i AS n FROM range(5) t(i)) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_range, RANGE 'Short!A1');
+
+statement ok
+COPY (SELECT 9 AS n) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_range, RANGE 'Short!A1', OVERWRITE);
+
+query I
+SELECT n FROM read_excel_range('_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx', 'Short');
+----
+9
+
 statement error
 COPY (SELECT 1 AS nope) TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_table, TABLE 'Sales');
 ----

@@ -425,6 +425,15 @@ bool ExcelBlockAt(const ExcelAddress &anchor, int64_t rows, int64_t cols, ExcelA
 	return true;
 }
 
+bool ExcelClearRegion(const ExcelAddress &anchor, const ExcelAddress &used, ExcelAddress &region) {
+	region.sheet = anchor.sheet;
+	region.first_row = anchor.HasCells() ? anchor.first_row : 1;
+	region.first_col = anchor.HasCells() ? anchor.first_col : 1;
+	region.last_row = used.last_row;
+	region.last_col = used.last_col;
+	return used.HasCells() && region.last_row >= region.first_row && region.last_col >= region.first_col;
+}
+
 ExcelColumnType InferExcelColumnType(const std::vector<const ExcelCell *> &cells) {
 	bool any_string = false, any_bool = false, any_number = false;
 	bool plain = false, date = false, datetime = false, time = false, all_integral = true;

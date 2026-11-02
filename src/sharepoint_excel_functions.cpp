@@ -401,6 +401,9 @@ constexpr const char *kRangeFormat = "excel_range";
 constexpr const char *kTableFormatInternal = "__sharepoint_excel_table";
 constexpr const char *kRangeFormatInternal = "__sharepoint_excel_range";
 constexpr const char *kInPlaceMarker = "__sharepoint_in_place";
+//! COPY's own OVERWRITE, carried past the binder (which would consume it as a
+//! file option) by the rewrite.
+constexpr const char *kOverwriteMarker = "__sharepoint_overwrite";
 
 //! How one column's values are written.
 enum class ExcelWriteKind { TEXT, NUMBER, BOOLEAN, DATE, TIMESTAMP, TIME };
@@ -527,6 +530,9 @@ struct ExcelWriteBindData : public FunctionData {
 	string sheet;        // excel_table: where to create a missing table
 	ExcelAddress anchor; // excel_range: the top-left cell
 	bool header = true;  // excel_range: write the column names first
+	//! OVERWRITE: excel_table replaces the table's rows; excel_range first
+	//! clears from the anchor down and right (ExcelClearRegion).
+	bool overwrite = false;
 	vector<string> names;
 	vector<ExcelWriteKind> kinds;
 
@@ -573,6 +579,7 @@ unique_ptr<FunctionData> ExcelWriteBind(ClientContext &context, CopyFunctionBind
 		data->anchor = parsed.address;
 		data->header = CopyBoolOption(context, info, "header", true);
 	}
+	data->overwrite = FindCopyOption(info.options, kOverwriteMarker) != nullptr;
 	for (idx_t i = 0; i < sql_types.size(); i++) {
 		data->names.push_back(duckdb_compat::Str(names[i]));
 		data->kinds.push_back(WriteKindFor(sql_types[i]));
@@ -763,6 +770,20 @@ unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, Func
 				g->create_table = true;
 				anchor.sheet = bind.sheet;
 				write_header = true;
+			} else if (bind.overwrite) {
+				// Replace: turn the table back into cells, clear them, and
+				// create it anew from its old top-left cell (the create path).
+				const auto range =
+				    ParseObject(client.WorkbookCall("GET", g->wb.item_id, base + "/range?$select=address", string(),
+				                                    g->session_id, what, true),
+				                what);
+				const auto old_block = ParseGraphAddress(range, what);
+				client.WorkbookCall("POST", g->wb.item_id, base + "/convertToRange", "{}", g->session_id, what, false);
+				client.WorkbookCall("POST", g->wb.item_id, RangeResource(old_block) + "/clear", "{\"applyTo\":\"All\"}",
+				                    g->session_id, what, true);
+				g->create_table = true;
+				anchor = old_block;
+				write_header = true;
 			} else {
 				// Append: map COPY columns onto the table's columns by name.
 				auto header = ParseObject(header_body, what);
@@ -796,8 +817,21 @@ unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, Func
 			}
 		} else {
 			anchor = bind.anchor;
-			EnsureWorksheet(client, *g, anchor.sheet);
+			const bool created = EnsureWorksheet(client, *g, anchor.sheet);
 			write_header = bind.header;
+			if (bind.overwrite && !created) {
+				const string what = Quoted("worksheet", anchor.sheet, g->wb);
+				const auto used = ParseObject(
+				    client.WorkbookCall("GET", g->wb.item_id,
+				                        WorksheetResource(anchor.sheet) + "/usedRange(valuesOnly=true)?$select=address",
+				                        string(), g->session_id, what, true),
+				    what);
+				ExcelAddress region;
+				if (ExcelClearRegion(anchor, ParseGraphAddress(used, what), region)) {
+					client.WorkbookCall("POST", g->wb.item_id, RangeResource(region) + "/clear",
+					                    "{\"applyTo\":\"Contents\"}", g->session_id, what, true);
+				}
+			}
 		}
 		// Range writing (excel_range, or a table being created).
 		g->width = bind.names.size();
@@ -899,12 +933,14 @@ void AddCopyOption(MAP &options, const char *name, const LogicalType &type) {
 
 void ExcelTableCopyOptions(ClientContext &, CopyOptionsInput &input) {
 	AddCopyOption(input.options, kInPlaceMarker, LogicalType::BOOLEAN);
+	AddCopyOption(input.options, kOverwriteMarker, LogicalType::BOOLEAN);
 	AddCopyOption(input.options, "table", LogicalType::VARCHAR);
 	AddCopyOption(input.options, "sheet", LogicalType::VARCHAR);
 }
 
 void ExcelRangeCopyOptions(ClientContext &, CopyOptionsInput &input) {
 	AddCopyOption(input.options, kInPlaceMarker, LogicalType::BOOLEAN);
+	AddCopyOption(input.options, kOverwriteMarker, LogicalType::BOOLEAN);
 	AddCopyOption(input.options, "range", LogicalType::VARCHAR);
 	AddCopyOption(input.options, "header", LogicalType::BOOLEAN);
 }
@@ -921,6 +957,21 @@ BoundStatement RewriteExcelCopy(Binder &binder, CopyStatement &stmt, const char 
 	}
 	info.format = internal_format;
 	using Key = typename std::decay<decltype(info.options)>::type::key_type;
+	// OVERWRITE is COPY's own file option, consumed by the binder; carry it
+	// as ours, so it means "replace in the workbook" and never reaches
+	// DuckDB's file handling. The other file modes make no sense here.
+	auto overwrite = FindCopyOption(info.options, "overwrite");
+	const bool replace =
+	    overwrite && (overwrite->empty() || (*overwrite)[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>());
+	info.options.erase(Key("overwrite"));
+	for (const char *mode : {"overwrite_or_ignore", "append"}) {
+		if (FindCopyOption(info.options, mode)) {
+			throw InvalidInputException("sharepoint: %s is a file option; for a workbook use OVERWRITE", mode);
+		}
+	}
+	if (replace) {
+		info.options[Key(kOverwriteMarker)] = {Value::BOOLEAN(true)};
+	}
 	info.options[Key("use_tmp_file")] = {Value::BOOLEAN(false)};
 	info.options[Key(kInPlaceMarker)] = {Value::BOOLEAN(true)};
 	return binder.Bind(*copy);

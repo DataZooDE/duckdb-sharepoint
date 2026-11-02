@@ -393,9 +393,8 @@ sessions", a Conditional Access change, or 90 days without any redemption.
    `read_excel_table` / `read_excel_range` (§9). Open: verified live in CI
    (`test/sql/sharepoint_excel.live.template`, `e2e/tests/test_excel_workbook.py`).
    Write side implemented 2026-11-02: `COPY ... (FORMAT excel_table|excel_range)`
-   (§9.1). Open: replacing a table's rows (today a table only grows -- rerun
-   into a range, or a fresh table), clearing cells beyond a shorter rewrite of
-   a range, the 1904 date system. Then SharePoint lists (#49).
+   (§9.1); `OVERWRITE` replaces a table's rows / clears a range first
+   (2026-11-02). Open: the 1904 date system. Then SharePoint lists (#49).
 
 ## 7a. Discovered on the first live runs (2026-10-10)
 
@@ -630,6 +629,17 @@ COPY (SELECT ...) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Out!B2');  
   sets values *as if typed*, so `=1+1` would become a formula and `00123` a
   number. Other types are written as their text. TIMESTAMPTZ is written in
   UTC. Excel keeps 15 significant digits.
+- **OVERWRITE.** COPY's own `OVERWRITE` (a file option the binder would
+  consume) is carried past it by the rewrite as a private option, so it never
+  reaches DuckDB's file handling; `OVERWRITE_OR_IGNORE` and `APPEND` are
+  refused. `excel_table` + OVERWRITE replaces an existing table:
+  `tables/{name}/range` (its address, header included), `convertToRange`,
+  `clear` (`applyTo: All`) of those cells, then the create path from the old
+  top-left cell -- same name and place, the COPY's columns, Excel's default
+  table style. `excel_range` + OVERWRITE first clears (`applyTo: Contents`,
+  formatting kept) everything from the anchor down and right within the
+  sheet's used range (`ExcelClearRegion`, pure), so a shorter rewrite leaves
+  no stale rows.
 - **Retries.** `rows/add`, `tables/add` and `worksheets/add` are not
   idempotent: they are re-sent only after throttling (429/503: not applied),
   never after a 5xx or a lost reply, which may have been applied and would
