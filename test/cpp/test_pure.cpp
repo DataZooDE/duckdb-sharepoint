@@ -859,6 +859,7 @@ TEST_CASE("call counters count, snapshot by name and reset", "[counters]") {
 	REQUIRE(snap["bytes_read"] == 4096);
 	REQUIRE(snap["read_range"] == 0);
 	REQUIRE(snap.count("workbook") == 1);
+	REQUIRE(snap.count("list") == 1);
 	ResetCounters();
 	for (const auto &kv : SnapshotCounters()) {
 		REQUIRE(kv.second == 0);

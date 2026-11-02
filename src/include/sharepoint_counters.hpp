@@ -36,6 +36,7 @@ enum class Counter {
 	AUTH_REFRESH,    // a 401 made a request re-mint its token and re-send
 	UPLOAD_BUFFER_PEAK, // HIGH-WATER MARK, not a count: most bytes one write handle held in memory
 	WORKBOOK,        // GET of an Excel workbook resource (table, worksheet, range values)
+	SHAREPOINT_LIST, // GET of a site / list / columns / one page of list items
 	COUNT_           // sentinel
 };
 

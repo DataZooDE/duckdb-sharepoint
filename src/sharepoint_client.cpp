@@ -929,6 +929,64 @@ string GraphClient::WorkbookCall(const string &method, const string &item_id, co
 	return res->body;
 }
 
+string GraphPathOfLink(const string &link) {
+	auto scheme = link.find("://");
+	if (scheme == string::npos) {
+		return link;
+	}
+	auto slash = link.find('/', scheme + 3);
+	return slash == string::npos ? string() : link.substr(slash);
+}
+
+string GraphClient::GraphGet(const string &path, const string &what, int *status) {
+	IncrementCounter(Counter::SHAREPOINT_LIST);
+	auto &cli = GraphConnection(auth.graph_endpoint);
+	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.tokens->Token()}};
+	auto res = SendWithRetry(*auth.tokens, h, [&] { return cli.Get(path.c_str(), h); });
+	if (!res) {
+		throw IOException("sharepoint: reading %s failed at the transport layer", what.c_str());
+	}
+	if (res->status == 404) {
+		if (status) {
+			*status = 404;
+			return string();
+		}
+		string code, message;
+		ParseGraphError(res->body, code, message);
+		throw InvalidInputException("sharepoint: %s not found (Graph %s: %s)", what.c_str(), code.c_str(),
+		                            message.c_str());
+	}
+	if (status) {
+		*status = res->status;
+	}
+	if (res->status < 200 || res->status >= 300) {
+		ThrowGraph("read " + what, res->status, res->body);
+	}
+	return res->body;
+}
+
+string GraphClient::GraphSend(const string &method, const string &path, const string &json_body, const string &what,
+                              bool idempotent) {
+	IncrementCounter(Counter::SHAREPOINT_LIST);
+	auto &cli = GraphConnection(auth.graph_endpoint);
+	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.tokens->Token()}};
+	auto res = SendWithRetry(
+	    *auth.tokens, h,
+	    [&] {
+		    return method == "PATCH" ? cli.Patch(path.c_str(), h, json_body, "application/json")
+		                             : cli.Post(path.c_str(), h, json_body, "application/json");
+	    },
+	    idempotent);
+	if (!res) {
+		throw IOException("sharepoint: %s %s failed at the transport layer%s", method.c_str(), what.c_str(),
+		                  idempotent ? "" : " (it may or may not have been applied)");
+	}
+	if (res->status < 200 || res->status >= 300) {
+		ThrowGraph("write " + what, res->status, res->body);
+	}
+	return res->body;
+}
+
 string GraphClient::WorkbookGet(const string &item_id, const string &resource, const string &what) {
 	return WorkbookCall("GET", item_id, resource, string(), string(), what, true, nullptr);
 }

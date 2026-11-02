@@ -48,6 +48,10 @@ struct ChildEntry {
 //! Retry-After as a floor). Used by every retry loop that talks to Microsoft.
 void SleepBeforeRetry(int failed_attempt, int retry_after_seconds);
 
+//! The path+query of an absolute @odata.nextLink, for the Graph connection
+//! (bound to one host; Graph keeps the host across pages).
+string GraphPathOfLink(const string &link);
+
 //! Percent-encode one path segment of a workbook resource (a table or
 //! worksheet name, a range address): everything but unreserved characters,
 //! '/' included.
@@ -130,6 +134,17 @@ public:
 	//! thrown; every other non-2xx throws.
 	string WorkbookCall(const string &method, const string &item_id, const string &resource, const string &json_body,
 	                    const string &session_id, const string &what, bool idempotent, int *status = nullptr);
+
+	//! GET any Graph path ("/v1.0/sites/..."; a nextLink via GraphPathOfLink)
+	//! and return its JSON body. With `status` given, a 404 is returned
+	//! in-band (empty body); every other non-2xx throws, naming `what`.
+	string GraphGet(const string &path, const string &what, int *status = nullptr);
+
+	//! POST or PATCH a JSON body to any Graph path and return the reply's
+	//! body; non-2xx throws, naming `what`. `idempotent = false` (a $batch
+	//! that creates items): re-sent only after throttling.
+	string GraphSend(const string &method, const string &path, const string &json_body, const string &what,
+	                 bool idempotent);
 
 private:
 	const AuthContext &auth;
