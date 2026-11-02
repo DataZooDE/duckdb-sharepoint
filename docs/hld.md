@@ -389,6 +389,13 @@ sessions", a Conditional Access change, or 90 days without any redemption.
    community-extensions submission, and a signing key (`DUCKDB_EXTENSION_SIGNING_PK`)
    if a signed build is ever wanted.
 
+8. **Excel workbooks (#50, #52).** Read side implemented 2026-11-02:
+   `read_excel_table` / `read_excel_range` (§9). Open: verified live in CI
+   (`test/sql/sharepoint_excel.live.template`, `e2e/tests/test_excel_workbook.py`);
+   write back (`COPY ... (FORMAT excel_table|excel_range)`: append rows to a
+   table, overwrite a range, in a `persistChanges` workbook session); README.
+   Then SharePoint lists (#49).
+
 ## 7a. Discovered on the first live runs (2026-10-10)
 
 Things the Graph docs do not tell you, each found against a real tenant and
@@ -536,3 +543,45 @@ community-extensions registry). escurel consumes it purely as a config change:
 built `sharepoint.duckdb_extension` path — no escurel code change once the
 `duckvfs` config is generalised to scheme-agnostic secret params (a small,
 separately-tracked escurel PR).
+
+## 9. Excel workbooks: `read_excel_table` / `read_excel_range` (#50)
+
+Decided 2026-11-02 (#52): Excel before lists; **in this extension**, as table
+functions beside `sharepoint://` over the same secret, auth and Graph client --
+the filesystem's behaviour is untouched; **names as proposed in #50**.
+
+`sharepoint://` already reads a saved `.xlsx` as bytes (the `excel`
+extension's `read_xlsx` over the filesystem). These functions read the
+**workbook API** instead -- what Excel for the web holds now, by table name or
+address, without downloading the file -- which is what writing back (next
+step) needs too.
+
+- **Addressing.** The first argument is a `sharepoint://` path (scheme
+  optional) or `id:<itemId>`, resolved with one stat to the item id; then
+  `/drives/{d}/items/{id}/workbook/...`. Sessionless: each call opens the
+  saved workbook. A non-persistent session would be faster for many windows
+  but is one more call and a session to close; not needed yet.
+- **Calls.** A table: `tables/{name}/headerRowRange?$select=values` (column
+  names -- unique in an Excel table), `tables/{name}/dataBodyRange?$select=address`,
+  then the rows. A range: the address as given, or for a bare sheet
+  `worksheets/{s}/usedRange(valuesOnly=true)?$select=address`. Rows are read as
+  `worksheets/{s}/range(address='A2:F5001')?$select=values,valueTypes,numberFormat`
+  in windows of at most 20,000 cells (`kCellsPerRequest`): Graph rejects or
+  times out on very large range requests. Counted as `workbook` in
+  `sharepoint_stats()`; a small table is 1 stat + 3 workbook calls.
+- **Whole read at bind.** Column types depend on every row, so bind reads the
+  range and keeps the cells; the scan only converts. Fine for the sizes Excel
+  is used at (tested at 10,000 rows); a sheet of millions of cells belongs in
+  Parquet.
+- **Types** (pure, `sharepoint_excel.*`, Catch2): booleans -> BOOLEAN; numbers
+  by number format -- date-only -> DATE, date+time -> TIMESTAMP, time-only ->
+  TIME, plain integral -> BIGINT, else DOUBLE, dates mixed with plain numbers
+  -> DOUBLE; anything mixed with text -> VARCHAR. Dates are 1900-system
+  serials (with Lotus' phantom 1900-02-29), rounded to the millisecond. Error
+  cells (`#DIV/0!`) are NULL in a typed column. `all_varchar := true` reads
+  text, dates as ISO text. The 1904 date system (old Mac workbooks) is not
+  detected: their dates read four years early.
+- **Header.** A table's header row; for a range the first row unless
+  `header := false`. Empty names become `column<N>`, duplicates get `_2`
+  (case-insensitive, as DuckDB names are).
+

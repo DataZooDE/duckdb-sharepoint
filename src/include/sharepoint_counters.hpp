@@ -35,6 +35,7 @@ enum class Counter {
 	META_CACHE_HIT,  // an open served from the immutable-prefix metadata cache
 	AUTH_REFRESH,    // a 401 made a request re-mint its token and re-send
 	UPLOAD_BUFFER_PEAK, // HIGH-WATER MARK, not a count: most bytes one write handle held in memory
+	WORKBOOK,        // GET of an Excel workbook resource (table, worksheet, range values)
 	COUNT_           // sentinel
 };
 

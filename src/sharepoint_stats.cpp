@@ -83,7 +83,7 @@ void RegisterSharepointStats(ExtensionLoader &loader) {
 		    "Microsoft Graph call counters, one row per metric: token_request, stat, read_range, list_page, "
 		    "upload_put, upload_session, upload_chunk, upload_commit, upload_abort, delete, move, create_folder "
 		    "(calls by kind), retries, throttled, bytes_read, bytes_written, meta_cache_hits (opens served from the "
-		    "sharepoint_immutable_prefixes metadata cache), auth_refresh (401s answered by a fresh token) and "
+		    "sharepoint_immutable_prefixes metadata cache), auth_refresh (401s answered by a fresh token), workbook (Excel workbook API GETs) and "
 		    "upload_buffer_peak (a HIGH-WATER MARK: the most bytes one file being written held in memory). "
 		    "Process-wide; reset with sharepoint_reset_stats() "
 		    "to measure what one query costs.";

@@ -81,7 +81,7 @@ with os.fdopen(fd, "w", encoding="utf-8") as f:
 PY
 }
 
-suites=(sharepoint)
+suites=(sharepoint sharepoint_excel)
 if [ "$delegated" -eq 1 ]; then
 	suites+=(sharepoint_delegated)
 fi

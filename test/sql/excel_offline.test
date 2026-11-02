@@ -1,0 +1,45 @@
+# name: test/sql/excel_offline.test
+# description: read_excel_table / read_excel_range without credentials: they
+#              are registered, and bad input fails before any Graph call.
+#              Reading a real workbook is sharepoint_excel.live.template.
+# group: [sharepoint]
+
+require sharepoint
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name IN ('read_excel_table', 'read_excel_range') AND function_type = 'table';
+----
+2
+
+# No secret: a configuration error naming the path, not "not found".
+statement error
+SELECT * FROM read_excel_table('Finance/plan.xlsx', 'Sales');
+----
+no `sharepoint` secret configured for 'sharepoint://Finance/plan.xlsx'
+
+# Addresses are checked before the workbook is even looked up.
+statement error
+SELECT * FROM read_excel_range('Finance/plan.xlsx', 'A1:B2');
+----
+names no worksheet
+
+statement error
+SELECT * FROM read_excel_range('Finance/plan.xlsx', 'Input!A:B');
+----
+not a range of cells
+
+statement error
+SELECT * FROM read_excel_range('Finance/plan.xlsx', '''Input!A1');
+----
+unterminated quote
+
+statement error
+SELECT * FROM read_excel_table(NULL, 'Sales');
+----
+must not be NULL
+
+statement error
+SELECT * FROM read_excel_table('sharepoint://', 'Sales');
+----
+not a workbook

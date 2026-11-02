@@ -2,6 +2,7 @@
 
 #include "sharepoint_extension.hpp"
 #include "sharepoint_banner.hpp"
+#include "sharepoint_excel_functions.hpp"
 #include "sharepoint_filesystem.hpp"
 #include "sharepoint_stats.hpp"
 #include "sharepoint_version.hpp"
@@ -159,6 +160,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// process, since both register the same four names.
 	sharepoint::RegisterVfsFunctions(loader);
 	sharepoint::RegisterSharepointStats(loader);
+
+	// read_excel_table()/read_excel_range(): live workbook reads through the
+	// Graph workbook API, over the same secret. Table functions beside the
+	// filesystem; they change nothing about sharepoint://.
+	sharepoint::RegisterExcelFunctions(loader);
 
 	datazoo::RegisterBannerOption(loader);
 	// Last, so a load that fails earlier never advertises itself. Silent unless
