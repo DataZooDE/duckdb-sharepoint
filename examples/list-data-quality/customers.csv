@@ -1,0 +1,42 @@
+Title,Email,Phone,Country,VAT,IBAN,Notes
+Ben Fischer,ben.fischer1@example.com,+33 1 2345 6701,FR,FR40303265045,FR1420041010050500013M02606,
+Clara Hoffmann,clara.hoffmann2@example.com,+31 20 5523902,NL,NL004495445B01,NL91ABNA0417164300,Key account.
+David Klein,david.klein3@example.com,+49 30 90182003,DE,DE136695976,DE89370400440532013000,Asked for a call back in Q1.
+Eva Koch,eva.koch4@example.com,+33 1 2345 6704,FR,FR40303265045,FR1420041010050500013M02606,Prefers invoices by post.
+Felix Lange,felix.lange5@example.com,+31 20 5523905,NL,,NL91ABNA0417164300,Prefers invoices by post.
+Greta Meyer,greta.meyer6@example.com,+49 30 90182006,DE,DE136695976,DE89370400440532013000,Prefers invoices by post.
+Hannah Neumann,hannah.neumann7@example.com,+33 1 2345 6707,FR,FR40303265045,FR1420041010050500013M02606,
+Jonas Richter,jonas.richter8@example.com,+31 20 5523908,NL,NL004495445B01,NL91ABNA0417164300,Prefers invoices by post.
+Lena Schmidt,lena.schmidt9example.com,+49 30 90182009,DE,DE136695976,DE89370400440532013000,Key account.
+Max Becker,max.becker10@example.com,+33 1 2345 6710,FR,FR40303265045,FR1420041010050500013M02606,"Called Max on +33 1 2345 6710, private mail max@home.example.com"
+Nina Fischer,nina.fischer11@example.com,12345,NL,NL004495445B01,NL91ABNA0417164300,Prefers invoices by post.
+Oskar Hoffmann,oskar.hoffmann12@example.com,+49 30 90182012,DE,DE136695976,DE89370400440532013000,Asked for a call back in Q1.
+Paula Klein,paula.klein13@example.com,+33 1 2345 6713,FR,FR40303265046,FR1420041010050500013M02606,Asked for a call back in Q1.
+Rosa Koch,rosa.koch14@example.com,+31 20 5523914,NL,NL004495445B01,NL91ABNA0417164300,Prefers invoices by post.
+Theo Lange,theo.lange15@example.com,+49 30 90182015,DE,DE136695976,DE89370400440532013000,Key account.
+Uwe Meyer,uwe.meyer16@example.com,+33 1 2345 6716,FR,FR40303265045,FR1420041010050500013M02606,Prefers invoices by post.
+Vera Neumann,vera.neumann17@example.com,+31 20 5523917,NL,NL004495445B01,NL91ABNA0417164400,Asked for a call back in Q1.
+Wim Richter,wim.richter18example.com,+49 30 90182018,DE,DE136695976,DE89370400440532013000,Prefers invoices by post.
+Zoe Schmidt,zoe.schmidt19@example.com,+33 1 2345 6719,FR,FR40303265045,FR1420041010050500013M02606,Prefers invoices by post.
+Anna Becker,anna.becker20@example.com,+31 20 5523920,NL,NL004495445B01,NL91ABNA0417164300,"Called Anna on +31 20 5523920, private mail anna@home.example.com"
+Ben Fischer,ben.fischer21@example.com,+49 30 90182021,DE,DE136695976,DE89370400440532013000,Prefers invoices by post.
+Clara Hoffmann,clara.hoffmann22@example.com,12345,FR,FR40303265045,FR1420041010050500013M02606,Asked for a call back in Q1.
+David Klein,david.klein23@example.com,+31 20 5523923,NL,NL004495445B01,NL91ABNA0417164300,Pays by card 4111 1111 1111 1111
+Eva Koch,eva.koch24@example.com,+49 30 90182024,DE,DE136695976,DE89370400440532013000,Key account.
+Felix Lange,felix.lange25@example.com,+33 1 2345 6725,FR,FR40303265045,FR1420041010050500013M02606,Prefers invoices by post.
+Greta Meyer,greta.meyer26@example.com,+31 20 5523926,NL,NL004495445B02,NL91ABNA0417164300,Key account.
+Hannah Neumann,hannah.neumann27example.com,+49 30 90182027,DE,DE136695976,DE89370400440532013000,
+Jonas Richter,jonas.richter28@example.com,+33 1 2345 6728,FR,FR40303265045,FR1420041010050500013M02606,Asked for a call back in Q1.
+Lena Schmidt,lena.schmidt29@example.com,+31 20 5523929,NL,,NL91ABNA0417164300,Key account.
+Max Becker,max.becker30@example.com,+49 30 90182030,DE,DE136695976,DE89370400440532013000,"Called Max on +49 30 90182030, private mail max@home.example.com"
+Nina Fischer,nina.fischer31@example.com,+33 1 2345 6731,FR,FR40303265045,FR1420041010050500013M02606,
+Oskar Hoffmann,oskar.hoffmann32@example.com,+31 20 5523932,NL,NL004495445B01,NL91ABNA0417164300,Key account.
+Paula Klein,paula.klein33@example.com,12345,DE,DE136695976,DE89370400440532013000,Prefers invoices by post.
+Rosa Koch,rosa.koch34@example.com,+33 1 2345 6734,FR,FR40303265045,FR1420041010050500013M02606,Key account.
+Theo Lange,theo.lange35@example.com,+31 20 5523935,NL,NL004495445B01,NL91ABNA0417164300,
+Uwe Meyer,uwe.meyer36example.com,+49 30 90182036,DE,DE136695976,DE89370400440532013000,Prefers invoices by post.
+Vera Neumann,vera.neumann37@example.com,+33 1 2345 6737,FR,FR40303265045,FR1420041010050500013M02606,Prefers invoices by post.
+Wim Richter,wim.richter38@example.com,+31 20 5523938,NL,NL004495445B01,NL91ABNA0417164300,Prefers invoices by post.
+Zoe Schmidt,zoe.schmidt39@example.com,+49 30 90182039,DE,DE136695977,DE89370400440532013000,Key account.
+Anna Becker,anna.becker40@example.com,+33 1 2345 6740,FR,FR40303265045,FR1420041010050500013M02606,"Called Anna on +33 1 2345 6740, private mail anna@home.example.com"
+Eva Koch,eva.koch4@example.com,+33 1 2345 6704,FR,FR40303265045,FR1420041010050500013M02606,Prefers invoices by post.
