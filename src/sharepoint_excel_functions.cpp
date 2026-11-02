@@ -702,6 +702,25 @@ void FlushPending(ExcelWriteGlobalState &g, const ExcelWriteBindData &bind, bool
 	g.pending_cells = 0;
 }
 
+//! Closes the COPY's workbook session if initialisation throws after opening
+//! it; disarmed once initialisation succeeds (finalize closes it then).
+struct SessionGuard {
+	ExcelWriteGlobalState &g;
+	bool armed = true;
+	~SessionGuard() {
+		if (!armed || g.session_id.empty()) {
+			return;
+		}
+		try {
+			GraphClient client(g.wb.auth);
+			client.WorkbookCall("POST", g.wb.item_id, "closeSession", "{}", g.session_id, "workbook session", true);
+		} catch (...) {
+			// Best effort: an unclosed session expires on its own.
+		}
+		g.session_id.clear();
+	}
+};
+
 unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, FunctionData &bind_p,
                                                     const string &file_path) {
 	auto &bind = bind_p.Cast<ExcelWriteBindData>();
@@ -722,6 +741,9 @@ unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, Func
 		for (auto kind : bind.kinds) {
 			g->any_number_format = g->any_number_format || NumberFormatFor(kind) != nullptr;
 		}
+		// A COPY that fails from here on must not leave its session open: an
+		// open session keeps the workbook locked (HTTP 423) for minutes.
+		SessionGuard guard {*g};
 
 		ExcelAddress anchor;
 		bool write_header = false;
@@ -769,6 +791,7 @@ unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, Func
 					}
 					g->column_of.push_back(found);
 				}
+				guard.armed = false;
 				return std::move(g);
 			}
 		} else {
@@ -792,6 +815,7 @@ unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, Func
 			}
 			QueueRow(*g, std::move(values), std::move(formats));
 		}
+		guard.armed = false;
 	});
 	return std::move(g);
 }
