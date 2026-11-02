@@ -114,8 +114,8 @@ def test_list_types_paging_and_lookup(fixture_lists, sql, secret_sql):
                count(DISTINCT Status), count(DISTINCT id), min(created) <= max(modified) FROM o;
         SELECT Customer, Customer_id, count(*) FROM o GROUP BY ALL ORDER BY Customer_id;
     """).splitlines()
-    assert out[0] == "true"  # sharepoint_reset_stats()
-    out = out[1:]
+    # From the end: CREATE SECRET and CALL print a "true" line each before these.
+    out = out[-6:]
     pages = int(out[0])
     # drive -> site, list, columns, then one call per page
     # (plus possibly one empty last page when ITEMS is a multiple of PAGE)

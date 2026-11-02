@@ -308,7 +308,15 @@ unique_ptr<FunctionData> ListBind(ClientContext &context, TableFunctionBindInput
 		// Every item first: whether a choice column is multi-valued shows only
 		// in the data.
 		vector<picojson::object> items;
-		string next = base + "/items?$expand=fields&$top=" + std::to_string(ListPageSize(context));
+		// Name every planned field: a lookup's display value is only returned
+		// when it is selected explicitly (by default Graph sends <name>LookupId
+		// alone -- found live).
+		string select;
+		for (auto &col : plan) {
+			select += (select.empty() ? "" : ",") + EncodeWorkbookName(col.field);
+		}
+		string next = base + "/items?$expand=fields($select=" + select + ")&$top=" +
+		              std::to_string(ListPageSize(context));
 		for (int pages = 0; !next.empty(); pages++) {
 			if (pages >= kMaxItemPages) {
 				throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxItemPages);
