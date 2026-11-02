@@ -157,7 +157,7 @@ Value ToValue(const picojson::value *v, ListColumnType t) {
 		}
 		if (v->is<string>()) {
 			int64_t n;
-			if (TryCast::Operation<string_t, int64_t>(string_t(v->get<string>()), n)) {
+			if (TryCast::Operation<string_t, int64_t>(string_t(v->get<string>()), n, false)) {
 				return Value::BIGINT(n);
 			}
 		}
@@ -169,7 +169,7 @@ Value ToValue(const picojson::value *v, ListColumnType t) {
 			d = static_cast<double>(v->get<int64_t>());
 		} else if (v->is<double>()) {
 			d = v->get<double>();
-		} else if (!v->is<string>() || !TryCast::Operation<string_t, double>(string_t(v->get<string>()), d)) {
+		} else if (!v->is<string>() || !TryCast::Operation<string_t, double>(string_t(v->get<string>()), d, false)) {
 			return Value(type);
 		}
 		return t == ListColumnType::DOUBLE ? Value::DOUBLE(d) : Value::DOUBLE(d).DefaultCastAs(type);
