@@ -106,3 +106,11 @@ TEST_CASE("ParseIsoTimestamp", "[list]") {
 	REQUIRE_FALSE(ParseIsoTimestamp("2026-13-01T00:00:00Z", us));
 	REQUIRE_FALSE(ParseIsoTimestamp("yesterday", us));
 }
+
+TEST_CASE("PlanListColumns: built-in Title keeps its name in any site language", "[list]") {
+	// A German site shows Title as "Titel"; queries must not depend on that.
+	auto plan = PlanListColumns({Col("Title", "Titel", ListFacet::TEXT), Col("Betrag", "Betrag", ListFacet::NUMBER)});
+	REQUIRE(plan[1].name == "Title");
+	REQUIRE(plan[1].field == "Title");
+	REQUIRE(plan[2].name == "Betrag"); // user columns keep their display name
+}

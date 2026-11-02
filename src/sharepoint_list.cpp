@@ -94,7 +94,9 @@ std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &
 		if (def.hidden || def.read_only || def.name == "ContentType" || def.name == "Attachments") {
 			continue;
 		}
-		std::string base = Trim(def.display_name);
+		// Built-in Title keeps its internal name: its display name is the
+		// site's language ("Titel" on a German site, found live).
+		std::string base = def.name == "Title" ? def.name : Trim(def.display_name);
 		if (base.empty()) {
 			base = def.name;
 		}
