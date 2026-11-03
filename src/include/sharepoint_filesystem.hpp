@@ -48,6 +48,8 @@ public:
 	AuthContext auth;
 	//! Read path: resolved once at OpenFile and reused.
 	DriveItemMeta meta;
+	//! An earlier version being read ("?version=3.0"); empty for the current.
+	string version;
 	//! Sequential read/write cursor.
 	idx_t position = 0;
 	//! Block size for cached reads, captured at OpenFile from

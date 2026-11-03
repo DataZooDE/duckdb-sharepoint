@@ -347,7 +347,35 @@ DriveItemMeta GraphClient::StatById(const string &item_id) {
 	return ParseMeta(v.get<picojson::object>());
 }
 
-void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t length, string &out) {
+DriveItemMeta GraphClient::StatVersion(const string &item_id, const string &version) {
+	IncrementCounter(Counter::STAT);
+	auto &cli = GraphConnection(auth.graph_endpoint);
+	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.tokens->Token()}};
+	const string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id + "/versions/" + version +
+	                    "?$select=id,size,lastModifiedDateTime";
+	auto res = SendWithRetry(*auth.tokens, h, [&] { return cli.Get(path.c_str(), h); });
+	if (!res) {
+		throw IOException("sharepoint: stat version '%s' of id '%s' failed at the transport layer", version.c_str(),
+		                  item_id.c_str());
+	}
+	if (res->status == 404) {
+		return DriveItemMeta {};
+	}
+	if (res->status < 200 || res->status >= 300) {
+		ThrowGraph("stat version '" + version + "' of id '" + item_id + "'", res->status, res->body);
+	}
+	picojson::value v;
+	if (!picojson::parse(v, res->body).empty() || !v.is<picojson::object>()) {
+		throw IOException("sharepoint: unexpected version response for id '%s'", item_id.c_str());
+	}
+	auto meta = ParseMeta(v.get<picojson::object>());
+	meta.id = item_id;
+	meta.ctag = "version:" + version;
+	return meta;
+}
+
+void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t length, string &out,
+                            const string &version) {
 	out.clear();
 	if (length <= 0) {
 		return; // "bytes=o-(o-1)" is not a valid range; nothing to fetch.
@@ -355,7 +383,8 @@ void GraphClient::ReadRange(const string &item_id, int64_t offset, int64_t lengt
 	IncrementCounter(Counter::READ_RANGE);
 	auto &cli = GraphConnection(auth.graph_endpoint);
 	const string range = "bytes=" + std::to_string(offset) + "-" + std::to_string(offset + length - 1);
-	const string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id + "/content";
+	const string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id +
+	                    (version.empty() ? string() : "/versions/" + version) + "/content";
 	// Body cap for the download: a 206 must be exactly `length`. A host that
 	// ignores Range answers 200 with the WHOLE file; that is only tolerated
 	// (and sliced) when the range ends within the first 64 MiB -- otherwise one

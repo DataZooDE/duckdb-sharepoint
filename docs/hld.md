@@ -795,6 +795,25 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   would still be attempted for a name that exists as a local file; the same
   rewrite as the Excel writers (`sharepoint_copy_rewrite.hpp`) rules it out.
 
+## 11. File versions: `sharepoint_versions` and `?version=` (#66)
+
+- **Addressing.** `sharepoint://<path or id:...>?version=<label>` (labels
+  are SharePoint's `major.minor`, digits and one dot). `?` cannot occur in a
+  SharePoint name, so the suffix never collides with a real path; any other
+  `?` stays a glob character. A path rather than a named parameter, because
+  then every reader takes it (`read_parquet`, `read_csv`, `read_blob`, ...).
+- **Reading.** `GET /items/{id}/versions/{v}` for the size and time, then
+  ranged reads of `/items/{id}/versions/{v}/content` through the same 302 ->
+  pre-authenticated URL path as `/content`. Blocks are cached under
+  `version:<v>` in place of the cTag: a version never changes. The
+  immutable-prefix metadata cache is bypassed. `Glob` returns such a path
+  as it is (DuckDB globs it, because of the `?`).
+- **Read-only.** Writing to it, and `remove_file`, `move_file` and the
+  directory calls on it, are refused: with the version stripped, the path
+  names the current file, which a delete of `x?version=1.0` must not hit.
+- **`sharepoint_versions(path)`.** `GET /items/{id}/versions`, paged; Graph
+  lists the current version first, and its `path` is the plain one.
+
 ## 13. `read_sharepoint_files` (#65)
 
 - The files come from the filesystem's `Glob` (its syntax, the

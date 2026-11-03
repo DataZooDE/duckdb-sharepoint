@@ -5,6 +5,7 @@
 #include "sharepoint_excel_functions.hpp"
 #include "sharepoint_filesystem.hpp"
 #include "sharepoint_list_functions.hpp"
+#include "sharepoint_versions.hpp"
 #include "sharepoint_search_functions.hpp"
 #include "sharepoint_stats.hpp"
 #include "sharepoint_version.hpp"
@@ -181,6 +182,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	sharepoint::RegisterExcelFunctions(loader);
 	// read_sharepoint_list(): a SharePoint list as a table, same secret.
 	sharepoint::RegisterListFunctions(loader);
+	sharepoint::RegisterVersionFunctions(loader);
 	sharepoint::RegisterSearchFunctions(loader);
 
 	datazoo::RegisterBannerOption(loader);
