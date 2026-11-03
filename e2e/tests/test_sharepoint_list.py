@@ -208,7 +208,10 @@ def test_people_by_name_email_and_id(graph, fixture_lists, sql, secret_sql):
     id, looked up in the site's User Information List; Created By / Modified
     By the same way. Names are looked up only when they are read."""
     site, _, _ = fixture_lists
-    users = _ok(graph._req("GET", f"{GRAPH}/sites/{site}/lists/User Information List/items"
+    lists = _ok(graph._req("GET", f"{GRAPH}/sites/{site}/lists?$select=id,webUrl,system&$top=999"), "lists")["value"]
+    uil = [x["id"] for x in lists if x.get("webUrl", "").lower().endswith("/_catalogs/users")]
+    assert uil, "no User Information List (_catalogs/users) among the site's lists"
+    users = _ok(graph._req("GET", f"{GRAPH}/sites/{site}/lists/{uil[0]}/items"
                                   "?$top=200&$expand=fields($select=Title,EMail)"), "user information list")["value"]
     people = [(int(u["id"]), u["fields"]["Title"], u["fields"].get("EMail"))
               for u in users if u["fields"].get("EMail") and u["fields"].get("Title")][:2]
