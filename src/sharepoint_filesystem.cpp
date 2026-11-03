@@ -30,6 +30,27 @@ SharepointUri ParseOrThrow(const string &path) {
 	return parsed.uri;
 }
 
+//! For a call that changes something: an earlier version is read-only (and
+//! its path, version stripped, names the current file -- which must not be
+//! what a delete or move of "x?version=1.0" hits).
+SharepointUri ParseForChange(const string &path) {
+	auto uri = ParseOrThrow(path);
+	if (!uri.version.empty()) {
+		throw IOException("sharepoint: '%s' is an earlier version, which is read-only", path);
+	}
+	return uri;
+}
+
+//! The item a read URI names: by path or id, and for "?version=" that version.
+DriveItemMeta StatUri(GraphClient &client, const SharepointUri &uri) {
+	auto meta = uri.kind == SharepointUriKind::FILE_ID ? client.StatById(uri.item_id)
+	                                                   : client.StatByPath(uri.RootRelativePath());
+	if (uri.version.empty() || !meta.found || meta.is_folder) {
+		return meta;
+	}
+	return client.StatVersion(meta.id, uri.version);
+}
+
 // Secrets and settings are resolved through the opener, which works for a
 // client connection AND for the database-level opener DuckDB uses when it
 // opens an ATTACHed database file (which has no ClientContext).
@@ -224,6 +245,9 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 			                              path);
 		}
 		if (flags.OpenForWriting()) {
+			if (!uri.version.empty()) {
+				throw IOException("sharepoint: '%s' is an earlier version, which is read-only", path);
+			}
 			if (uri.kind != SharepointUriKind::PATH) {
 				throw IOException("sharepoint: writing addresses a path, not an id: form ('%s')", path);
 			}
@@ -237,7 +261,8 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 
 		// Read: resolve metadata once -- or not at all, for a file under a prefix
 		// the user declared immutable whose metadata we already hold.
-		const string prefixes = uri.kind == SharepointUriKind::PATH ? ImmutablePrefixes(context) : string();
+		const string prefixes =
+		    uri.kind == SharepointUriKind::PATH && uri.version.empty() ? ImmutablePrefixes(context) : string();
 		const bool immutable = !prefixes.empty() && PathMatchesAnyPrefix(path, prefixes);
 		const string meta_key = auth.identity + "|" + uri.RootRelativePath();
 		DriveItemMeta meta;
@@ -245,8 +270,7 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 			IncrementCounter(Counter::META_CACHE_HIT);
 		} else {
 			GraphClient client(auth);
-			meta = (uri.kind == SharepointUriKind::FILE_ID) ? client.StatById(uri.item_id)
-			                                                : client.StatByPath(uri.RootRelativePath());
+			meta = StatUri(client, uri);
 			if (immutable && meta.found && !meta.is_folder) {
 				MetaCachePut(meta_key, meta);
 			}
@@ -264,6 +288,7 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 		}
 		auto handle = make_uniq<SharepointFileHandle>(*this, path, flags, std::move(auth));
 		handle->meta = std::move(meta);
+		handle->version = uri.version;
 		handle->block_size_bytes = BlockSizeBytes(context);
 		return std::move(handle);
 	});
@@ -290,7 +315,7 @@ void SharepointFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_byt
 	if (h.block_size_bytes == 0 || h.meta.ctag.empty()) {
 		GraphClient client(h.auth);
 		string chunk;
-		client.ReadRange(h.meta.id, static_cast<int64_t>(location), nr_bytes, chunk);
+		client.ReadRange(h.meta.id, static_cast<int64_t>(location), nr_bytes, chunk, h.version);
 		if (static_cast<int64_t>(chunk.size()) < nr_bytes) {
 			throw IOException("sharepoint: short read of '%s' (wanted %lld, got %llu)", handle.path.c_str(),
 			                  (long long)nr_bytes, (unsigned long long)chunk.size());
@@ -305,13 +330,14 @@ void SharepointFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_byt
 	const string key = h.auth.identity + "|" + h.meta.id + "|" + h.meta.ctag;
 	const AuthContext auth = h.auth;
 	const string item = h.meta.id;
+	const string version = h.version;
 	block_cache.Read(
 	    key, static_cast<uint64_t>(h.block_size_bytes), static_cast<uint64_t>(h.meta.size),
 	    static_cast<uint64_t>(location), static_cast<uint64_t>(nr_bytes), static_cast<char *>(buffer),
-	    [&auth, &item](uint64_t block_offset, uint64_t block_length) {
+	    [&auth, &item, &version](uint64_t block_offset, uint64_t block_length) {
 		    string chunk;
 		    GraphClient(auth).ReadRange(item, static_cast<int64_t>(block_offset),
-		                                static_cast<int64_t>(block_length), chunk);
+		                                static_cast<int64_t>(block_length), chunk, version);
 		    if (chunk.size() < block_length) {
 			    throw IOException("sharepoint: short read of block at %llu (wanted %llu, got %llu)",
 			                      (unsigned long long)block_offset, (unsigned long long)block_length,
@@ -430,8 +456,7 @@ bool SharepointFileSystem::FileExists(const string &filename, optional_ptr<FileO
 	}
 	auto auth = GetAuthContext(opener, filename);
 	GraphClient client(auth);
-	auto meta = (parsed.uri.kind == SharepointUriKind::FILE_ID) ? client.StatById(parsed.uri.item_id)
-	                                                            : client.StatByPath(parsed.uri.RootRelativePath());
+	auto meta = StatUri(client, parsed.uri);
 	return meta.found && !meta.is_folder;
 }
 
@@ -454,7 +479,7 @@ bool SharepointFileSystem::DirectoryExists(const string &directory, optional_ptr
 
 void SharepointFileSystem::CreateDirectory(const string &directory, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
-		auto uri = ParseOrThrow(directory);
+		auto uri = ParseForChange(directory);
 		CheckCreatableNames(uri, directory);
 		auto context = RequireOpener(opener, "create directory");
 		auto auth = GetAuthContext(context, directory);
@@ -466,7 +491,7 @@ void SharepointFileSystem::RemoveDirectory(const string &directory, optional_ptr
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		// A directory is a driveItem too; resolve and delete it (recursively, as
 		// Graph deletes a folder and its contents).
-		auto uri = ParseOrThrow(directory);
+		auto uri = ParseForChange(directory);
 		auto context = RequireOpener(opener, "remove directory");
 		if (uri.kind != SharepointUriKind::PATH || IsDriveRoot(uri)) {
 			// The empty path is the drive root: a recursive delete of the whole
@@ -506,8 +531,8 @@ bool SharepointFileSystem::ListFiles(const string &directory,
 
 void SharepointFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
-		auto src = ParseOrThrow(source);
-		auto dst = ParseOrThrow(target);
+		auto src = ParseForChange(source);
+		auto dst = ParseForChange(target);
 		if (src.kind != SharepointUriKind::PATH || dst.kind != SharepointUriKind::PATH) {
 			throw IOException("sharepoint: move addresses paths on both sides, not id: forms");
 		}
@@ -530,7 +555,7 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 
 void SharepointFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
-		auto uri = ParseOrThrow(filename);
+		auto uri = ParseForChange(filename);
 		if (IsDriveRoot(uri)) {
 			throw IOException("sharepoint: refusing to remove '%s': it is the drive root", filename);
 		}
@@ -568,8 +593,9 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 			return result;
 		}
 		auto uri = ParseOrThrow(path);
-		if (uri.kind == SharepointUriKind::FILE_ID) {
-			// A bare id addresses exactly one item; DuckDB globs it before opening.
+		if (uri.kind == SharepointUriKind::FILE_ID || !uri.version.empty()) {
+			// A bare id, or an earlier version, addresses exactly one item; DuckDB
+			// globs it before opening (the '?' of "?version=" looks like a glob).
 			result.emplace_back(path);
 			return result;
 		}

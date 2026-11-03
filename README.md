@@ -121,6 +121,16 @@ SELECT write_blob('sharepoint://notes/readme.md', '# Title'::BLOB);
 SELECT remove_file('sharepoint://notes/readme.md');   -- true, then false
 ```
 
+**Earlier versions.** SharePoint keeps a file's version history, and
+`?version=<label>` reads one of them with any reader; earlier versions are
+read-only:
+
+```sql
+SELECT version, current, modified, modified_by, size, path
+FROM sharepoint_versions('sharepoint://Finance/actuals.parquet');
+SELECT * FROM read_parquet('sharepoint://Finance/actuals.parquet?version=3.0');
+```
+
 `write_blob`, `remove_file`, `move_file` and `file_size` don't depend on the
 scheme, so they work for any filesystem DuckDB can reach (`s3://`, `gs://`,
 local paths). They are shared with duckdb-gdrive, so both extensions can be
