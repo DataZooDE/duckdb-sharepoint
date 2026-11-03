@@ -139,7 +139,7 @@ def test_list_types_paging_and_lookup(fixture_lists, sql, secret_sql):
         SELECT count(*) FROM read_sharepoint_list('id:{orders}');
         SELECT count(*) FROM read_sharepoint_list('{ORDERS}', site := '{site}');
     """).splitlines()
-    assert out == [str(ITEMS), str(ITEMS)]
+    assert out[-2:] == [str(ITEMS), str(ITEMS)]  # after CREATE SECRET's "true"
 
 
 def test_missing_list_names_it(sql, secret_sql):
