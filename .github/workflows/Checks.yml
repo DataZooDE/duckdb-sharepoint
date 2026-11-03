@@ -218,6 +218,14 @@ jobs:
     timeout-minutes: 120
     name: Live tests against a real Graph tenant
     runs-on: ubuntu-latest
+    # One live job at a time across the whole repo (#73): parallel runs share
+    # the test tenant, collide on the file suite's fixed paths and throttle
+    # each other (docs/hld.md §7a). Queue instead of cancelling: a cancelled
+    # live job leaks its scratch folders. (GitHub keeps one pending job per
+    # group; a newer one replaces an older pending one, never a running one.)
+    concurrency:
+      group: sharepoint-live-tenant
+      cancel-in-progress: false
     # `secrets` is not available in job-level `if`, so gate on the event:
     # fork PRs have a head repo different from the base repo.
     # Not on the nightly schedule (that only sweeps), and not for fork PRs,
@@ -308,6 +316,12 @@ jobs:
           SHAREPOINT_CERT_CLIENT_ID: ${{ secrets.SHAREPOINT_CERT_CLIENT_ID }}
           SHAREPOINT_CERTIFICATE_PEM: ${{ secrets.SHAREPOINT_CERTIFICATE_PEM }}
           SHAREPOINT_CERTIFICATE_PASSWORD: ${{ secrets.SHAREPOINT_CERTIFICATE_PASSWORD }}
+          # Least privilege (#70): a second app with only Sites.Selected,
+          # granted the test site. Skips until these secrets exist; then set
+          # SHAREPOINT_REQUIRE_SELECTED to '1' here.
+          SHAREPOINT_SELECTED_CLIENT_ID: ${{ secrets.SHAREPOINT_SELECTED_CLIENT_ID }}
+          SHAREPOINT_SELECTED_CLIENT_SECRET: ${{ secrets.SHAREPOINT_SELECTED_CLIENT_SECRET }}
+          SHAREPOINT_UNGRANTED_SITE: ${{ secrets.SHAREPOINT_UNGRANTED_SITE }}
           DATAZOO_DISABLE_TELEMETRY: '1'
         run: cd e2e && uv run --locked pytest -v
 
