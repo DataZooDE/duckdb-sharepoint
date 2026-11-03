@@ -13,6 +13,7 @@
 #include "sharepoint_uri.hpp"
 
 #include "duckdb.hpp"
+#include "duckdb/common/gzip_file_system.hpp"
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -41,6 +42,8 @@ struct ExcelBindData : public TableFunctionData {
 	vector<ExcelColumnType> types;
 	//! Row-major. Read whole at bind: the column types depend on every row.
 	vector<vector<ExcelCell>> rows;
+	//! The workbook counts dates from 1904 (Workbook::date1904).
+	bool date1904 = false;
 };
 
 //! The workbook an argument names, and what is needed to call Graph for it.
@@ -48,7 +51,58 @@ struct Workbook {
 	AuthContext auth;
 	string item_id;
 	string path; // as the user can paste it back, for messages
+	//! Dates count from 1904 (old Mac Excel), not 1900 (#64).
+	bool date1904 = false;
 };
+
+//! Whether the workbook uses the 1904 date system. The workbook API does not
+//! say; xl/workbook.xml does. Three ranged reads: the zip's tail (end record),
+//! its central directory, then that one entry. Any surprise means 1900, the
+//! default: this must never fail a read.
+bool UsesDate1904(GraphClient &client, const string &item_id, int64_t size) {
+	try {
+		constexpr int64_t kTail = 64 * 1024 + 22; // end record + longest comment
+		constexpr uint64_t kMaxEntry = 8 * 1024 * 1024;
+		if (size < 22) {
+			return false;
+		}
+		const int64_t tail_at = std::max<int64_t>(0, size - kTail);
+		string tail;
+		client.ReadRange(item_id, tail_at, size - tail_at, tail);
+		uint64_t cd_offset, cd_size;
+		if (!ZipCentralDirectory(tail, static_cast<uint64_t>(size), cd_offset, cd_size) || cd_size > kMaxEntry) {
+			return false;
+		}
+		string cd;
+		if (cd_offset >= static_cast<uint64_t>(tail_at)) {
+			cd = tail.substr(cd_offset - tail_at, cd_size);
+		} else {
+			client.ReadRange(item_id, static_cast<int64_t>(cd_offset), static_cast<int64_t>(cd_size), cd);
+		}
+		ZipEntry entry;
+		if (!ZipFindEntry(cd, "xl/workbook.xml", entry) || entry.compressed_size > kMaxEntry ||
+		    (entry.method != 0 && entry.method != 8)) {
+			return false;
+		}
+		// The local header's name and extra field may differ from the central
+		// record's; read generously and measure.
+		string local;
+		client.ReadRange(item_id, static_cast<int64_t>(entry.local_header_offset),
+		                 static_cast<int64_t>(30 + 1024 + entry.compressed_size), local);
+		uint64_t header;
+		if (!ZipLocalHeaderSize(local, header) || header + entry.compressed_size > local.size()) {
+			return false;
+		}
+		auto data = local.substr(header, entry.compressed_size);
+		if (entry.method == 8) {
+			data = GZipFileSystem::UncompressGZIPString(
+			    GzipFrame(data, entry.crc32, static_cast<uint32_t>(entry.uncompressed_size)));
+		}
+		return WorkbookUses1904(data);
+	} catch (std::exception &) {
+		return false;
+	}
+}
 
 Workbook OpenWorkbook(ClientContext &context, const string &arg) {
 	Workbook wb;
@@ -75,6 +129,7 @@ Workbook OpenWorkbook(ClientContext &context, const string &arg) {
 		throw InvalidInputException("sharepoint: '%s' is a folder, not a workbook", wb.path);
 	}
 	wb.item_id = meta.id;
+	wb.date1904 = UsesDate1904(client, meta.id, meta.size);
 	return wb;
 }
 
@@ -213,7 +268,7 @@ LogicalType ToLogicalType(ExcelColumnType t) {
 	}
 }
 
-Value ToValue(const ExcelCell &cell, ExcelColumnType t) {
+Value ToValue(const ExcelCell &cell, ExcelColumnType t, bool date1904) {
 	const auto type = ToLogicalType(t);
 	if (cell.kind == ExcelCellKind::EMPTY) {
 		return Value(type);
@@ -228,16 +283,19 @@ Value ToValue(const ExcelCell &cell, ExcelColumnType t) {
 		return Value(type); // an error cell (#DIV/0!) in a typed column
 	}
 	int64_t days, micros;
+	// A 1904 workbook's serial is the 1900 serial less 1462 days. Times of
+	// day (TIME) are the same in both.
+	const double serial = cell.number + (date1904 ? kExcel1904Offset : 0);
 	switch (t) {
 	case ExcelColumnType::BIGINT:
 		return Value::BIGINT(static_cast<int64_t>(cell.number));
 	case ExcelColumnType::DOUBLE:
 		return Value::DOUBLE(cell.number);
 	case ExcelColumnType::DATE:
-		ExcelSerialToEpoch(cell.number, days, micros);
+		ExcelSerialToEpoch(serial, days, micros);
 		return Value::DATE(date_t(static_cast<int32_t>(days)));
 	case ExcelColumnType::TIMESTAMP:
-		ExcelSerialToEpoch(cell.number, days, micros);
+		ExcelSerialToEpoch(serial, days, micros);
 		return Value::TIMESTAMP(timestamp_t(days * Interval::MICROS_PER_DAY + micros));
 	case ExcelColumnType::TIME:
 		ExcelSerialToEpoch(cell.number, days, micros);
@@ -260,7 +318,7 @@ string StringArg(TableFunctionBindInput &input, idx_t i, const char *what) {
 }
 
 //! Shared tail of both binds: types per column, then the result schema.
-unique_ptr<FunctionData> Finish(vector<string> names, vector<vector<ExcelCell>> rows, bool all_varchar,
+unique_ptr<FunctionData> Finish(vector<string> names, vector<vector<ExcelCell>> rows, bool all_varchar, bool date1904,
                                 vector<LogicalType> &return_types, duckdb_compat::BindNames &out_names) {
 	auto data = make_uniq<ExcelBindData>();
 	for (size_t c = 0; c < names.size(); c++) {
@@ -275,6 +333,7 @@ unique_ptr<FunctionData> Finish(vector<string> names, vector<vector<ExcelCell>> 
 		out_names.emplace_back(names[c]);
 	}
 	data->rows = std::move(rows);
+	data->date1904 = date1904;
 	return std::move(data);
 }
 
@@ -303,7 +362,8 @@ unique_ptr<FunctionData> TableBind(ClientContext &context, TableFunctionBindInpu
 			header_cells.push_back(ToCell(At(header_values, 0, c), nullptr, nullptr));
 		}
 		result =
-		    Finish(ExcelHeaderNames(header_cells), ReadCells(client, wb, address), all_varchar, return_types, names);
+		    Finish(ExcelHeaderNames(header_cells), ReadCells(client, wb, address), all_varchar, wb.date1904, return_types,
+		           names);
 	});
 	return result;
 }
@@ -339,7 +399,7 @@ unique_ptr<FunctionData> RangeBind(ClientContext &context, TableFunctionBindInpu
 			header_cells = std::move(rows.front());
 			rows.erase(rows.begin());
 		}
-		result = Finish(ExcelHeaderNames(header_cells), std::move(rows), all_varchar, return_types, names);
+		result = Finish(ExcelHeaderNames(header_cells), std::move(rows), all_varchar, wb.date1904, return_types, names);
 	});
 	return result;
 }
@@ -359,7 +419,7 @@ void ExcelScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	while (state.cursor < data.rows.size() && out < STANDARD_VECTOR_SIZE) {
 		auto &row = data.rows[state.cursor];
 		for (idx_t c = 0; c < data.types.size(); c++) {
-			output.SetValue(c, out, ToValue(row[c], data.types[c]));
+			output.SetValue(c, out, ToValue(row[c], data.types[c], data.date1904));
 		}
 		state.cursor++;
 		out++;
@@ -452,7 +512,8 @@ const char *NumberFormatFor(ExcelWriteKind kind) {
 
 //! A value as the workbook API takes it. NULL and non-finite numbers clear
 //! the cell (""); text keeps its apostrophe guard (ExcelTextInput).
-picojson::value ToJsonCell(const Value &v, ExcelWriteKind kind) {
+picojson::value ToJsonCell(const Value &v, ExcelWriteKind kind, bool date1904) {
+	const double epoch_shift = date1904 ? kExcel1904Offset : 0;
 	if (v.IsNull()) {
 		return picojson::value(string());
 	}
@@ -468,7 +529,7 @@ picojson::value ToJsonCell(const Value &v, ExcelWriteKind kind) {
 		if (!Value::IsFinite(date)) {
 			return picojson::value(string());
 		}
-		return picojson::value(ExcelSerialFromEpoch(date.days, 0));
+		return picojson::value(ExcelSerialFromEpoch(date.days, 0) - epoch_shift);
 	}
 	case ExcelWriteKind::TIMESTAMP: {
 		const auto ts = v.DefaultCastAs(LogicalType::TIMESTAMP).GetValue<timestamp_t>();
@@ -482,7 +543,7 @@ picojson::value ToJsonCell(const Value &v, ExcelWriteKind kind) {
 			rest += Interval::MICROS_PER_DAY;
 			days--;
 		}
-		return picojson::value(ExcelSerialFromEpoch(days, rest));
+		return picojson::value(ExcelSerialFromEpoch(days, rest) - epoch_shift);
 	}
 	case ExcelWriteKind::TIME: {
 		// Time::Convert, not dtime_t's member: `micros` before 2.0, `value` in 2.0.
@@ -606,6 +667,8 @@ struct ExcelWriteGlobalState : public GlobalFunctionData {
 	picojson::array pending_formats;
 	idx_t pending_cells = 0;
 	idx_t first_data_row = 0; // created table: the header row
+	//! A worksheet this COPY added (EnsureWorksheet), waited for at the end.
+	string created_sheet;
 };
 
 string WorksheetResource(const string &sheet) {
@@ -631,6 +694,7 @@ bool EnsureWorksheet(GraphClient &client, ExcelWriteGlobalState &g, const string
 	body["name"] = picojson::value(sheet);
 	client.WorkbookCall("POST", g.wb.item_id, "worksheets/add", picojson::value(body).serialize(), g.session_id, what,
 	                    false);
+	g.created_sheet = sheet;
 	return true;
 }
 
@@ -860,7 +924,7 @@ void ExcelWriteSink(ExecutionContext &context, FunctionData &bind_p, GlobalFunct
 			picojson::array formats(g.width);
 			for (idx_t c = 0; c < input.ColumnCount(); c++) {
 				const idx_t to = append ? g.column_of[c] : c;
-				values[to] = ToJsonCell(input.GetValue(c, r), bind.kinds[c]);
+				values[to] = ToJsonCell(input.GetValue(c, r), bind.kinds[c], g.wb.date1904);
 				if (auto format = NumberFormatFor(bind.kinds[c])) {
 					formats[to] = picojson::value(string(format));
 				}
@@ -875,6 +939,10 @@ void ExcelWriteSink(ExecutionContext &context, FunctionData &bind_p, GlobalFunct
 
 void ExcelWriteCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
 }
+
+//! Polls for a new table or worksheet to become visible outside its session
+//! (~30 s of backoff in all).
+constexpr int kMaxCreatedVisibleAttempts = 6;
 
 void ExcelWriteFinalize(ClientContext &context, FunctionData &bind_p, GlobalFunctionData &gstate_p) {
 	auto &bind = bind_p.Cast<ExcelWriteBindData>();
@@ -908,6 +976,28 @@ void ExcelWriteFinalize(ClientContext &context, FunctionData &bind_p, GlobalFunc
 			client.WorkbookCall("POST", g.wb.item_id, "closeSession", "{}", g.session_id,
 			                    "workbook session for '" + g.wb.path + "'", true);
 			g.session_id.clear();
+		}
+		// What a COPY creates in a session -- a table, a worksheet -- is not
+		// at once visible outside it: a read right after the COPY got 404
+		// ItemNotFound (live CI, 2026-11-03, both). Wait until it is, so
+		// COPY-then-read works; the rows are written either way, so running
+		// out of patience is no error.
+		string created, what;
+		if (g.create_table) {
+			created = "tables/" + EncodeWorkbookName(bind.table);
+			what = Quoted("table", bind.table, g.wb);
+		} else if (!g.created_sheet.empty()) {
+			created = WorksheetResource(g.created_sheet);
+			what = Quoted("worksheet", g.created_sheet, g.wb);
+		}
+		for (int attempt = 1; !created.empty() && attempt <= kMaxCreatedVisibleAttempts; attempt++) {
+			int status = 0;
+			client.WorkbookCall("GET", g.wb.item_id, created + "?$select=name", string(), string(), what, true,
+			                    &status);
+			if (status != 404) {
+				break;
+			}
+			SleepBeforeRetry(attempt, 0);
 		}
 	});
 }

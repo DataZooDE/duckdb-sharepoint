@@ -83,6 +83,33 @@ TEST_CASE("id: values are restricted to Graph's id alphabet", "[uri]") {
 	}
 }
 
+TEST_CASE("?version= addresses an earlier version of a file", "[uri][versions]") {
+	// '?' cannot appear in a SharePoint name, so the suffix is unambiguous.
+	auto p = ParseSharepointUri("sharepoint://Finance/actuals.parquet?version=3.0");
+	REQUIRE(p.ok);
+	REQUIRE(p.uri.RootRelativePath() == "Finance/actuals.parquet");
+	REQUIRE(p.uri.version == "3.0");
+	REQUIRE(p.uri.ToString() == "sharepoint://Finance/actuals.parquet?version=3.0");
+
+	auto id = ParseSharepointUri("sharepoint://id:01ABC?version=12.0");
+	REQUIRE(id.ok);
+	REQUIRE(id.uri.item_id == "01ABC");
+	REQUIRE(id.uri.version == "12.0");
+	REQUIRE(id.uri.ToString() == "sharepoint://id:01ABC?version=12.0");
+
+	REQUIRE(ParseSharepointUri("sharepoint://a.csv").uri.version.empty());
+	// A version id is SharePoint's "major.minor"; nothing else is spliced into a URL.
+	REQUIRE_FALSE(ParseSharepointUri("sharepoint://a.csv?version=").ok);
+	REQUIRE_FALSE(ParseSharepointUri("sharepoint://a.csv?version=1.0/../x").ok);
+	REQUIRE_FALSE(ParseSharepointUri("sharepoint://a.csv?version=1.0&x=1").ok);
+	REQUIRE_FALSE(ParseSharepointUri("sharepoint://?version=1.0").ok); // the root has no versions
+	// Any other '?' stays part of the path (a glob character).
+	auto glob = ParseSharepointUri("sharepoint://data/file?.csv");
+	REQUIRE(glob.ok);
+	REQUIRE(glob.uri.version.empty());
+	REQUIRE(glob.uri.FileName() == "file?.csv");
+}
+
 TEST_CASE("names SharePoint forbids are caught before Graph sees them", "[uri]") {
 	// ':' is also Graph's root:/path: delimiter -- sent through, it surfaced as
 	// "Resource not found for the segment 'root:'", which explains nothing.
@@ -481,6 +508,16 @@ TEST_CASE("graph error messages carry the code and stay one line", "[errors]") {
 	const auto long_msg = FormatGraphError("op", 400, "invalidRequest", std::string(1000, 'm') + "\nsecond line");
 	REQUIRE(long_msg.size() < 400);
 	REQUIRE(long_msg.find('\n') == std::string::npos);
+}
+
+TEST_CASE("a 403 says how to grant access, including Sites.Selected", "[errors]") {
+	const auto msg = FormatGraphError("site 'Other'", 403, "accessDenied", "Access denied");
+	REQUIRE(msg.find("HTTP 403 (forbidden, accessDenied): Access denied") != std::string::npos);
+	REQUIRE(msg.find("Sites.Selected") != std::string::npos);
+	REQUIRE(msg.find('\n') == std::string::npos);
+	// Throttling sent as a 403 is not a permission problem: no hint.
+	REQUIRE(FormatGraphError("op", 403, "activityLimitReached", "").find("Sites.Selected") == std::string::npos);
+	REQUIRE(FormatGraphError("op", 404, "itemNotFound", "").find("Sites.Selected") == std::string::npos);
 }
 
 // ---------------------------------------------------------------------------

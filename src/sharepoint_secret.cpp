@@ -68,6 +68,44 @@ unique_ptr<BaseSecret> CreateClientCredentialsSecret(ClientContext &, CreateSecr
 }
 
 // ---------------------------------------------------------------------------
+// PROVIDER client_certificate -- app-only auth with a certificate (#71).
+//
+// The same app registration as client_credentials, with a certificate
+// uploaded under *Certificates & secrets* instead of a client secret. The
+// token request carries a JWT signed with the certificate's key (see
+// sharepoint_assertion.hpp). CERTIFICATE_PATH is a local PEM file holding the
+// certificate and its RSA private key; CERTIFICATE_PASSWORD decrypts an
+// encrypted key. The file is read when the secret is used, so a renewed
+// certificate in the same place needs no new secret.
+// ---------------------------------------------------------------------------
+unique_ptr<BaseSecret> CreateClientCertificateSecret(ClientContext &, CreateSecretInput &input) {
+	auto result = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
+
+	CopyOption(input, *result, "tenant_id");
+	CopyOption(input, *result, "client_id");
+	CopyOption(input, *result, "certificate_path");
+	CopyOption(input, *result, "certificate_password");
+	CopyOption(input, *result, "drive_id");
+	CopyOption(input, *result, "site_id");
+	CopyOption(input, *result, "graph_scope");
+
+	for (const char *required : {"tenant_id", "client_id", "certificate_path"}) {
+		if (!HasNonEmptyOption(input, required)) {
+			throw InvalidInputException(
+			    "sharepoint secret (PROVIDER client_certificate) needs TENANT_ID, CLIENT_ID and "
+			    "CERTIFICATE_PATH, a PEM file with the certificate and its private key. Upload the "
+			    "certificate to the app registration (Certificates & secrets), then:\n"
+			    "  CREATE SECRET sp (TYPE sharepoint, PROVIDER client_certificate,\n"
+			    "                    TENANT_ID '...', CLIENT_ID '...', CERTIFICATE_PATH '/etc/sp/app.pem',\n"
+			    "                    DRIVE_ID 'b!...');");
+		}
+	}
+
+	result->redact_keys.insert("certificate_password");
+	return std::move(result);
+}
+
+// ---------------------------------------------------------------------------
 // PROVIDER config -- pre-obtained tokens, pasted in.
 // ---------------------------------------------------------------------------
 unique_ptr<BaseSecret> CreateConfigSecret(ClientContext &, CreateSecretInput &input) {
@@ -189,6 +227,14 @@ void RegisterSharepointSecrets(ExtensionLoader &loader) {
 	cc_fn.named_parameters["client_secret"] = LogicalType(LogicalTypeId::VARCHAR);
 	RegisterCommonParameters(cc_fn);
 	loader.RegisterFunction(cc_fn);
+
+	CreateSecretFunction cert_fn = {kSecretTypeName, "client_certificate", CreateClientCertificateSecret, {}};
+	cert_fn.named_parameters["tenant_id"] = LogicalType(LogicalTypeId::VARCHAR);
+	cert_fn.named_parameters["client_id"] = LogicalType(LogicalTypeId::VARCHAR);
+	cert_fn.named_parameters["certificate_path"] = LogicalType(LogicalTypeId::VARCHAR);
+	cert_fn.named_parameters["certificate_password"] = LogicalType(LogicalTypeId::VARCHAR);
+	RegisterCommonParameters(cert_fn);
+	loader.RegisterFunction(cert_fn);
 
 	CreateSecretFunction config_fn = {kSecretTypeName, "config", CreateConfigSecret, {}};
 	config_fn.named_parameters["access_token"] = LogicalType(LogicalTypeId::VARCHAR);

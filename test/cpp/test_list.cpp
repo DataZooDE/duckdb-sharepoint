@@ -6,6 +6,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -27,11 +28,16 @@ ListColumnDef Col(const std::string &name, const std::string &display, ListFacet
 std::string Describe(const std::vector<ListOutputColumn> &cols) {
 	std::string out;
 	for (auto &c : cols) {
-		static const char *types[] = {"VARCHAR", "VARCHAR[]", "DOUBLE", "DECIMAL", "BOOLEAN", "TIMESTAMP", "BIGINT"};
+		static const char *types[] = {"VARCHAR", "VARCHAR[]", "DOUBLE", "DECIMAL", "BOOLEAN", "TIMESTAMP", "BIGINT", "BIGINT[]", "DATE"};
 		out += c.name + ":" + types[static_cast<int>(c.type)] + "<-" + c.field + (c.may_be_multi ? "*" : "") + " ";
 	}
 	return out;
 }
+
+//! Created By / Modified By, after created and modified on every list.
+const std::string kPeople = "created_by:VARCHAR<-AuthorLookupId created_by_email:VARCHAR<-AuthorLookupId "
+                            "created_by_id:BIGINT<-AuthorLookupId modified_by:VARCHAR<-EditorLookupId "
+                            "modified_by_email:VARCHAR<-EditorLookupId modified_by_id:BIGINT<-EditorLookupId ";
 
 } // namespace
 
@@ -49,7 +55,8 @@ TEST_CASE("PlanListColumns: system columns kept, plumbing left out", "[list]") {
 	};
 	REQUIRE(Describe(PlanListColumns(defs)) ==
 	        "id:BIGINT<-id Title:VARCHAR<-Title Amount:DOUBLE<-Amount created:TIMESTAMP<-Created "
-	        "modified:TIMESTAMP<-Modified ");
+	        "modified:TIMESTAMP<-Modified " +
+	            kPeople);
 }
 
 TEST_CASE("PlanListColumns: one type per facet", "[list]") {
@@ -64,7 +71,8 @@ TEST_CASE("PlanListColumns: one type per facet", "[list]") {
 	REQUIRE(Describe(PlanListColumns(defs)) ==
 	        "id:BIGINT<-id Price:DECIMAL<-Price Done:BOOLEAN<-Done Due Date:TIMESTAMP<-Due Status:VARCHAR<-Status* "
 	        "Link:VARCHAR<-Link Margin:DOUBLE<-Margin Where:VARCHAR<-Geo created:TIMESTAMP<-Created "
-	        "modified:TIMESTAMP<-Modified ");
+	        "modified:TIMESTAMP<-Modified " +
+	            kPeople);
 }
 
 TEST_CASE("PlanListColumns: lookups and people by id", "[list]") {
@@ -74,7 +82,40 @@ TEST_CASE("PlanListColumns: lookups and people by id", "[list]") {
 	};
 	REQUIRE(Describe(PlanListColumns(defs)) ==
 	        "id:BIGINT<-id Customer:VARCHAR<-Customer Customer_id:BIGINT<-CustomerLookupId "
-	        "Owner_id:BIGINT<-OwnerLookupId created:TIMESTAMP<-Created modified:TIMESTAMP<-Modified ");
+	        "Owner:VARCHAR<-OwnerLookupId Owner_email:VARCHAR<-OwnerLookupId Owner_id:BIGINT<-OwnerLookupId "
+	        "created:TIMESTAMP<-Created modified:TIMESTAMP<-Modified " +
+	            kPeople);
+}
+
+TEST_CASE("PlanListColumns: a person is name, email and id; several people are lists", "[list][people]") {
+	auto team = Col("Team", "Team", ListFacet::PERSON);
+	team.multi = true;
+	auto owner = Col("Owner", "Owner", ListFacet::PERSON);
+	owner.indexed = true;
+	auto plan = PlanListColumns({owner, team, Col("created_by", "created_by", ListFacet::TEXT)});
+	REQUIRE(Describe(plan) == "id:BIGINT<-id Owner:VARCHAR<-OwnerLookupId Owner_email:VARCHAR<-OwnerLookupId "
+	                          "Owner_id:BIGINT<-OwnerLookupId Team:VARCHAR[]<-TeamLookupId "
+	                          "Team_email:VARCHAR[]<-TeamLookupId Team_id:BIGINT[]<-TeamLookupId "
+	                          "created_by_2:VARCHAR<-created_by created:TIMESTAMP<-Created "
+	                          "modified:TIMESTAMP<-Modified " +
+	                              kPeople);
+	REQUIRE(plan[1].person == ListPersonPart::NAME);
+	REQUIRE(plan[1].person_field == "Owner");
+	REQUIRE(plan[2].person == ListPersonPart::EMAIL);
+	REQUIRE(plan[3].person == ListPersonPart::ID);
+	REQUIRE(plan[3].filter == ListFilterKind::NUMBER); // an indexed single person, by id
+	REQUIRE(plan[6].filter == ListFilterKind::NONE);   // several people: not pushed down
+
+	// Written back as read: names, emails and the system people are skipped,
+	// a person is set through its _id.
+	std::vector<ListWriteColumn> out;
+	std::string error;
+	REQUIRE(PlanListWrite({"Owner", "Owner_email", "Owner_id", "created_by", "modified_by_id"}, plan, out, error));
+	REQUIRE(out[0].target == ListWriteTarget::SKIP);
+	REQUIRE(out[1].target == ListWriteTarget::SKIP);
+	REQUIRE((out[2].target == ListWriteTarget::FIELD && out[2].field == "OwnerLookupId"));
+	REQUIRE(out[3].target == ListWriteTarget::SKIP);
+	REQUIRE(out[4].target == ListWriteTarget::SKIP);
 }
 
 TEST_CASE("PlanListColumns: names unique case-insensitively", "[list]") {
@@ -86,7 +127,8 @@ TEST_CASE("PlanListColumns: names unique case-insensitively", "[list]") {
 	};
 	REQUIRE(Describe(PlanListColumns(defs)) ==
 	        "id:BIGINT<-id Title:VARCHAR<-Title title_2:VARCHAR<-Title0 ID_2:VARCHAR<-ID0 "
-	        "Created_2:VARCHAR<-Created0 created:TIMESTAMP<-Created modified:TIMESTAMP<-Modified ");
+	        "Created_2:VARCHAR<-Created0 created:TIMESTAMP<-Created modified:TIMESTAMP<-Modified " +
+	            kPeople);
 }
 
 TEST_CASE("ParseIsoTimestamp", "[list]") {
@@ -152,4 +194,175 @@ TEST_CASE("PlanListColumns: built-in Title keeps its name in any site language",
 	REQUIRE(plan[1].name == "Title");
 	REQUIRE(plan[1].field == "Title");
 	REQUIRE(plan[2].name == "Betrag"); // user columns keep their display name
+}
+
+// ---------------------------------------------------------------------------
+// WHERE pushdown (#61): which columns Graph may filter on, and the $filter
+// text. DuckDB keeps every predicate, so a pushed clause only has to be never
+// stricter than the SQL it came from.
+// ---------------------------------------------------------------------------
+namespace {
+
+ListColumnDef Indexed(ListColumnDef d) {
+	d.indexed = true;
+	return d;
+}
+
+ListPredicate Pred(const std::string &field, ListFilterKind kind, ListFilterOp op) {
+	ListPredicate p;
+	p.field = field;
+	p.kind = kind;
+	p.op = op;
+	return p;
+}
+
+} // namespace
+
+TEST_CASE("PlanListColumns: only indexed columns of a safe kind are filterable", "[list][pushdown]") {
+	std::vector<ListColumnDef> defs = {
+	    Indexed(Col("Title", "Title", ListFacet::TEXT)),
+	    Col("Note", "Note", ListFacet::TEXT), // not indexed
+	    Indexed(Col("Amount", "Amount", ListFacet::NUMBER)),
+	    Indexed(Col("Price", "Price", ListFacet::CURRENCY)),
+	    Indexed(Col("Due", "Due", ListFacet::DATETIME)),
+	    Indexed(Col("Done", "Done", ListFacet::BOOLEAN)),
+	    Indexed(Col("Customer", "Customer", ListFacet::LOOKUP)),
+	    Indexed(Col("Calc", "Calc", ListFacet::CALCULATED)),
+	    Indexed(Col("Modified", "Modified", ListFacet::DATETIME, false, true)),
+	    Col("Created", "Created", ListFacet::DATETIME, false, true),
+	};
+	std::string out;
+	for (auto &c : PlanListColumns(defs)) {
+		static const char *kinds[] = {"-", "text", "number", "timestamp"};
+		out += c.name + "=" + kinds[static_cast<int>(c.filter)] + " ";
+	}
+	REQUIRE(out == "id=- Title=text Note=- Amount=number Price=number Due=timestamp Done=- Customer=- "
+	               "Customer_id=number Calc=- created=- modified=timestamp created_by=- created_by_email=- "
+	               "created_by_id=- modified_by=- modified_by_email=- modified_by_id=- ");
+}
+
+TEST_CASE("ODataClause: text equality, IN and prefix; quotes doubled", "[list][pushdown]") {
+	auto eq = Pred("Status", ListFilterKind::TEXT, ListFilterOp::EQ);
+	eq.texts = {"it's"};
+	REQUIRE(ODataClause(eq) == "fields/Status eq 'it''s'");
+	auto in = Pred("Status", ListFilterKind::TEXT, ListFilterOp::IN);
+	in.texts = {"a", "b"};
+	REQUIRE(ODataClause(in) == "(fields/Status eq 'a' or fields/Status eq 'b')");
+	auto prefix = Pred("Title", ListFilterKind::TEXT, ListFilterOp::PREFIX);
+	prefix.texts = {"ord"};
+	REQUIRE(ODataClause(prefix) == "startswith(fields/Title,'ord')");
+	// SharePoint compares text case-insensitively and in its own collation:
+	// a range or an empty prefix is not pushed.
+	auto range = Pred("Title", ListFilterKind::TEXT, ListFilterOp::GT);
+	range.texts = {"m"};
+	REQUIRE(ODataClause(range).empty());
+	auto empty_prefix = Pred("Title", ListFilterKind::TEXT, ListFilterOp::PREFIX);
+	empty_prefix.texts = {""};
+	REQUIRE(ODataClause(empty_prefix).empty());
+}
+
+TEST_CASE("ODataClause: number ranges are made inclusive", "[list][pushdown]") {
+	auto gt = Pred("Amount", ListFilterKind::NUMBER, ListFilterOp::GT);
+	gt.numbers = {5};
+	REQUIRE(ODataClause(gt) == "fields/Amount ge 5");
+	auto lt = Pred("Amount", ListFilterKind::NUMBER, ListFilterOp::LT);
+	lt.numbers = {0.1};
+	REQUIRE(ODataClause(lt) == "fields/Amount le 0.1");
+	auto in = Pred("CustomerLookupId", ListFilterKind::NUMBER, ListFilterOp::IN);
+	in.numbers = {1, 3};
+	REQUIRE(ODataClause(in) == "(fields/CustomerLookupId eq 1 or fields/CustomerLookupId eq 3)");
+	auto neg = Pred("Amount", ListFilterKind::NUMBER, ListFilterOp::EQ);
+	neg.numbers = {-2.5};
+	REQUIRE(ODataClause(neg) == "fields/Amount eq -2.5");
+	auto nan = Pred("Amount", ListFilterKind::NUMBER, ListFilterOp::EQ);
+	nan.numbers = {std::numeric_limits<double>::quiet_NaN()};
+	REQUIRE(ODataClause(nan).empty());
+}
+
+TEST_CASE("ODataClause: timestamps as inclusive whole-second ranges only", "[list][pushdown]") {
+	int64_t t;
+	REQUIRE(ParseIsoTimestamp("2026-01-01T10:00:00.500000Z", t));
+	auto ge = Pred("Modified", ListFilterKind::TIMESTAMP, ListFilterOp::GT);
+	ge.micros = t;
+	REQUIRE(ODataClause(ge) == "fields/Modified ge '2026-01-01T10:00:00Z'");
+	auto le = Pred("Modified", ListFilterKind::TIMESTAMP, ListFilterOp::LT);
+	le.micros = t;
+	REQUIRE(ODataClause(le) == "fields/Modified le '2026-01-01T10:00:01Z'");
+	auto eq = Pred("Modified", ListFilterKind::TIMESTAMP, ListFilterOp::EQ);
+	eq.micros = t;
+	REQUIRE(ODataClause(eq).empty());
+}
+
+TEST_CASE("BuildListFilter joins the pushable clauses with and", "[list][pushdown]") {
+	auto a = Pred("Status", ListFilterKind::TEXT, ListFilterOp::EQ);
+	a.texts = {"open"};
+	auto skipped = Pred("Status", ListFilterKind::TEXT, ListFilterOp::LT);
+	skipped.texts = {"x"};
+	auto b = Pred("Amount", ListFilterKind::NUMBER, ListFilterOp::GE);
+	b.numbers = {10};
+	REQUIRE(BuildListFilter({a, skipped, b}) == "fields/Status eq 'open' and fields/Amount ge 10");
+	REQUIRE(BuildListFilter({skipped}).empty());
+	REQUIRE(BuildListFilter({}).empty());
+}
+
+TEST_CASE("PlanListColumns: a drop-down or radio choice is single-valued and filterable", "[list][pushdown]") {
+	auto single = Indexed(Col("Status", "Status", ListFacet::CHOICE));
+	single.single_choice = true;
+	auto multi = Indexed(Col("Tags", "Tags", ListFacet::CHOICE)); // check boxes, or unknown
+	auto plan = PlanListColumns({single, multi});
+	REQUIRE(Describe(plan) == "id:BIGINT<-id Status:VARCHAR<-Status Tags:VARCHAR<-Tags* created:TIMESTAMP<-Created "
+	                          "modified:TIMESTAMP<-Modified " +
+	            kPeople);
+	REQUIRE(plan[1].filter == ListFilterKind::TEXT);
+	REQUIRE(plan[2].filter == ListFilterKind::NONE);
+}
+
+// ---------------------------------------------------------------------------
+// Date-only columns (#64). Graph returns a date-only value as midnight in the
+// site's time zone, in UTC: 2026-03-15 on a UTC+1 site is
+// "2026-03-14T23:00:00Z". Graph v1.0 does not expose the site's time zone.
+// ---------------------------------------------------------------------------
+TEST_CASE("PlanListColumns: a date-only column is a DATE", "[list][date]") {
+	auto due = Col("Due", "Due", ListFacet::DATETIME);
+	due.date_only = true;
+	due.indexed = true; // still not pushed down: Graph compares the site-local midnight
+	auto calc = Col("Next", "Next", ListFacet::CALCULATED);
+	calc.calculated_output = ListFacet::DATETIME;
+	calc.date_only = true;
+	auto plan = PlanListColumns({due, calc, Col("At", "At", ListFacet::DATETIME)});
+	REQUIRE(Describe(plan) == "id:BIGINT<-id Due:DATE<-Due Next:DATE<-Next At:TIMESTAMP<-At "
+	                          "created:TIMESTAMP<-Created modified:TIMESTAMP<-Modified " +
+	                              kPeople);
+	std::vector<ListWriteColumn> out;
+	std::string error;
+	REQUIRE(PlanListWrite({"Due", "At"}, plan, out, error));
+	REQUIRE(plan[1].filter == ListFilterKind::NONE);
+	REQUIRE(out[0].date_only);
+	REQUIRE_FALSE(out[1].date_only);
+}
+
+TEST_CASE("DateOnlyDays: the site-local date of Graph's UTC midnight", "[list][date]") {
+	auto days = [](const char *iso) {
+		int64_t us;
+		REQUIRE(ParseIsoTimestamp(iso, us));
+		return FormatIsoTimestamp(int64_t(DateOnlyDays(us)) * 86400 * 1000000).substr(0, 10);
+	};
+	REQUIRE(days("2026-03-15T00:00:00Z") == "2026-03-15"); // UTC
+	REQUIRE(days("2026-03-14T23:00:00Z") == "2026-03-15"); // UTC+1 (Berlin)
+	REQUIRE(days("2026-03-14T11:00:00Z") == "2026-03-15"); // UTC+13 (Auckland, summer)
+	REQUIRE(days("2026-03-14T13:30:00Z") == "2026-03-15"); // UTC+10:30
+	REQUIRE(days("2026-03-15T05:00:00Z") == "2026-03-15"); // UTC-5 (New York)
+	REQUIRE(days("2026-03-15T10:00:00Z") == "2026-03-15"); // UTC-10 (Hawaii)
+	REQUIRE(days("1969-12-31T23:00:00Z") == "1970-01-01"); // before the epoch
+}
+
+TEST_CASE("FormatDateOnly: an instant on that date from UTC-10 to UTC+13:30", "[list][date][write]") {
+	REQUIRE(FormatDateOnly(0) == "1970-01-01T10:15:00Z");
+	int64_t us;
+	REQUIRE(ParseIsoTimestamp("2026-03-15T00:00:00Z", us));
+	const auto d = static_cast<int32_t>(us / 86400 / 1000000);
+	REQUIRE(FormatDateOnly(d) == "2026-03-15T10:15:00Z");
+	// Read back as the same date, whatever Graph does with it in between.
+	REQUIRE(ParseIsoTimestamp(FormatDateOnly(d), us));
+	REQUIRE(DateOnlyDays(us) == d);
 }

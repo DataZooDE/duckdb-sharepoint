@@ -19,10 +19,16 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include <picojson.h>
 
 #include <algorithm>
+#include <map>
+#include <set>
 #include <cmath>
 #include <cstdint>
 #include "duckdb_compat.hpp"
@@ -47,6 +53,8 @@ int64_t ListPageSize(ClientContext &context) {
 }
 //! A nextLink chain longer than this is a server bug, not a list.
 constexpr int kMaxItemPages = 100000;
+//! People looked up per $batch call (Graph's $batch limit).
+constexpr idx_t kPeoplePerBatch = 20;
 
 const picojson::object &AsObject(const string &body, const string &what, picojson::value &holder) {
 	if (!picojson::parse(holder, body).empty() || !holder.is<picojson::object>()) {
@@ -105,12 +113,22 @@ ListColumnDef ParseColumnDef(const picojson::object &o) {
 	def.display_name = StringField(o, "displayName");
 	def.hidden = BoolField(o, "hidden");
 	def.read_only = BoolField(o, "readOnly");
+	def.indexed = BoolField(o, "indexed");
 	// The facet is the one object-valued key naming a kind.
 	for (const char *facet : {"text", "number", "currency", "boolean", "dateTime", "choice", "lookup", "personOrGroup",
 	                          "hyperlinkOrPicture", "calculated"}) {
 		auto it = o.find(facet);
 		if (it != o.end() && it->second.is<picojson::object>()) {
 			def.facet = FacetOf(facet);
+			if (def.facet == ListFacet::PERSON) {
+				def.multi = BoolField(it->second.get<picojson::object>(), "allowMultipleSelection");
+			}
+			if (def.facet == ListFacet::CHOICE) {
+				const auto shown = StringField(it->second.get<picojson::object>(), "displayAs");
+				def.single_choice = shown == "dropDownMenu" || shown == "radioButtons";
+			}
+			// dateTime and calculated both say "format": "dateOnly" | "dateTime".
+			def.date_only = StringField(it->second.get<picojson::object>(), "format") == "dateOnly";
 			if (def.facet == ListFacet::CALCULATED) {
 				auto output = StringField(it->second.get<picojson::object>(), "outputType");
 				def.calculated_output = output == "number"     ? ListFacet::NUMBER
@@ -136,6 +154,10 @@ LogicalType ToLogicalType(ListColumnType t) {
 		return LogicalType::BOOLEAN;
 	case ListColumnType::TIMESTAMP:
 		return LogicalType::TIMESTAMP;
+	case ListColumnType::BIGINT_LIST:
+		return LogicalType::LIST(LogicalType::BIGINT);
+	case ListColumnType::DATE:
+		return LogicalType::DATE;
 	case ListColumnType::BIGINT:
 		return LogicalType::BIGINT;
 	default:
@@ -198,6 +220,13 @@ Value ToValue(const picojson::value *v, ListColumnType t) {
 		}
 		return Value(type);
 	}
+	case ListColumnType::DATE: {
+		int64_t us;
+		if (v->is<string>() && ParseIsoTimestamp(v->get<string>(), us)) {
+			return Value::DATE(date_t(DateOnlyDays(us)));
+		}
+		return Value(type);
+	}
 	case ListColumnType::VARCHAR_LIST: {
 		vector<Value> items;
 		if (v->is<picojson::array>()) {
@@ -214,9 +243,117 @@ Value ToValue(const picojson::value *v, ListColumnType t) {
 	}
 }
 
+//! Every item of a list, as its `fields` object, page by page; `filter` is
+//! an OData $filter ("" for none).
+vector<picojson::object> FetchItems(GraphClient &client, const string &base, const string &select, int64_t page_size,
+                                    const string &filter, const string &what) {
+	vector<picojson::object> items;
+	string next = base + "/items?$expand=fields($select=" + select + ")&$top=" + std::to_string(page_size);
+	if (!filter.empty()) {
+		next += "&$filter=" + EncodeWorkbookName(filter);
+	}
+	for (int pages = 0; !next.empty(); pages++) {
+		if (pages >= kMaxItemPages) {
+			throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxItemPages);
+		}
+		picojson::value page_holder;
+		const auto &page = AsObject(client.GraphGet(next, what), what, page_holder);
+		auto page_items = page.find("value");
+		if (page_items != page.end() && page_items->second.is<picojson::array>()) {
+			for (auto &item : page_items->second.get<picojson::array>()) {
+				if (!item.is<picojson::object>()) {
+					continue;
+				}
+				auto fields = item.get<picojson::object>().find("fields");
+				items.push_back(fields != item.get<picojson::object>().end() && fields->second.is<picojson::object>()
+				                    ? fields->second.get<picojson::object>()
+				                    : picojson::object());
+			}
+		}
+		auto link = page.find("@odata.nextLink");
+		next = (link != page.end() && link->second.is<string>()) ? GraphPathOfLink(link->second.get<string>())
+		                                                         : string();
+	}
+	return items;
+}
+
+//! A person column's value from an item's fields (#63). The id comes from
+//! <internal>LookupId (one id, or a list of them), or from the objects of
+//! <internal> ([{LookupId, LookupValue, Email}], as Graph may send several
+//! people); a name or email only from those objects -- else NULL, for
+//! ListScan to look up in the User Information List.
+Value PersonValue(const picojson::object &fields, const ListOutputColumn &col) {
+	const bool multi = col.type == ListColumnType::VARCHAR_LIST || col.type == ListColumnType::BIGINT_LIST;
+	const auto type = ToLogicalType(col.type);
+	const auto element = multi ? ListType::GetChildType(type) : type;
+	vector<Value> values;
+	auto objects = fields.find(col.person_field);
+	if (objects != fields.end() && objects->second.is<picojson::array>()) {
+		for (auto &o : objects->second.get<picojson::array>()) {
+			if (!o.is<picojson::object>()) {
+				continue;
+			}
+			auto &person = o.get<picojson::object>();
+			const char *key = col.person == ListPersonPart::NAME ? "LookupValue"
+			                  : col.person == ListPersonPart::EMAIL ? "Email"
+			                                                        : "LookupId";
+			auto it = person.find(key);
+			values.push_back(ToValue(it == person.end() ? nullptr : &it->second,
+			                         col.person == ListPersonPart::ID ? ListColumnType::BIGINT
+			                                                          : ListColumnType::VARCHAR));
+		}
+	} else if (col.person == ListPersonPart::ID) {
+		auto ids = fields.find(col.field);
+		if (ids != fields.end() && ids->second.is<picojson::array>()) {
+			for (auto &id : ids->second.get<picojson::array>()) {
+				values.push_back(ToValue(&id, ListColumnType::BIGINT));
+			}
+		} else if (ids != fields.end()) {
+			values.push_back(ToValue(&ids->second, ListColumnType::BIGINT));
+		}
+	} else {
+		return Value(type); // looked up by ListScan
+	}
+	if (multi) {
+		return values.empty() ? Value(type) : Value::LIST(element, std::move(values));
+	}
+	return values.empty() ? Value(type) : values[0].DefaultCastAs(type);
+}
+
+vector<vector<Value>> RowsOf(const vector<picojson::object> &items, const vector<ListOutputColumn> &plan) {
+	vector<vector<Value>> rows;
+	rows.reserve(items.size());
+	for (auto &fields : items) {
+		vector<Value> row;
+		row.reserve(plan.size());
+		for (auto &col : plan) {
+			if (col.person != ListPersonPart::NONE) {
+				row.push_back(PersonValue(fields, col));
+				continue;
+			}
+			auto it = fields.find(col.field);
+			row.push_back(ToValue(it == fields.end() ? nullptr : &it->second, col.type));
+		}
+		rows.push_back(std::move(row));
+	}
+	return rows;
+}
+
 struct ListBindData : public TableFunctionData {
 	vector<ListColumnType> types;
+	//! Read at bind (a choice column may hold several values, which only the
+	//! data shows, and the type must be known at bind) ...
 	vector<vector<Value>> rows;
+	//! ... or, when `deferred`, at init, with the WHERE predicates on indexed
+	//! columns pushed down as `filter` (#61).
+	bool deferred = false;
+	AuthContext auth;
+	string base;
+	string select;
+	string what;
+	int64_t page_size = 0;
+	vector<ListOutputColumn> plan;
+	string filter;
 };
 
 //! The Graph site id ("host,siteGuid,webGuid") for `site`: the secret's own
@@ -328,91 +465,464 @@ unique_ptr<FunctionData> ListBind(ClientContext &context, TableFunctionBindInput
 		const auto &base = target.base;
 		const auto &what = target.what;
 
-		// Every item first: whether a choice column is multi-valued shows only
-		// in the data.
-		vector<picojson::object> items;
 		// Name every planned field: a lookup's display value is only returned
 		// when it is selected explicitly (by default Graph sends <name>LookupId
 		// alone -- found live).
 		string select;
+		std::set<string> selected;
 		for (auto &col : plan) {
-			select += (select.empty() ? "" : ",") + EncodeWorkbookName(col.field);
-		}
-		string next = base + "/items?$expand=fields($select=" + select + ")&$top=" +
-		              std::to_string(ListPageSize(context));
-		for (int pages = 0; !next.empty(); pages++) {
-			if (pages >= kMaxItemPages) {
-				throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxItemPages);
+			// Several people may come only as <internal>: [{LookupId,
+			// LookupValue, Email}], so it is asked for too.
+			const bool multi_person = col.person != ListPersonPart::NONE && col.type != ListColumnType::BIGINT &&
+			                          col.type != ListColumnType::VARCHAR;
+			for (auto &field : {col.field, multi_person ? col.person_field : string()}) {
+				if (!field.empty() && selected.insert(field).second) {
+					select += (select.empty() ? "" : ",") + EncodeWorkbookName(field);
+				}
 			}
-			picojson::value page_holder;
-			const auto &page = AsObject(client.GraphGet(next, what), what, page_holder);
-			auto page_items = page.find("value");
-			if (page_items != page.end() && page_items->second.is<picojson::array>()) {
-				for (auto &item : page_items->second.get<picojson::array>()) {
-					if (!item.is<picojson::object>()) {
-						continue;
+		}
+		const auto page_size = ListPageSize(context);
+		auto data = make_uniq<ListBindData>();
+		data->deferred = std::none_of(plan.begin(), plan.end(), [](const ListOutputColumn &c) { return c.may_be_multi; });
+		if (!data->deferred) {
+			// Every item first: whether a choice column is multi-valued shows
+			// only in the data.
+			auto items = FetchItems(client, base, select, page_size, "", what);
+			for (auto &col : plan) {
+				if (!col.may_be_multi) {
+					continue;
+				}
+				for (auto &fields : items) {
+					auto it = fields.find(col.field);
+					if (it != fields.end() && it->second.is<picojson::array>()) {
+						col.type = ListColumnType::VARCHAR_LIST;
+						break;
 					}
-					auto fields = item.get<picojson::object>().find("fields");
-					items.push_back(fields != item.get<picojson::object>().end() &&
-					                        fields->second.is<picojson::object>()
-					                    ? fields->second.get<picojson::object>()
-					                    : picojson::object());
+				}
+			}
+			data->rows = RowsOf(items, plan);
+		}
+		for (auto &col : plan) {
+			data->types.push_back(col.type);
+			return_types.push_back(ToLogicalType(col.type));
+			names.emplace_back(col.name);
+		}
+		data->auth = target.auth;
+		data->base = base;
+		data->select = select;
+		data->what = what;
+		data->page_size = page_size;
+		data->plan = plan;
+		result = std::move(data);
+	});
+	return result;
+}
+
+// --- WHERE pushdown (#61) ---------------------------------------------------
+// The filters stay where they are: DuckDB applies each one after the scan, so
+// a pushed $filter only has to let through at least the rows the SQL keeps
+// (ODataClause). Expressions are walked with ExpressionIterator and expression
+// types only: 2.0 turned comparisons into function expressions.
+
+namespace detail {
+template <class E>
+auto Binding(const E &expr, int) -> decltype(expr.Binding()) {
+	return expr.Binding();
+}
+template <class E>
+auto Binding(const E &expr, long) -> decltype((expr.binding)) {
+	return expr.binding;
+}
+} // namespace detail
+
+vector<reference<const Expression>> ChildrenOf(const Expression &expr) {
+	vector<reference<const Expression>> out;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) { out.push_back(child); });
+	return out;
+}
+
+//! The plan column `expr` reads, when it is a plain column of this scan.
+const ListOutputColumn *ColumnOf(const Expression &expr, const LogicalGet &get, const ListBindData &data) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return nullptr;
+	}
+	const auto &binding = detail::Binding(expr.Cast<BoundColumnRefExpression>(), 0);
+	if (!(binding.table_index == get.table_index)) {
+		return nullptr;
+	}
+	auto &ids = get.GetColumnIds();
+	const idx_t pos = binding.column_index;
+	if (pos >= ids.size() || ids[pos].IsRowIdColumn() || ids[pos].IsVirtualColumn()) {
+		return nullptr;
+	}
+	const auto col = ids[pos].GetPrimaryIndex();
+	return col < data.plan.size() ? &data.plan[col] : nullptr;
+}
+
+//! Add the constant to `p` as its kind's literal; false if it is not one.
+bool AddLiteral(const Expression &expr, ListPredicate &p) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	const auto &v = duckdb_compat::ConstantValue(expr.Cast<BoundConstantExpression>());
+	if (v.IsNull()) {
+		return false;
+	}
+	switch (p.kind) {
+	case ListFilterKind::TEXT:
+		if (v.type().id() != LogicalTypeId::VARCHAR) {
+			return false;
+		}
+		p.texts.push_back(StringValue::Get(v));
+		return true;
+	case ListFilterKind::NUMBER:
+		if (!v.type().IsNumeric()) {
+			return false;
+		}
+		p.numbers.push_back(v.GetValue<double>());
+		// An integer past 2^53 is not a double: its = would be stricter.
+		if (v.type().IsIntegral() && std::fabs(p.numbers.back()) > 9007199254740992.0) {
+			return false;
+		}
+		return true;
+	case ListFilterKind::TIMESTAMP:
+		if (v.type().id() != LogicalTypeId::TIMESTAMP) {
+			return false;
+		}
+		p.micros = Timestamp::GetEpochMicroSeconds(v.GetValue<timestamp_t>());
+		return true;
+	default:
+		return false;
+	}
+}
+
+bool ToPredicate(const Expression &expr, const LogicalGet &get, const ListBindData &data, ListPredicate &p) {
+	auto children = ChildrenOf(expr);
+	ListFilterOp op;
+	bool flip = false;
+	switch (expr.GetExpressionType()) {
+	case ExpressionType::COMPARE_EQUAL:
+		op = ListFilterOp::EQ;
+		break;
+	case ExpressionType::COMPARE_LESSTHAN:
+		op = ListFilterOp::LT;
+		break;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		op = ListFilterOp::LE;
+		break;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		op = ListFilterOp::GT;
+		break;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		op = ListFilterOp::GE;
+		break;
+	case ExpressionType::COMPARE_IN:
+		op = ListFilterOp::IN;
+		break;
+	case ExpressionType::BOUND_FUNCTION: {
+		// col LIKE 'abc%' is rewritten to prefix(col, 'abc').
+		const auto text = expr.ToString();
+		if (!StringUtil::StartsWith(text, "prefix(") && !StringUtil::StartsWith(text, "starts_with(")) {
+			return false;
+		}
+		op = ListFilterOp::PREFIX;
+		break;
+	}
+	default:
+		return false;
+	}
+	if (children.size() < 2) {
+		return false;
+	}
+	auto col = ColumnOf(children[0], get, data);
+	if (!col && op != ListFilterOp::IN && op != ListFilterOp::PREFIX && children.size() == 2) {
+		col = ColumnOf(children[1], get, data); // 5 < Amount
+		flip = true;
+	}
+	if (!col || col->filter == ListFilterKind::NONE) {
+		return false;
+	}
+	if (op != ListFilterOp::IN && children.size() != 2) {
+		return false;
+	}
+	p.field = col->field;
+	p.kind = col->filter;
+	p.op = op;
+	if (flip) {
+		p.op = op == ListFilterOp::LT   ? ListFilterOp::GT
+		       : op == ListFilterOp::LE ? ListFilterOp::GE
+		       : op == ListFilterOp::GT ? ListFilterOp::LT
+		       : op == ListFilterOp::GE ? ListFilterOp::LE
+		                                : op;
+		return AddLiteral(children[0], p);
+	}
+	for (idx_t i = 1; i < children.size(); i++) {
+		if (!AddLiteral(children[i], p)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void ListPushdownFilter(ClientContext &, LogicalGet &get, FunctionData *bind_data,
+                        vector<unique_ptr<Expression>> &filters) {
+	auto &data = bind_data->Cast<ListBindData>();
+	if (!data.deferred) {
+		return;
+	}
+	vector<ListPredicate> predicates;
+	for (auto &filter : filters) {
+		ListPredicate p;
+		if (ToPredicate(*filter, get, data, p)) {
+			predicates.push_back(std::move(p));
+		} else if (filter->GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+			// DuckDB folds `a > x AND a < y` into a BETWEEN (found live): two
+			// inclusive bounds (ODataClause widens either way).
+			auto children = ChildrenOf(*filter);
+			auto col = children.size() == 3 ? ColumnOf(children[0], get, data) : nullptr;
+			if (!col || col->filter == ListFilterKind::NONE) {
+				continue;
+			}
+			ListPredicate lower, upper;
+			for (auto bound : {&lower, &upper}) {
+				bound->field = col->field;
+				bound->kind = col->filter;
+			}
+			lower.op = ListFilterOp::GE;
+			upper.op = ListFilterOp::LE;
+			if (AddLiteral(children[1], lower) && AddLiteral(children[2], upper)) {
+				predicates.push_back(std::move(lower));
+				predicates.push_back(std::move(upper));
+			}
+		}
+	}
+	data.filter = BuildListFilter(predicates);
+}
+
+//! EXPLAIN shows the list and the $filter sent to Graph.
+InsertionOrderPreservingMap<string> ListToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	auto &data = input.bind_data->Cast<ListBindData>();
+	result["List"] = data.what;
+	if (!data.filter.empty()) {
+		result["Graph $filter"] = data.filter;
+	}
+	return result;
+}
+
+//! The id of the site's User Information List, or "" if it cannot be read.
+//! Not by its title: it is hidden, Graph answers lists/User Information List
+//! with 404 (live CI, 2026-11-03), and the title is in the site's language.
+//! It is the system list at _catalogs/users; system lists are listed only
+//! when `system` is selected.
+string UserListId(GraphClient &client, const string &site, const string &what) {
+	try {
+		string next = "/v1.0" + site + "/lists?$select=id,webUrl,system&$top=999";
+		for (int pages = 0; !next.empty() && pages < 50; pages++) {
+			picojson::value holder;
+			const auto &page = AsObject(client.GraphGet(next, what), what, holder);
+			auto values = page.find("value");
+			if (values != page.end() && values->second.is<picojson::array>()) {
+				for (auto &v : values->second.get<picojson::array>()) {
+					if (v.is<picojson::object>() &&
+					    StringUtil::EndsWith(StringUtil::Lower(StringField(v.get<picojson::object>(), "webUrl")),
+					                         "/_catalogs/users")) {
+						return StringField(v.get<picojson::object>(), "id");
+					}
 				}
 			}
 			auto link = page.find("@odata.nextLink");
 			next = (link != page.end() && link->second.is<string>()) ? GraphPathOfLink(link->second.get<string>())
 			                                                         : string();
 		}
-		for (auto &col : plan) {
-			if (!col.may_be_multi) {
+	} catch (std::exception &) {
+	}
+	return string();
+}
+
+//! A person's name and email in the site's User Information List.
+struct PersonInfo {
+	Value name;
+	Value email;
+};
+
+//! Look the people up in the User Information List of `site` ("/sites/{id}",
+//! as $batch urls are relative to /v1.0), in $batch calls of 20. Best effort:
+//! a person not found (removed from the site's list) or a refused call leaves
+//! their name and email NULL.
+unordered_map<int64_t, PersonInfo> ResolvePeople(GraphClient &client, const string &site, const string &what,
+                                                 const vector<int64_t> &ids) {
+	unordered_map<int64_t, PersonInfo> people;
+	const auto users = UserListId(client, site, what);
+	if (users.empty()) {
+		return people;
+	}
+	for (idx_t start = 0; start < ids.size(); start += kPeoplePerBatch) {
+		picojson::array requests;
+		for (idx_t i = start; i < ids.size() && i < start + kPeoplePerBatch; i++) {
+			picojson::object r;
+			r["id"] = picojson::value(std::to_string(ids[i]));
+			r["method"] = picojson::value("GET");
+			r["url"] = picojson::value(site + "/lists/" + users + "/items/" + std::to_string(ids[i]) +
+			                           "?$select=id&$expand=fields($select=Title,EMail)");
+			requests.emplace_back(r);
+		}
+		picojson::object batch;
+		batch["requests"] = picojson::value(requests);
+		picojson::value holder;
+		try {
+			const auto &reply = AsObject(
+			    client.GraphSend("POST", "/v1.0/$batch", picojson::value(batch).serialize(), what, true), what,
+			    holder);
+			auto responses = reply.find("responses");
+			if (responses == reply.end() || !responses->second.is<picojson::array>()) {
 				continue;
 			}
-			for (auto &fields : items) {
-				auto it = fields.find(col.field);
-				if (it != fields.end() && it->second.is<picojson::array>()) {
-					col.type = ListColumnType::VARCHAR_LIST;
-					break;
+			for (auto &resp : responses->second.get<picojson::array>()) {
+				if (!resp.is<picojson::object>()) {
+					continue;
 				}
+				auto &o = resp.get<picojson::object>();
+				auto body = o.find("body");
+				if (body == o.end() || !body->second.is<picojson::object>()) {
+					continue;
+				}
+				auto fields = body->second.get<picojson::object>().find("fields");
+				if (fields == body->second.get<picojson::object>().end() || !fields->second.is<picojson::object>()) {
+					continue;
+				}
+				auto &f = fields->second.get<picojson::object>();
+				auto title = StringField(f, "Title");
+				auto email = StringField(f, "EMail");
+				people[std::stoll(StringField(o, "id"))] = {title.empty() ? Value() : Value(title),
+				                                             email.empty() ? Value() : Value(email)};
 			}
+		} catch (std::exception &) {
+			// Names are a convenience; the ids are in the result either way.
 		}
-
-		auto data = make_uniq<ListBindData>();
-		for (auto &col : plan) {
-			data->types.push_back(col.type);
-			return_types.push_back(ToLogicalType(col.type));
-			names.emplace_back(col.name);
-		}
-		data->rows.reserve(items.size());
-		for (auto &fields : items) {
-			vector<Value> row;
-			row.reserve(plan.size());
-			for (auto &col : plan) {
-				auto it = fields.find(col.field);
-				row.push_back(ToValue(it == fields.end() ? nullptr : &it->second, col.type));
-			}
-			data->rows.push_back(std::move(row));
-		}
-		result = std::move(data);
-	});
-	return result;
+	}
+	return people;
 }
 
 struct CursorState : public GlobalTableFunctionState {
 	idx_t cursor = 0;
+	//! The rows of a deferred read (ListBindData::deferred).
+	vector<vector<Value>> rows;
+	//! Projection pushdown: the plan column of each output column.
+	vector<column_t> column_ids;
+	//! For a person's name or email column: the plan index of its id column.
+	unordered_map<idx_t, idx_t> id_column;
+	unordered_map<int64_t, PersonInfo> people;
 };
 
-unique_ptr<GlobalTableFunctionState> CursorInit(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<CursorState>();
+unique_ptr<GlobalTableFunctionState> CursorInit(ClientContext &, TableFunctionInitInput &input) {
+	auto state = make_uniq<CursorState>();
+	auto &data = input.bind_data->Cast<ListBindData>();
+	state->column_ids = input.column_ids;
+	GraphClient client(data.auth);
+	if (data.deferred) {
+		vector<picojson::object> items;
+		if (data.filter.empty()) {
+			items = FetchItems(client, data.base, data.select, data.page_size, "", data.what);
+		} else {
+			try {
+				items = FetchItems(client, data.base, data.select, data.page_size, data.filter, data.what);
+			} catch (std::exception &) {
+				// A filter Graph refuses costs speed, never the result: read
+				// everything and let DuckDB filter.
+				items = FetchItems(client, data.base, data.select, data.page_size, "", data.what);
+			}
+		}
+		state->rows = RowsOf(items, data.plan);
+	}
+	// People are looked up only when a name or email column is read.
+	for (auto c : state->column_ids) {
+		if (c >= data.plan.size() || (data.plan[c].person != ListPersonPart::NAME &&
+		                              data.plan[c].person != ListPersonPart::EMAIL)) {
+			continue;
+		}
+		for (idx_t i = 0; i < data.plan.size(); i++) {
+			if (data.plan[i].person == ListPersonPart::ID && data.plan[i].field == data.plan[c].field) {
+				state->id_column[c] = i;
+			}
+		}
+	}
+	if (!state->id_column.empty()) {
+		std::set<int64_t> ids;
+		auto &rows = data.deferred ? state->rows : data.rows;
+		for (auto &row : rows) {
+			for (auto &named : state->id_column) {
+				if (!row[named.first].IsNull()) {
+					continue; // Graph sent the name with the item
+				}
+				auto &id = row[named.second];
+				if (id.IsNull()) {
+					continue;
+				}
+				if (id.type().id() == LogicalTypeId::LIST) {
+					for (auto &e : ListValue::GetChildren(id)) {
+						if (!e.IsNull()) {
+							ids.insert(e.GetValue<int64_t>());
+						}
+					}
+				} else {
+					ids.insert(id.GetValue<int64_t>());
+				}
+			}
+		}
+		// "/v1.0/sites/{site}/lists/{id}" -> "/sites/{site}".
+		const auto site = data.base.substr(5, data.base.find("/lists/") - 5);
+		state->people = ResolvePeople(client, site, data.what, vector<int64_t>(ids.begin(), ids.end()));
+	}
+	return std::move(state);
+}
+
+//! A person's name or email, looked up by the id(s) in the row.
+Value LookedUp(const CursorState &state, const ListOutputColumn &col, const Value &id) {
+	const auto type = ToLogicalType(col.type);
+	auto one = [&](const Value &v) {
+		if (v.IsNull()) {
+			return Value(LogicalType::VARCHAR);
+		}
+		auto it = state.people.find(v.GetValue<int64_t>());
+		if (it == state.people.end()) {
+			return Value(LogicalType::VARCHAR);
+		}
+		const auto &found = col.person == ListPersonPart::NAME ? it->second.name : it->second.email;
+		return found.IsNull() ? Value(LogicalType::VARCHAR) : found;
+	};
+	if (id.IsNull()) {
+		return Value(type);
+	}
+	if (id.type().id() != LogicalTypeId::LIST) {
+		return one(id);
+	}
+	vector<Value> out;
+	for (auto &e : ListValue::GetChildren(id)) {
+		out.push_back(one(e));
+	}
+	return Value::LIST(LogicalType::VARCHAR, std::move(out));
 }
 
 void ListScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	auto &data = input.bind_data->Cast<ListBindData>();
 	auto &state = input.global_state->Cast<CursorState>();
+	auto &rows = data.deferred ? state.rows : data.rows;
 	idx_t out = 0;
-	while (state.cursor < data.rows.size() && out < STANDARD_VECTOR_SIZE) {
-		auto &row = data.rows[state.cursor];
-		for (idx_t c = 0; c < row.size(); c++) {
-			output.SetValue(c, out, row[c]);
+	while (state.cursor < rows.size() && out < STANDARD_VECTOR_SIZE) {
+		auto &row = rows[state.cursor];
+		for (idx_t c = 0; c < state.column_ids.size(); c++) {
+			const auto col = state.column_ids[c];
+			if (col >= row.size()) {
+				output.SetValue(c, out, Value(output.data[c].GetType())); // the row id: none
+				continue;
+			}
+			auto named = state.id_column.find(col);
+			if (named != state.id_column.end() && row[col].IsNull()) {
+				output.SetValue(c, out, LookedUp(state, data.plan[col], row[named->second]));
+			} else {
+				output.SetValue(c, out, row[col]);
+			}
 		}
 		state.cursor++;
 		out++;
@@ -661,7 +1171,9 @@ void ListWriteSink(ExecutionContext &, FunctionData &, GlobalFunctionData &gstat
 					}
 					continue;
 				}
-				auto json = ToJsonField(v, col.field);
+				auto json = col.date_only && !v.IsNull()
+				                ? picojson::value(FormatDateOnly(v.DefaultCastAs(LogicalType::DATE).GetValue<date_t>().days))
+				                : ToJsonField(v, col.field);
 				if (json.is<picojson::array>()) {
 					// A multi-choice value: Graph needs the collection's type.
 					p.fields[col.field + "@odata.type"] = picojson::value("Collection(Edm.String)");
@@ -697,10 +1209,362 @@ BoundStatement ListCopyPlan(Binder &binder, CopyStatement &stmt) {
 	return RewriteCopyInPlace(binder, stmt, kListFormatInternal, "list");
 }
 
+
+// ===========================================================================
+// read_sharepoint_files('sharepoint://Finance/**/*.xlsx') (#65): a document
+// library's files and their metadata, one row per file. A library is a list,
+// so its own columns are planned as read_sharepoint_list plans a list's.
+// ===========================================================================
+
+//! Files whose metadata is fetched per $batch call (Graph's limit).
+constexpr idx_t kFilesPerBatch = 20;
+
+//! The fixed columns, before the library's own.
+const vector<std::pair<string, LogicalType>> &FileColumns() {
+	static const vector<std::pair<string, LogicalType>> columns = {
+	    {"path", LogicalType::VARCHAR},          {"name", LogicalType::VARCHAR},
+	    {"size", LogicalType::BIGINT},           {"created", LogicalType::TIMESTAMP},
+	    {"modified", LogicalType::TIMESTAMP},    {"created_by", LogicalType::VARCHAR},
+	    {"created_by_email", LogicalType::VARCHAR}, {"modified_by", LogicalType::VARCHAR},
+	    {"modified_by_email", LogicalType::VARCHAR}, {"content_type", LogicalType::VARCHAR},
+	    {"id", LogicalType::VARCHAR},            {"web_url", LogicalType::VARCHAR}};
+	return columns;
+}
+
+//! A root-relative path for /root:/<here>, each segment percent-encoded.
+string EncodeItemPath(const string &path) {
+	string out;
+	for (auto &segment : StringUtil::Split(path, '/')) {
+		out += (out.empty() ? "" : "/") + EncodeWorkbookName(segment);
+	}
+	return out;
+}
+
+Value TimestampField(const picojson::object &o, const char *key) {
+	int64_t us;
+	const auto text = StringField(o, key);
+	return !text.empty() && ParseIsoTimestamp(text, us) ? Value::TIMESTAMP(timestamp_t(us))
+	                                                      : Value(LogicalType::TIMESTAMP);
+}
+
+//! displayName / email of a driveItem's createdBy / lastModifiedBy.
+std::pair<Value, Value> Who(const picojson::object &item, const char *key) {
+	auto by = item.find(key);
+	if (by == item.end() || !by->second.is<picojson::object>()) {
+		return {Value(LogicalType::VARCHAR), Value(LogicalType::VARCHAR)};
+	}
+	const auto &o = by->second.get<picojson::object>();
+	for (const char *kind : {"user", "application"}) {
+		auto who = o.find(kind);
+		if (who != o.end() && who->second.is<picojson::object>()) {
+			const auto name = StringField(who->second.get<picojson::object>(), "displayName");
+			const auto email = StringField(who->second.get<picojson::object>(), "email");
+			return {name.empty() ? Value(LogicalType::VARCHAR) : Value(name),
+			        email.empty() ? Value(LogicalType::VARCHAR) : Value(email)};
+		}
+	}
+	return {Value(LogicalType::VARCHAR), Value(LogicalType::VARCHAR)};
+}
+
+//! A failed part of a $batch, as the exception its kind maps to (403 ->
+//! PermissionException, with the Sites.Selected hint).
+[[noreturn]] void ThrowBatchPart(const string &what, int status, const string &body) {
+	string code, message;
+	picojson::value err;
+	if (picojson::parse(err, body).empty() && err.is<picojson::object>()) {
+		auto e = err.get<picojson::object>().find("error");
+		if (e != err.get<picojson::object>().end() && e->second.is<picojson::object>()) {
+			code = StringField(e->second.get<picojson::object>(), "code");
+			message = StringField(e->second.get<picojson::object>(), "message");
+		}
+	}
+	const auto text = FormatGraphError("reading " + what, status, code, message);
+	switch (ExceptionTypeFor(ClassifyGraphError(status, code))) {
+	case GraphExceptionType::PERMISSION:
+		throw PermissionException(text);
+	case GraphExceptionType::INVALID_INPUT:
+		throw InvalidInputException(text);
+	default:
+		throw IOException(text);
+	}
+}
+
+struct FilesBindData : public TableFunctionData {
+	vector<vector<Value>> rows;
+};
+
+unique_ptr<FunctionData> FilesBind(ClientContext &context, TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types, duckdb_compat::BindNames &names) {
+	unique_ptr<FunctionData> result;
+	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
+		if (input.inputs[0].IsNull()) {
+			throw InvalidInputException("sharepoint: the path must not be NULL");
+		}
+		const auto arg = StringValue::Get(input.inputs[0]);
+		const string pattern = IsSharepointUri(arg) ? arg : string(SHAREPOINT_SCHEME) + arg;
+		auto opener = ClientData::Get(context).file_opener.get();
+		const auto auth = GetAuthContext(opener, pattern);
+		GraphClient client(auth);
+		const string what = "the files of '" + pattern + "'";
+
+		// The library's own columns, planned as a list's; the system ones
+		// (id, created/modified and their people) are the fixed columns here.
+		vector<ListColumnDef> defs;
+		{
+			picojson::value holder;
+			const auto &cols = AsObject(client.GraphGet("/v1.0/drives/" + auth.drive_id + "/list/columns", what),
+			                            what, holder);
+			auto values = cols.find("value");
+			if (values != cols.end() && values->second.is<picojson::array>()) {
+				for (auto &c : values->second.get<picojson::array>()) {
+					if (c.is<picojson::object>()) {
+						auto def = ParseColumnDef(c.get<picojson::object>());
+						// The file name is `name`; Title stays (a document's title).
+						if (def.name != "FileLeafRef") {
+							defs.push_back(def);
+						}
+					}
+				}
+			}
+		}
+		vector<ListOutputColumn> plan;
+		for (auto &col : PlanListColumns(defs)) {
+			const bool system = col.field == "id" || col.field == "Created" || col.field == "Modified" ||
+			                    col.person_field == "Author" || col.person_field == "Editor";
+			if (!system) {
+				// A multi-valued choice reads as a list; its type cannot wait for
+				// the data here (one row per file), so a choice is VARCHAR[] only
+				// when its definition says several values.
+				col.may_be_multi = false;
+				plan.push_back(col);
+			}
+		}
+
+		// The files: the filesystem's glob (its syntax, its immutable-prefix
+		// cache), then each file's driveItem with its listItem fields.
+		auto &fs = FileSystem::GetFileSystem(context);
+		const auto matches = fs.Glob(pattern); // the opener is pushed by DuckDB (passing one throws)
+		string select;
+		std::set<string> selected;
+		for (auto &col : plan) {
+			for (auto &field : {col.field, col.person != ListPersonPart::NONE && col.type != ListColumnType::BIGINT &&
+			                                        col.type != ListColumnType::VARCHAR
+			                                    ? col.person_field
+			                                    : string()}) {
+				if (!field.empty() && selected.insert(field).second) {
+					select += (select.empty() ? "" : ",") + EncodeWorkbookName(field);
+				}
+			}
+		}
+		const string query = "?$select=id,name,size,createdDateTime,lastModifiedDateTime,createdBy,lastModifiedBy,"
+		                     "file,folder,webUrl&$expand=listItem($select=id;$expand=fields" +
+		                     (select.empty() ? string() : "($select=" + select + ")") + ")";
+		vector<std::pair<string, picojson::object>> items; // path, driveItem
+		for (idx_t start = 0; start < matches.size(); start += kFilesPerBatch) {
+			std::map<string, string> pending; // request id -> path
+			for (idx_t i = start; i < matches.size() && i < start + kFilesPerBatch; i++) {
+				pending[std::to_string(i)] = matches[i].path;
+			}
+			std::map<string, picojson::object> found;
+			for (int attempt = 1; !pending.empty(); attempt++) {
+				picojson::array requests;
+				for (auto &p : pending) {
+					auto parsed = ParseSharepointUri(p.second);
+					if (!parsed.ok || parsed.uri.kind != SharepointUriKind::PATH) {
+						continue;
+					}
+					picojson::object r;
+					r["id"] = picojson::value(p.first);
+					r["method"] = picojson::value("GET");
+					r["url"] = picojson::value("/drives/" + auth.drive_id + "/root:/" +
+					                           EncodeItemPath(parsed.uri.RootRelativePath()) + query);
+					requests.emplace_back(r);
+				}
+				picojson::object batch;
+				batch["requests"] = picojson::value(requests);
+				picojson::value holder;
+				const auto &reply = AsObject(
+				    client.GraphSend("POST", "/v1.0/$batch", picojson::value(batch).serialize(), what, true), what,
+				    holder);
+				auto responses = reply.find("responses");
+				if (responses == reply.end() || !responses->second.is<picojson::array>()) {
+					throw IOException("sharepoint: unexpected $batch reply reading %s", what);
+				}
+				int retry_after = 0;
+				for (auto &resp : responses->second.get<picojson::array>()) {
+					if (!resp.is<picojson::object>()) {
+						continue;
+					}
+					auto &o = resp.get<picojson::object>();
+					const auto id = StringField(o, "id");
+					auto status = o.find("status");
+					const int code = status != o.end() && status->second.is<int64_t>()
+					                     ? static_cast<int>(status->second.get<int64_t>())
+					                     : 0;
+					auto body = o.find("body");
+					if (code >= 200 && code < 300 && body != o.end() && body->second.is<picojson::object>()) {
+						found[id] = body->second.get<picojson::object>();
+						pending.erase(id);
+					} else if (code == 404) {
+						pending.erase(id); // gone since the glob listed it
+					} else if (code == 429 || code == 503 || code >= 500) {
+						retry_after = std::max(retry_after, 1);
+					} else {
+						const auto text = body != o.end() ? body->second.serialize() : string();
+						ThrowBatchPart(what, code, text);
+					}
+				}
+				if (!pending.empty()) {
+					if (attempt >= kMaxBatchAttempts) {
+						throw IOException("sharepoint: reading %s: Graph kept throttling the metadata requests", what);
+					}
+					SleepBeforeRetry(attempt, retry_after);
+				}
+			}
+			for (auto &f : found) {
+				items.emplace_back(matches[std::stoull(f.first)].path, std::move(f.second));
+			}
+		}
+
+		// People in the library's own person columns: names and emails from
+		// the site's User Information List.
+		auto data = make_uniq<FilesBindData>();
+		vector<vector<Value>> custom;
+		std::set<int64_t> person_ids;
+		for (auto &item : items) {
+			picojson::object fields;
+			auto list_item = item.second.find("listItem");
+			if (list_item != item.second.end() && list_item->second.is<picojson::object>()) {
+				auto f = list_item->second.get<picojson::object>().find("fields");
+				if (f != list_item->second.get<picojson::object>().end() && f->second.is<picojson::object>()) {
+					fields = f->second.get<picojson::object>();
+				}
+			}
+			custom.push_back(RowsOf({fields}, plan)[0]);
+			for (idx_t c = 0; c < plan.size(); c++) {
+				if (plan[c].person != ListPersonPart::ID) {
+					continue;
+				}
+				auto &id = custom.back()[c];
+				if (id.IsNull()) {
+					continue;
+				}
+				if (id.type().id() == LogicalTypeId::LIST) {
+					for (auto &e : ListValue::GetChildren(id)) {
+						if (!e.IsNull()) {
+							person_ids.insert(e.GetValue<int64_t>());
+						}
+					}
+				} else {
+					person_ids.insert(id.GetValue<int64_t>());
+				}
+			}
+		}
+		CursorState lookup; // LookedUp reads the people from it
+		auto &people = lookup.people;
+		if (!person_ids.empty()) {
+			picojson::value holder;
+			const auto &library = AsObject(
+			    client.GraphGet("/v1.0/drives/" + auth.drive_id + "/list?$select=parentReference", what), what, holder);
+			auto parent = library.find("parentReference");
+			if (parent != library.end() && parent->second.is<picojson::object>()) {
+				const auto site = StringField(parent->second.get<picojson::object>(), "siteId");
+				people = ResolvePeople(client, "/sites/" + site, what,
+				                       vector<int64_t>(person_ids.begin(), person_ids.end()));
+			}
+		}
+		for (idx_t r = 0; r < items.size(); r++) {
+			auto &item = items[r].second;
+			if (item.find("folder") != item.end()) {
+				continue; // a literal folder path globs to itself
+			}
+			string mime;
+			auto file = item.find("file");
+			if (file != item.end() && file->second.is<picojson::object>()) {
+				mime = StringField(file->second.get<picojson::object>(), "mimeType");
+			}
+			auto size = item.find("size");
+			const auto created_by = Who(item, "createdBy");
+			const auto modified_by = Who(item, "lastModifiedBy");
+			vector<Value> row = {Value(items[r].first),
+			                     Value(StringField(item, "name")),
+			                     size != item.end() && size->second.is<int64_t>()
+			                         ? Value::BIGINT(size->second.get<int64_t>())
+			                         : Value(LogicalType::BIGINT),
+			                     TimestampField(item, "createdDateTime"),
+			                     TimestampField(item, "lastModifiedDateTime"),
+			                     created_by.first,
+			                     created_by.second,
+			                     modified_by.first,
+			                     modified_by.second,
+			                     mime.empty() ? Value(LogicalType::VARCHAR) : Value(mime),
+			                     Value(StringField(item, "id")),
+			                     Value(StringField(item, "webUrl"))};
+			for (idx_t c = 0; c < plan.size(); c++) {
+				auto value = custom[r][c];
+				if (value.IsNull() && (plan[c].person == ListPersonPart::NAME || plan[c].person == ListPersonPart::EMAIL)) {
+					for (idx_t i = 0; i < plan.size(); i++) {
+						if (plan[i].person == ListPersonPart::ID && plan[i].field == plan[c].field) {
+							value = LookedUp(lookup, plan[c], custom[r][i]);
+						}
+					}
+				}
+				row.push_back(std::move(value));
+			}
+			data->rows.push_back(std::move(row));
+		}
+
+		std::set<string> used;
+		for (auto &col : FileColumns()) {
+			names.emplace_back(col.first);
+			return_types.push_back(col.second);
+			used.insert(StringUtil::Lower(col.first));
+		}
+		for (auto &col : plan) {
+			// A library column named like a fixed one ("Name", "Size") gets "_2".
+			string name = col.name;
+			for (int n = 2; used.count(StringUtil::Lower(name)); n++) {
+				name = col.name + "_" + std::to_string(n);
+			}
+			used.insert(StringUtil::Lower(name));
+			names.emplace_back(name);
+			return_types.push_back(ToLogicalType(col.type));
+		}
+		result = std::move(data);
+	});
+	return result;
+}
+
+struct FilesCursor : public GlobalTableFunctionState {
+	idx_t cursor = 0;
+};
+
+unique_ptr<GlobalTableFunctionState> FilesInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<FilesCursor>();
+}
+
+void FilesScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &data = input.bind_data->Cast<FilesBindData>();
+	auto &state = input.global_state->Cast<FilesCursor>();
+	idx_t out = 0;
+	while (state.cursor < data.rows.size() && out < STANDARD_VECTOR_SIZE) {
+		auto &row = data.rows[state.cursor];
+		for (idx_t c = 0; c < row.size(); c++) {
+			output.SetValue(c, out, row[c]);
+		}
+		state.cursor++;
+		out++;
+	}
+	duckdb_compat::SetChildCardinality(output, out);
+}
+
 } // namespace
 
 void RegisterListFunctions(ExtensionLoader &loader) {
 	TableFunction fn("read_sharepoint_list", {LogicalType::VARCHAR}, ListScan, ListBind, CursorInit);
+	fn.pushdown_complex_filter = ListPushdownFilter;
+	fn.projection_pushdown = true;
+	fn.to_string = ListToString;
 	duckdb_compat::NameParameters(fn, {"list"});
 	duckdb_compat::AddNamedParameter(fn, "site", LogicalType::VARCHAR);
 	CreateTableFunctionInfo info(fn);
@@ -715,6 +1579,21 @@ void RegisterListFunctions(ExtensionLoader &loader) {
 	desc.categories = {"sharepoint", "list"};
 	info.descriptions.push_back(std::move(desc));
 	loader.RegisterFunction(std::move(info));
+
+	{
+		TableFunction files("read_sharepoint_files", {LogicalType::VARCHAR}, FilesScan, FilesBind, FilesInit);
+		duckdb_compat::NameParameters(files, {"path"});
+		CreateTableFunctionInfo files_info(files);
+		FunctionDescription files_desc;
+		files_desc.description =
+		    "A document library's files and their metadata, one row per file matching a sharepoint:// path or "
+		    "glob: path, name, size, created/modified and by whom, content type, id, web URL, then the library's "
+		    "own columns, typed as read_sharepoint_list types a list's.";
+		files_desc.examples = {"SELECT name, size, modified_by FROM read_sharepoint_files('sharepoint://Finance/**/*.xlsx')"};
+		files_desc.categories = {"sharepoint", "list"};
+		files_info.descriptions.push_back(std::move(files_desc));
+		loader.RegisterFunction(std::move(files_info));
+	}
 
 	CopyFunction front(duckdb_compat::FunctionName(kListFormat));
 	front.plan = ListCopyPlan;

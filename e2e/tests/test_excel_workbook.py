@@ -11,6 +11,8 @@ import math
 
 import pytest
 
+from helpers.graph import GRAPH
+
 pytestmark = pytest.mark.live
 
 openpyxl = pytest.importorskip("openpyxl")
@@ -97,3 +99,36 @@ def test_copy_changes_the_workbook_in_place(graph, scratch, sql, secret_sql, tmp
     assert out[-1] == "3"
     assert graph.stat(path)["id"] == before
     assert graph.stat(f"{scratch}/tmp_w.xlsx") is None
+
+
+def test_1904_date_system(graph, scratch, sql, secret_sql, tmp_path):
+    """A workbook in the 1904 date system (old Mac Excel, #64) reads its dates
+    right, not four years early, and a date written into it is stored as a
+    1904 serial. Workbooks in the 1900 system are unchanged (the tests above)."""
+    from openpyxl.utils.datetime import CALENDAR_MAC_1904
+
+    local = tmp_path / "mac.xlsx"
+    wb = openpyxl.Workbook()
+    wb.epoch = CALENDAR_MAC_1904
+    ws = wb.active
+    ws.title = "Data"
+    ws.append(["day", "stamp"])
+    ws.append([dt.date(2026, 3, 15), dt.datetime(2026, 3, 15, 8, 30)])
+    ws.append([dt.date(1904, 1, 2), dt.datetime(1999, 12, 31, 23, 59)])
+    ws["A2"].number_format = ws["A3"].number_format = "yyyy-mm-dd"
+    ws["B2"].number_format = ws["B3"].number_format = "yyyy-mm-dd hh:mm"
+    ws.add_table(Table(displayName="Mac", ref="A1:B3"))
+    wb.save(local)
+    path = f"{scratch}/mac.xlsx"
+    sql(f"{secret_sql} SELECT write_blob('sharepoint://{path}', content) FROM read_blob('{local}');")
+
+    out = sql(f"""{secret_sql}
+        SELECT string_agg(day || ' ' || stamp, ',' ORDER BY day) FROM read_excel_table('{path}', 'Mac');
+        COPY (SELECT DATE '2026-11-03' AS d) TO 'sharepoint://{path}' (FORMAT excel_range, RANGE 'Data!D1', HEADER false);
+    """).splitlines()
+    assert out[-1] == "1904-01-02 1999-12-31 23:59:00,2026-03-15 2026-03-15 08:30:00"
+    # The serial Excel itself shows: days since 1904-01-01.
+    item = graph.stat(path)["id"]
+    r = graph._req("GET", f"{GRAPH}/drives/{graph.drive_id}/items/{item}/workbook/worksheets('Data')/range(address='D1')?$select=values")
+    assert r.ok, r.text[:300]
+    assert r.json()["values"][0][0] == (dt.date(2026, 11, 3) - dt.date(1904, 1, 1)).days
