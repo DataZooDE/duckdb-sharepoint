@@ -58,8 +58,8 @@ Rules that bite:
 - Lists: `Sites.ReadWrite.All`; creating lists (only fixtures do): `Sites.Manage.All`.
 - Least privilege: `Sites.Selected` + a per-site grant
   (`POST /sites/{site-id}/permissions` with `{"roles":["write"],"grantedToIdentities":[{"application":{"id":"<app id>"}}]}`).
-  Graph hides a site the app was not granted: `site '…' not found` (404 `itemNotFound`,
-  not 403); the error names Sites.Selected.
+  A site not granted is refused (HTTP 403, or `site '…' not found`) with a hint naming
+  Sites.Selected.
 - Delegated: `Files.ReadWrite.All Sites.ReadWrite.All offline_access`.
 
 ## Errors
