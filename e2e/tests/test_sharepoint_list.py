@@ -122,9 +122,10 @@ def test_list_types_paging_and_lookup(fixture_lists, sql, secret_sql):
     out = out[-7:]
     pages = int(out[0])
     # drive -> site, list, columns, then one call per page (plus possibly one
-    # empty last page when ITEMS is a multiple of PAGE), then one $batch for
-    # the names of Created By / Modified By (#63: the app, at most a few).
-    assert 4 + math.ceil(ITEMS / PAGE) <= pages <= 5 + math.ceil(ITEMS / PAGE), f"{pages} Graph calls"
+    # empty last page when ITEMS is a multiple of PAGE), then for the names of
+    # Created By / Modified By (#63) the site's lists (to find its User
+    # Information List) and one $batch (the app, at most a few people).
+    assert 5 + math.ceil(ITEMS / PAGE) <= pages <= 6 + math.ceil(ITEMS / PAGE), f"{pages} Graph calls"
     assert out[1] == ("id BIGINT, Title VARCHAR, Amount DOUBLE, Price DECIMAL(18,4), Done BOOLEAN, "
                       "Due TIMESTAMP, Status VARCHAR, Customer VARCHAR, Customer_id BIGINT, "
                       "created TIMESTAMP, modified TIMESTAMP, created_by VARCHAR, created_by_email VARCHAR, "
