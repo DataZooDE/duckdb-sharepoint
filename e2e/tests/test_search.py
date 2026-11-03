@@ -48,7 +48,8 @@ def test_app_only_search_finds_the_file_and_reads_it_back(probe, sql, secret_sql
     assert rows == [f"driveItem|{TOKEN}.csv|true|true|true"], rows
     # The path (by path, or id: when Graph leaves the folder out) reads straight back.
     out = sql(f"""{secret_sql}
-        SELECT sum(n) FROM read_csv((SELECT path FROM search_sharepoint('{TOKEN}') WHERE name = '{TOKEN}.csv'));
+        SET VARIABLE hit = (SELECT path FROM search_sharepoint('{TOKEN}') WHERE name = '{TOKEN}.csv');
+        SELECT sum(n) FROM read_csv(getvariable('hit'));
     """).splitlines()
     assert out[-1] == "6"
 

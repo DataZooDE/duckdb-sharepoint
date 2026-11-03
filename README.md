@@ -216,7 +216,8 @@ items and sites, with what the signed-in user (or the app) may see:
 SELECT name, path, modified, modified_by, summary
 FROM search_sharepoint('quarterly forecast');                       -- files and list items
 SELECT name, web_url FROM search_sharepoint('Sales', types := ['site']);
-SELECT * FROM read_excel_table((SELECT path FROM search_sharepoint('plan 2026') LIMIT 1), 'Sales');
+SET VARIABLE plan = (SELECT path FROM search_sharepoint('plan 2026') LIMIT 1);
+SELECT * FROM read_excel_table(getvariable('plan'), 'Sales');   -- a table function takes no subquery
 ```
 
 A file in the secret's drive comes with a `sharepoint://` path, so a result
