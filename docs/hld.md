@@ -552,6 +552,11 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
 - **`createSession` answers a transient HTTP 504 (`UnknownError`).** It is
   retried like a read; a duplicate session after a lost reply is harmless
   (it expires unused).
+- **A table or worksheet created in a workbook session is not at once
+  visible outside it** (2026-11-03, both seen in live CI): after
+  `tables/add` (or `worksheets/add`) and `closeSession`, a sessionless read
+  got 404 `ItemNotFound`. A COPY that creates either now polls it until it is
+  visible (bounded; the rows are written either way).
 - **A missing workbook table is a 404 `ItemNotFound`**, with the message in
   the tenant's language ("Die angeforderte Ressource ist nicht vorhanden."),
   so tests match the name we put in the message, never Graph's text.
@@ -783,4 +788,19 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - **In place.** The target is a list, not a file, but COPY's temp-file rename
   would still be attempted for a name that exists as a local file; the same
   rewrite as the Excel writers (`sharepoint_copy_rewrite.hpp`) rules it out.
+
+## 14. `search_sharepoint` (#67)
+
+- `POST /search/query`, `entityTypes` driveItem + listItem by default
+  (`types :=`), paged with `from`/`size` (200) while
+  `moreResultsAvailable`, up to `max_results`.
+- **Region.** App-only search must name the tenant's data location; delegated
+  search must not. The first search goes without one; on Graph's 400
+  "Region is required" the known codes are tried (NAM, EUR, APC, ...) and the
+  one that works is kept per identity for the process. `region :=` skips that.
+- A driveItem in the secret's drive gets a `sharepoint://` path from
+  `parentReference.path`, or `id:` when the hit has none; list items carry
+  `site_id`/`list_id`, for `read_sharepoint_list('id:<list_id>', site := ...)`.
+- The live test searches for a probe file kept between runs: the index lags
+  by minutes, so the run that creates the probe skips.
 

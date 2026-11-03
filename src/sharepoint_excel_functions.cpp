@@ -606,6 +606,8 @@ struct ExcelWriteGlobalState : public GlobalFunctionData {
 	picojson::array pending_formats;
 	idx_t pending_cells = 0;
 	idx_t first_data_row = 0; // created table: the header row
+	//! A worksheet this COPY added (EnsureWorksheet), waited for at the end.
+	string created_sheet;
 };
 
 string WorksheetResource(const string &sheet) {
@@ -631,6 +633,7 @@ bool EnsureWorksheet(GraphClient &client, ExcelWriteGlobalState &g, const string
 	body["name"] = picojson::value(sheet);
 	client.WorkbookCall("POST", g.wb.item_id, "worksheets/add", picojson::value(body).serialize(), g.session_id, what,
 	                    false);
+	g.created_sheet = sheet;
 	return true;
 }
 
@@ -876,6 +879,10 @@ void ExcelWriteSink(ExecutionContext &context, FunctionData &bind_p, GlobalFunct
 void ExcelWriteCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
 }
 
+//! Polls for a new table or worksheet to become visible outside its session
+//! (~30 s of backoff in all).
+constexpr int kMaxCreatedVisibleAttempts = 6;
+
 void ExcelWriteFinalize(ClientContext &context, FunctionData &bind_p, GlobalFunctionData &gstate_p) {
 	auto &bind = bind_p.Cast<ExcelWriteBindData>();
 	auto &g = gstate_p.Cast<ExcelWriteGlobalState>();
@@ -908,6 +915,28 @@ void ExcelWriteFinalize(ClientContext &context, FunctionData &bind_p, GlobalFunc
 			client.WorkbookCall("POST", g.wb.item_id, "closeSession", "{}", g.session_id,
 			                    "workbook session for '" + g.wb.path + "'", true);
 			g.session_id.clear();
+		}
+		// What a COPY creates in a session -- a table, a worksheet -- is not
+		// at once visible outside it: a read right after the COPY got 404
+		// ItemNotFound (live CI, 2026-11-03, both). Wait until it is, so
+		// COPY-then-read works; the rows are written either way, so running
+		// out of patience is no error.
+		string created, what;
+		if (g.create_table) {
+			created = "tables/" + EncodeWorkbookName(bind.table);
+			what = Quoted("table", bind.table, g.wb);
+		} else if (!g.created_sheet.empty()) {
+			created = WorksheetResource(g.created_sheet);
+			what = Quoted("worksheet", g.created_sheet, g.wb);
+		}
+		for (int attempt = 1; !created.empty() && attempt <= kMaxCreatedVisibleAttempts; attempt++) {
+			int status = 0;
+			client.WorkbookCall("GET", g.wb.item_id, created + "?$select=name", string(), string(), what, true,
+			                    &status);
+			if (status != 404) {
+				break;
+			}
+			SleepBeforeRetry(attempt, 0);
 		}
 	});
 }

@@ -109,6 +109,25 @@ titled `sharepoint: bump to vYYYY.MM.DD`.
      commit builds on both (duckdb-compat). There is no `andium` key: DuckDB
      1.4.x is not supported.
 3. Open the PR from the `DataZooDE/community-extensions` fork.
+4. **After the merge, ask for the v1.5.6 build. Nothing builds it on its own.**
+   A merge (push to main) runs `build.yml` for DuckDB 2.0 only.
+   `scripts/build.py` reads `variegata` only when a maintainer dispatches
+   `build.yml` with `duckdb_version: v1.5.6`, and the andium/next workflows
+   are `if: false`. v2026.10.18 merged without that request, so v1.5.6 had no
+   binary (#48). Comment on the merged PR, as for the anofox extensions:
+
+   > Thanks for merging! Could someone run the **DuckDB v1.5.6** build for
+   > `sharepoint` (`build.yml` with `duckdb_version: v1.5.6`, `deploy: true`)?
+   > The descriptor sets `variegata` to the same SHA as `ref`.
+
+   Done when the v1.5.6 binary exists on every platform:
+
+   ```bash
+   for a in linux_amd64 linux_arm64 osx_amd64 osx_arm64 windows_amd64; do
+     echo "$a $(curl -s -o /dev/null -w '%{http_code}' \
+       https://community-extensions.duckdb.org/v1.5.6/$a/sharepoint.duckdb_extension.gz)"
+   done
+   ```
 
 ## Excluded platforms, and why
 
