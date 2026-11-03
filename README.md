@@ -355,7 +355,6 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
 - **Excel.**
   - Workbooks are read whole when the query is planned, which suits Excel's
     sizes; a sheet of millions of cells belongs in Parquet.
-  - Workbooks in the 1904 date system (old Mac files) read four years early.
 - **Lists.**
   - No filter pushdown yet.
   - A person column gives the person's id, not their name.

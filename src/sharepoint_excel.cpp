@@ -541,5 +541,102 @@ std::vector<std::string> ExcelHeaderNames(const std::vector<ExcelCell> &header) 
 	return names;
 }
 
+namespace {
+
+uint32_t Le(const std::string &s, size_t pos, size_t bytes) {
+	uint32_t v = 0;
+	for (size_t i = 0; i < bytes; i++) {
+		v |= static_cast<uint32_t>(static_cast<unsigned char>(s[pos + i])) << (8 * i);
+	}
+	return v;
+}
+
+} // namespace
+
+bool ZipCentralDirectory(const std::string &tail, uint64_t file_size, uint64_t &cd_offset, uint64_t &cd_size) {
+	// The end record is 22 bytes plus a comment of up to 64 KiB; the last
+	// signature whose comment ends exactly at the end of the file is it.
+	constexpr size_t kEnd = 22;
+	if (tail.size() < kEnd) {
+		return false;
+	}
+	for (size_t pos = tail.size() - kEnd + 1; pos-- > 0;) {
+		if (Le(tail, pos, 4) != 0x06054b50 || pos + kEnd + Le(tail, pos + 20, 2) != tail.size()) {
+			continue;
+		}
+		cd_size = Le(tail, pos + 12, 4);
+		cd_offset = Le(tail, pos + 16, 4);
+		return cd_offset + cd_size <= file_size;
+	}
+	return false;
+}
+
+bool ZipFindEntry(const std::string &cd, const std::string &name, ZipEntry &out) {
+	constexpr size_t kRecord = 46;
+	for (size_t pos = 0; pos + kRecord <= cd.size() && Le(cd, pos, 4) == 0x02014b50;) {
+		const size_t name_len = Le(cd, pos + 28, 2);
+		const size_t next = pos + kRecord + name_len + Le(cd, pos + 30, 2) + Le(cd, pos + 32, 2);
+		if (pos + kRecord + name_len > cd.size()) {
+			return false;
+		}
+		if (cd.compare(pos + kRecord, name_len, name) == 0 && name_len == name.size()) {
+			out.method = static_cast<uint16_t>(Le(cd, pos + 10, 2));
+			out.crc32 = Le(cd, pos + 16, 4);
+			out.compressed_size = Le(cd, pos + 20, 4);
+			out.uncompressed_size = Le(cd, pos + 24, 4);
+			out.local_header_offset = Le(cd, pos + 42, 4);
+			return true;
+		}
+		pos = next;
+	}
+	return false;
+}
+
+bool ZipLocalHeaderSize(const std::string &local, uint64_t &size) {
+	if (local.size() < 30 || Le(local, 0, 4) != 0x04034b50) {
+		return false;
+	}
+	size = 30 + Le(local, 26, 2) + Le(local, 28, 2);
+	return true;
+}
+
+bool WorkbookUses1904(const std::string &xml) {
+	for (size_t at = xml.find("workbookPr"); at != std::string::npos; at = xml.find("workbookPr", at + 1)) {
+		// An element (<workbookPr or <x:workbookPr), not text that mentions it.
+		const auto open = xml.rfind('<', at);
+		const auto end = xml.find('>', at);
+		if (open == std::string::npos || end == std::string::npos || xml.find('>', open) < at) {
+			continue;
+		}
+		const auto attr = xml.find("date1904", at);
+		if (attr == std::string::npos || attr > end) {
+			return false;
+		}
+		size_t v = attr + 8;
+		while (v < end && (xml[v] == ' ' || xml[v] == '=')) {
+			v++;
+		}
+		if (v >= end || (xml[v] != '"' && xml[v] != '\'')) {
+			return false;
+		}
+		const auto close = xml.find(xml[v], v + 1);
+		const auto value = xml.substr(v + 1, close == std::string::npos ? 0 : close - v - 1);
+		return value == "1" || value == "true";
+	}
+	return false;
+}
+
+std::string GzipFrame(const std::string &deflate, uint32_t crc32, uint32_t uncompressed_size) {
+	// ID1 ID2, CM=8 (deflate), no flags, no mtime, XFL 0, OS unknown.
+	std::string out("\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff", 10);
+	out += deflate;
+	for (uint32_t v : {crc32, uncompressed_size}) {
+		for (int i = 0; i < 4; i++) {
+			out += static_cast<char>((v >> (8 * i)) & 0xFF);
+		}
+	}
+	return out;
+}
+
 } // namespace sharepoint
 } // namespace duckdb
