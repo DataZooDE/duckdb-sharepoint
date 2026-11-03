@@ -37,6 +37,8 @@
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
 
+#include <cstdint>
+
 #include "duckdb_compat.hpp"
 
 namespace duckdb {
