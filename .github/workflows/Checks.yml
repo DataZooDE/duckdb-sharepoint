@@ -218,6 +218,14 @@ jobs:
     timeout-minutes: 120
     name: Live tests against a real Graph tenant
     runs-on: ubuntu-latest
+    # One live job at a time across the whole repo (#73): parallel runs share
+    # the test tenant, collide on the file suite's fixed paths and throttle
+    # each other (docs/hld.md §7a). Queue instead of cancelling: a cancelled
+    # live job leaks its scratch folders. (GitHub keeps one pending job per
+    # group; a newer one replaces an older pending one, never a running one.)
+    concurrency:
+      group: sharepoint-live-tenant
+      cancel-in-progress: false
     # `secrets` is not available in job-level `if`, so gate on the event:
     # fork PRs have a head repo different from the base repo.
     # Not on the nightly schedule (that only sweeps), and not for fork PRs,
