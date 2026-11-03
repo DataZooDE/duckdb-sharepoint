@@ -241,6 +241,10 @@ def test_people_by_name_email_and_id(graph, fixture_lists, sql, secret_sql):
         assert out[-4] == f"{n0}|{e0}|{i0}|[{n0}, {n1}]|[{e0}, {e1}]|[{i0}, {i1}]|true|true"
         # No name or email read: no lookup (drive -> site, list, columns, one page).
         assert out[-1] == "4", f"{out[-1]} list calls"
+    finally:
+        graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}")
+
+
 def test_date_only_column_reads_and_writes_dates(graph, fixture_lists, sql, secret_sql):
     """A date-only column (#64) is a DATE: Graph stores and returns the site's
     local midnight in UTC (on the test site, UTC+1/+2, the evening before),
