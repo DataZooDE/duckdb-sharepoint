@@ -663,6 +663,25 @@ void ListPushdownFilter(ClientContext &, LogicalGet &get, FunctionData *bind_dat
 		ListPredicate p;
 		if (ToPredicate(*filter, get, data, p)) {
 			predicates.push_back(std::move(p));
+		} else if (filter->GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+			// DuckDB folds `a > x AND a < y` into a BETWEEN (found live): two
+			// inclusive bounds (ODataClause widens either way).
+			auto children = ChildrenOf(*filter);
+			auto col = children.size() == 3 ? ColumnOf(children[0], get, data) : nullptr;
+			if (!col || col->filter == ListFilterKind::NONE) {
+				continue;
+			}
+			ListPredicate lower, upper;
+			for (auto bound : {&lower, &upper}) {
+				bound->field = col->field;
+				bound->kind = col->filter;
+			}
+			lower.op = ListFilterOp::GE;
+			upper.op = ListFilterOp::LE;
+			if (AddLiteral(children[1], lower) && AddLiteral(children[2], upper)) {
+				predicates.push_back(std::move(lower));
+				predicates.push_back(std::move(upper));
+			}
 		}
 	}
 	data.filter = BuildListFilter(predicates);
