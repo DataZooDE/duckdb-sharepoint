@@ -79,12 +79,17 @@ public:
 	DriveItemMeta StatByPath(const string &root_relative_path);
 	//! Metadata by item id.
 	DriveItemMeta StatById(const string &item_id);
+	//! Metadata of an earlier version ("3.0") of item `item_id` (#66): its
+	//! size and time; `id` stays the item's, `ctag` is "version:<v>" (a
+	//! version never changes, so blocks cached under it never go stale).
+	DriveItemMeta StatVersion(const string &item_id, const string &version);
 
 	//! Read [offset, offset+length) of an item's content into `out`. Sends a
 	//! Range header; Graph 302-redirects /content to a pre-authenticated
 	//! download URL, which is fetched verbatim by PreauthenticatedRequest
 	//! (never by httplib, which would re-sort its signed query -> 401).
-	void ReadRange(const string &item_id, int64_t offset, int64_t length, string &out);
+	//! With `version`, the bytes of that earlier version (/versions/<v>/content).
+	void ReadRange(const string &item_id, int64_t offset, int64_t length, string &out, const string &version = "");
 
 	//! Upload `bytes` -- at most one upload chunk -- to a root-relative path
 	//! in a single PUT, replacing any existing file. Returns the new item's

@@ -8,6 +8,7 @@ namespace sharepoint {
 namespace {
 
 constexpr const char *kIdPrefix = "id:";
+constexpr const char *kVersionSuffix = "?version=";
 
 // Split on '/', collapsing repeated slashes and dropping a trailing one.
 // Rejection of empty/"."/".." segments is done by the caller so the reason
@@ -33,10 +34,11 @@ std::vector<std::string> SplitSegments(const std::string &body) {
 } // namespace
 
 std::string SharepointUri::ToString() const {
+	const std::string suffix = version.empty() ? std::string() : kVersionSuffix + version;
 	if (kind == SharepointUriKind::FILE_ID) {
-		return std::string(SHAREPOINT_SCHEME) + kIdPrefix + item_id;
+		return std::string(SHAREPOINT_SCHEME) + kIdPrefix + item_id + suffix;
 	}
-	return std::string(SHAREPOINT_SCHEME) + RootRelativePath();
+	return std::string(SHAREPOINT_SCHEME) + RootRelativePath() + suffix;
 }
 
 std::string SharepointUri::RootRelativePath() const {
@@ -83,6 +85,25 @@ SharepointUriParse ParseSharepointUri(const std::string &uri) {
 	}
 	std::string body = uri.substr(scheme.size());
 
+	// "?version=<v>" at the end: an earlier version of the file. The version
+	// is spliced into /versions/<v> URLs, so it is digits and one '.' only.
+	std::string version;
+	const auto at = body.rfind(kVersionSuffix);
+	if (at != std::string::npos) {
+		version = body.substr(at + std::string(kVersionSuffix).size());
+		body = body.substr(0, at);
+		const auto dot = version.find('.');
+		bool ok = !version.empty() && dot != 0 && dot != version.size() - 1 &&
+		          version.find('.', dot == std::string::npos ? 0 : dot + 1) == std::string::npos;
+		for (char c : version) {
+			ok = ok && ((c >= '0' && c <= '9') || c == '.');
+		}
+		if (!ok) {
+			result.error = "a sharepoint:// version is SharePoint's version label, e.g. ?version=3.0: '" + uri + "'";
+			return result;
+		}
+	}
+
 	// id: form -- a single already-resolved driveItem id, no path segments.
 	if (body.rfind(kIdPrefix, 0) == 0) {
 		std::string id = body.substr(std::string(kIdPrefix).size());
@@ -120,6 +141,7 @@ SharepointUriParse ParseSharepointUri(const std::string &uri) {
 		}
 		result.uri.kind = SharepointUriKind::FILE_ID;
 		result.uri.item_id = id;
+		result.uri.version = version;
 		result.ok = true;
 		return result;
 	}
@@ -132,8 +154,13 @@ SharepointUriParse ParseSharepointUri(const std::string &uri) {
 			return result;
 		}
 	}
+	if (!version.empty() && segments.empty()) {
+		result.error = "the drive root has no versions: '" + uri + "'";
+		return result;
+	}
 	result.uri.kind = SharepointUriKind::PATH;
 	result.uri.segments = std::move(segments);
+	result.uri.version = version;
 	result.ok = true;
 	return result;
 }

@@ -1,0 +1,27 @@
+# name: test/sql/search_offline.test
+# description: search_sharepoint (#67) without a tenant: registered, and bad
+#              input fails before any Graph call. Searching is
+#              e2e/tests/test_search.py.
+# group: [sharepoint]
+
+require sharepoint
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'search_sharepoint' AND function_type = 'table';
+----
+1
+
+statement error
+SELECT * FROM search_sharepoint('');
+----
+needs a query string
+
+statement error
+SELECT * FROM search_sharepoint('x', types := []);
+----
+needs at least one of
+
+statement error
+SELECT * FROM search_sharepoint('x', max_results := 0);
+----
+max_results must be positive

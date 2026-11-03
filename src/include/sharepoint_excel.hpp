@@ -143,5 +143,35 @@ std::string ExcelCellText(const ExcelCell &cell);
 //! (compared case-insensitively, since DuckDB column names are).
 std::vector<std::string> ExcelHeaderNames(const std::vector<ExcelCell> &header);
 
+//! Days between the 1900 and the 1904 date system: a 1904 workbook's serial
+//! plus this is the 1900 serial of the same day.
+constexpr double kExcel1904Offset = 1462;
+
+//! An .xlsx is a zip. Where one entry's bytes are, from its central
+//! directory record (no zip64: an xlsx part is never that large).
+struct ZipEntry {
+	uint64_t local_header_offset = 0;
+	uint64_t compressed_size = 0;
+	uint64_t uncompressed_size = 0;
+	uint16_t method = 0; // 0 stored, 8 deflate
+	uint32_t crc32 = 0;
+};
+
+//! From the last bytes of a zip of `file_size` bytes, where its central
+//! directory is. False when the end record is not in `tail`.
+bool ZipCentralDirectory(const std::string &tail, uint64_t file_size, uint64_t &cd_offset, uint64_t &cd_size);
+
+//! The record for `name` in a central directory.
+bool ZipFindEntry(const std::string &central_directory, const std::string &name, ZipEntry &out);
+
+//! The size of the local header that starts `local` (its data follows it).
+bool ZipLocalHeaderSize(const std::string &local, uint64_t &size);
+
+//! Whether xl/workbook.xml says <workbookPr date1904="1"> (or "true").
+bool WorkbookUses1904(const std::string &workbook_xml);
+
+//! Raw deflate data framed as a gzip member, for a gzip decoder.
+std::string GzipFrame(const std::string &deflate, uint32_t crc32, uint32_t uncompressed_size);
+
 } // namespace sharepoint
 } // namespace duckdb

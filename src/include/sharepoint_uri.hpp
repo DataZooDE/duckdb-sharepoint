@@ -46,6 +46,9 @@ struct SharepointUri {
 	std::string item_id;
 	//! Populated when kind == PATH. Empty vector means the drive root.
 	std::vector<std::string> segments;
+	//! An earlier version of the file ("3.0"), from a trailing "?version=3.0"
+	//! (#66); empty for the current one. Read-only.
+	std::string version;
 
 	//! Round-trips back to the canonical textual form. Used in error messages,
 	//! so a user is always shown a path they could paste back.
@@ -82,6 +85,9 @@ bool IsSharepointUri(const std::string &uri);
 //!   - "id:" with an empty id is an error, and the id: form may carry no
 //!     further path segments
 //!   - percent-decoding is NOT performed: DuckDB hands us the path un-escaped
+//!   - a trailing "?version=<major.minor>" names an earlier version of the
+//!     file ('?' cannot occur in a SharePoint name); any other '?' is part
+//!     of the path
 SharepointUriParse ParseSharepointUri(const std::string &uri);
 
 //! True iff `uri` has EXACTLY the shape "sharepoint://id:<itemId>/**/*.<ext>"
