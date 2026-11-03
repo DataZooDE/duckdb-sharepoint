@@ -754,3 +754,21 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   would still be attempted for a name that exists as a local file; the same
   rewrite as the Excel writers (`sharepoint_copy_rewrite.hpp`) rules it out.
 
+## 12. Certificate credentials: `PROVIDER client_certificate` (#71)
+
+- The client-credentials grant with `client_assertion_type =
+  urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and a JWT signed
+  RS256 with the certificate's key: header `{alg: RS256, typ: JWT, x5t}`
+  (base64url SHA-1 of the DER certificate), claims `aud` (this tenant's
+  token endpoint), `iss = sub = client id`, a random `jti`, `nbf = iat = now`,
+  `exp = now + 10 min`. A fresh assertion per token request.
+- Pure split: the JWT shape is `sharepoint_assertion.*` (in both unit-test
+  binaries); thumbprint and signature are `sharepoint_certificate.*`
+  (OpenSSL over PEM text, no file I/O; tested with a certificate made at test
+  time, so only in the main build's unit tests).
+- `CERTIFICATE_PATH` is read on every `GetAuthContext` and validated there
+  (no certificate -> an error naming the path, never its content). Its
+  content and the password are part of the credential fingerprint: a renewed
+  certificate gets its own token, and two secrets with different keys never
+  share one.
+

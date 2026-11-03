@@ -42,7 +42,8 @@ def _load_env_file(env_file: Path) -> None:
 def scrub(text: str) -> str:
     """Remove credential values, bearer tokens and signed URLs from text that
     may end up in a failure report (and so in CI logs)."""
-    for name in ("SHAREPOINT_USER_REFRESH_TOKEN", "SHAREPOINT_CLIENT_SECRET", "SHAREPOINT_DELEGATED_CLIENT_ID",
+    for name in ("SHAREPOINT_USER_REFRESH_TOKEN", "SHAREPOINT_CLIENT_SECRET", "SHAREPOINT_CERTIFICATE_PASSWORD",
+                 "SHAREPOINT_CERT_CLIENT_ID", "SHAREPOINT_DELEGATED_CLIENT_ID",
                  "SHAREPOINT_CLIENT_ID", "SHAREPOINT_TENANT_ID"):
         value = os.environ.get(name)
         if value:

@@ -8,6 +8,8 @@
 // cache would serve one principal's token to another (the bug the sibling
 // gdrive documents and fixed the same way).
 #include "sharepoint_auth.hpp"
+#include "sharepoint_assertion.hpp"
+#include "sharepoint_certificate.hpp"
 #include "sharepoint_token_policy.hpp"
 #include "sharepoint_client.hpp"
 #include "sharepoint_counters.hpp"
@@ -33,6 +35,9 @@
 #include <openssl/evp.h>
 
 #include <chrono>
+#include <fstream>
+#include <random>
+#include <sstream>
 #include <cstdint>
 #include <functional>
 #include "duckdb_compat.hpp"
@@ -184,6 +189,10 @@ struct MintRequest {
 	string provider;
 	string client_id;
 	string client_secret;
+	//! PROVIDER client_certificate: the PEM (certificate + key) and the key's
+	//! password; a fresh signed assertion goes with every token request.
+	string certificate_pem;
+	string certificate_password;
 	string refresh_token;
 	string scope;
 	//! Test hook (sharepoint_debug_token_max_age_seconds): treat tokens as
@@ -191,6 +200,27 @@ struct MintRequest {
 	//! without waiting an hour. 0 = Entra ID's own lifetime.
 	int64_t max_age_seconds = 0;
 };
+
+//! A signed client assertion for a certificate credential (#71): good for ten
+//! minutes, for this tenant's token endpoint only, with a fresh jti.
+string ClientAssertion(const MintRequest &req) {
+	string x5t, signature, error;
+	if (!CertificateThumbprint(req.certificate_pem, x5t, error)) {
+		throw InvalidInputException("sharepoint: secret '%s': %s", req.secret_name, error);
+	}
+	std::random_device rd;
+	std::ostringstream jti;
+	jti << std::hex << rd() << rd() << rd() << rd();
+	const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+	                     std::chrono::system_clock::now().time_since_epoch())
+	                     .count();
+	const auto input = ClientAssertionSigningInput(
+	    req.client_id, req.login_endpoint + "/" + req.tenant + "/oauth2/v2.0/token", x5t, jti.str(), now);
+	if (!SignRs256(req.certificate_pem, req.certificate_password, input, signature, error)) {
+		throw InvalidInputException("sharepoint: secret '%s': %s", req.secret_name, error);
+	}
+	return input + "." + Base64Url(signature);
+}
 
 //! Mint a token and store it in the shared cache. Throttling and 5xx on the
 //! token endpoint are retried with the same backoff as Graph calls.
@@ -221,6 +251,12 @@ string MintToken(const MintRequest &req) {
 				return DelegatedErrorMessage(ParseTokenReply(status, body), name, provider);
 			};
 		}
+	} else if (!req.certificate_pem.empty()) {
+		params.emplace("client_id", req.client_id);
+		params.emplace("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer");
+		params.emplace("client_assertion", ClientAssertion(req));
+		params.emplace("scope", req.scope);
+		params.emplace("grant_type", "client_credentials");
 	} else {
 		params.emplace("client_id", req.client_id);
 		params.emplace("client_secret", req.client_secret);
@@ -601,6 +637,28 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 	const string client_id = SecretField(secret, "client_id");
 	// Never read for an interactive provider: a public client has no secret.
 	const string client_secret = interactive ? string() : SecretField(secret, "client_secret");
+	// PROVIDER client_certificate: the PEM file, read on every use, so a
+	// renewed certificate at the same path is picked up (its content is part
+	// of the fingerprint below, so it also gets a token of its own).
+	string certificate_pem;
+	const string certificate_password =
+	    provider == "client_certificate" ? SecretField(secret, "certificate_password") : string();
+	if (provider == "client_certificate") {
+		const string cert_path = SecretField(secret, "certificate_path");
+		std::ifstream in(cert_path, std::ios::binary);
+		std::stringstream buf;
+		buf << in.rdbuf();
+		certificate_pem = buf.str();
+		string x5t, error;
+		if (!in || certificate_pem.empty()) {
+			throw InvalidInputException("sharepoint: secret '%s': cannot read CERTIFICATE_PATH '%s'",
+			                            duckdb_compat::Str(secret.GetName()), cert_path);
+		}
+		if (!CertificateThumbprint(certificate_pem, x5t, error)) {
+			throw InvalidInputException("sharepoint: secret '%s': CERTIFICATE_PATH '%s': %s",
+			                            duckdb_compat::Str(secret.GetName()), cert_path, error);
+		}
+	}
 	string refresh_token = SecretField(secret, "refresh_token");
 	string lineage = SecretField(secret, "refresh_token_lineage");
 	if (lineage.empty()) {
@@ -627,7 +685,8 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 	// LineageOf) is the user's identity: two users' secrets of the same name
 	// never share a token, and rotation does not change the key.
 	auto fingerprint_for = [&](const string &lin) {
-		return Fingerprint({provider, tenant, client_id, client_secret, lin, scope, login_endpoint, static_token});
+		return Fingerprint({provider, tenant, client_id, client_secret, lin, scope, login_endpoint, static_token,
+		                    certificate_pem, certificate_password});
 	};
 	string credential_fp = fingerprint_for(lineage);
 
@@ -656,6 +715,8 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 		req.provider = provider;
 		req.client_id = client_id;
 		req.client_secret = client_secret;
+		req.certificate_pem = certificate_pem;
+		req.certificate_password = certificate_password;
 		req.refresh_token = refresh_token;
 		req.scope = scope;
 		Value max_age;

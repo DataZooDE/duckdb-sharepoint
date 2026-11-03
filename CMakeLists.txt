@@ -93,6 +93,8 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_delegated.cpp
     src/sharepoint_excel.cpp
     src/sharepoint_list.cpp
+    src/sharepoint_assertion.cpp
+    src/sharepoint_certificate.cpp
 )
 
 # ---------------------------------------------------------------------------
