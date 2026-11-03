@@ -1,0 +1,23 @@
+# name: test/sql/attach_offline.test
+# description: ATTACH ... (TYPE sharepoint) (#60) without a tenant: attaching
+#              makes no Graph call; the first table lookup needs a secret.
+#              Real lists are e2e/tests/test_attach.py.
+# group: [sharepoint]
+
+require sharepoint
+
+statement ok
+ATTACH 'sharepoint://sites/Sales' AS sales (TYPE sharepoint);
+
+query II
+SELECT type, path FROM duckdb_databases() WHERE database_name = 'sales';
+----
+sharepoint	sharepoint://sites/Sales
+
+statement error
+SELECT * FROM sales.Orders;
+----
+no `sharepoint` secret configured
+
+statement ok
+DETACH sales;

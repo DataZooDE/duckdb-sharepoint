@@ -446,6 +446,77 @@ ListTarget ResolveList(ClientContext &context, const string &list, const string 
 	return t;
 }
 
+//! read_sharepoint_list's bind, for the table function and for an ATTACHed
+//! site's tables (#60). `fixed_types`: the types come from the column
+//! definitions alone (a catalog declares them before any data is read), so a
+//! choice column that may hold several values is always VARCHAR[], and the
+//! items are read at init.
+unique_ptr<ListBindData> BindListData(ClientContext &context, const string &list, const string &site,
+                                      bool fixed_types) {
+	auto target = ResolveList(context, list, site);
+	GraphClient client(target.auth);
+	auto &plan = target.plan;
+	const auto &base = target.base;
+	const auto &what = target.what;
+
+	// Name every planned field: a lookup's display value is only returned
+	// when it is selected explicitly (by default Graph sends <name>LookupId
+	// alone -- found live).
+	string select;
+	std::set<string> selected;
+	for (auto &col : plan) {
+		// Several people may come only as <internal>: [{LookupId,
+		// LookupValue, Email}], so it is asked for too.
+		const bool multi_person = col.person != ListPersonPart::NONE && col.type != ListColumnType::BIGINT &&
+		                          col.type != ListColumnType::VARCHAR;
+		for (auto &field : {col.field, multi_person ? col.person_field : string()}) {
+			if (!field.empty() && selected.insert(field).second) {
+				select += (select.empty() ? "" : ",") + EncodeWorkbookName(field);
+			}
+		}
+	}
+	const auto page_size = ListPageSize(context);
+	auto data = make_uniq<ListBindData>();
+	if (fixed_types) {
+		for (auto &col : plan) {
+			if (col.may_be_multi) {
+				col.type = ListColumnType::VARCHAR_LIST;
+				col.may_be_multi = false;
+				col.filter = ListFilterKind::NONE;
+			}
+		}
+	}
+	data->deferred = std::none_of(plan.begin(), plan.end(), [](const ListOutputColumn &c) { return c.may_be_multi; });
+	if (!data->deferred) {
+		// Every item first: whether a choice column is multi-valued shows
+		// only in the data.
+		auto items = FetchItems(client, base, select, page_size, "", what);
+		for (auto &col : plan) {
+			if (!col.may_be_multi) {
+				continue;
+			}
+			for (auto &fields : items) {
+				auto it = fields.find(col.field);
+				if (it != fields.end() && it->second.is<picojson::array>()) {
+					col.type = ListColumnType::VARCHAR_LIST;
+					break;
+				}
+			}
+		}
+		data->rows = RowsOf(items, plan);
+	}
+	for (auto &col : plan) {
+		data->types.push_back(col.type);
+	}
+	data->auth = target.auth;
+	data->base = base;
+	data->select = select;
+	data->what = what;
+	data->page_size = page_size;
+	data->plan = plan;
+	return data;
+}
+
 unique_ptr<FunctionData> ListBind(ClientContext &context, TableFunctionBindInput &input,
                                   vector<LogicalType> &return_types, duckdb_compat::BindNames &names) {
 	unique_ptr<FunctionData> result;
@@ -459,60 +530,11 @@ unique_ptr<FunctionData> ListBind(ClientContext &context, TableFunctionBindInput
 				site = StringValue::Get(*v);
 			}
 		}
-		auto target = ResolveList(context, StringValue::Get(input.inputs[0]), site);
-		GraphClient client(target.auth);
-		auto &plan = target.plan;
-		const auto &base = target.base;
-		const auto &what = target.what;
-
-		// Name every planned field: a lookup's display value is only returned
-		// when it is selected explicitly (by default Graph sends <name>LookupId
-		// alone -- found live).
-		string select;
-		std::set<string> selected;
-		for (auto &col : plan) {
-			// Several people may come only as <internal>: [{LookupId,
-			// LookupValue, Email}], so it is asked for too.
-			const bool multi_person = col.person != ListPersonPart::NONE && col.type != ListColumnType::BIGINT &&
-			                          col.type != ListColumnType::VARCHAR;
-			for (auto &field : {col.field, multi_person ? col.person_field : string()}) {
-				if (!field.empty() && selected.insert(field).second) {
-					select += (select.empty() ? "" : ",") + EncodeWorkbookName(field);
-				}
-			}
-		}
-		const auto page_size = ListPageSize(context);
-		auto data = make_uniq<ListBindData>();
-		data->deferred = std::none_of(plan.begin(), plan.end(), [](const ListOutputColumn &c) { return c.may_be_multi; });
-		if (!data->deferred) {
-			// Every item first: whether a choice column is multi-valued shows
-			// only in the data.
-			auto items = FetchItems(client, base, select, page_size, "", what);
-			for (auto &col : plan) {
-				if (!col.may_be_multi) {
-					continue;
-				}
-				for (auto &fields : items) {
-					auto it = fields.find(col.field);
-					if (it != fields.end() && it->second.is<picojson::array>()) {
-						col.type = ListColumnType::VARCHAR_LIST;
-						break;
-					}
-				}
-			}
-			data->rows = RowsOf(items, plan);
-		}
-		for (auto &col : plan) {
-			data->types.push_back(col.type);
+		auto data = BindListData(context, StringValue::Get(input.inputs[0]), site, false);
+		for (auto &col : data->plan) {
 			return_types.push_back(ToLogicalType(col.type));
 			names.emplace_back(col.name);
 		}
-		data->auth = target.auth;
-		data->base = base;
-		data->select = select;
-		data->what = what;
-		data->page_size = page_size;
-		data->plan = plan;
 		result = std::move(data);
 	});
 	return result;
@@ -914,7 +936,11 @@ void ListScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 		for (idx_t c = 0; c < state.column_ids.size(); c++) {
 			const auto col = state.column_ids[c];
 			if (col >= row.size()) {
-				output.SetValue(c, out, Value(output.data[c].GetType())); // the row id: none
+				// The row id: the item's id (row[0]) -- what an ATTACHed table's
+				// UPDATE and DELETE address the item by (#60).
+				output.SetValue(c, out,
+				                col == COLUMN_IDENTIFIER_ROW_ID ? row[0].DefaultCastAs(output.data[c].GetType())
+				                                                : Value(output.data[c].GetType()));
 				continue;
 			}
 			auto named = state.id_column.find(col);
@@ -986,6 +1012,7 @@ unique_ptr<FunctionData> ListWriteBind(ClientContext &, CopyFunctionBindInput &i
 struct PendingRequest {
 	string item_id; // empty: create
 	picojson::object fields;
+	bool remove = false; // DELETE item_id (an ATTACHed table's DELETE, #60)
 };
 
 struct ListWriteGlobalState : public GlobalFunctionData {
@@ -1071,7 +1098,11 @@ void FlushBatch(ListWriteGlobalState &g) {
 			picojson::object headers;
 			headers["Content-Type"] = picojson::value("application/json");
 			r["headers"] = picojson::value(headers);
-			if (p.item_id.empty()) {
+			if (p.remove) {
+				r.erase("headers");
+				r["method"] = picojson::value("DELETE");
+				r["url"] = picojson::value(items_path + "/" + EncodeWorkbookName(p.item_id));
+			} else if (p.item_id.empty()) {
 				any_create = true;
 				picojson::object body;
 				body["fields"] = picojson::value(p.fields);
@@ -1107,8 +1138,8 @@ void FlushBatch(ListWriteGlobalState &g) {
 			const int status = (status_it != o.end() && status_it->second.is<int64_t>())
 			                       ? static_cast<int>(status_it->second.get<int64_t>())
 			                       : 0;
-			if (status >= 200 && status < 300) {
-				continue;
+			if ((status >= 200 && status < 300) || (status == 404 && g.pending[index].remove)) {
+				continue; // a 404 on a delete: gone already
 			}
 			string body = "{}";
 			auto body_it = o.find("body");
@@ -1124,11 +1155,13 @@ void FlushBatch(ListWriteGlobalState &g) {
 					message = StringField(e->second.get<picojson::object>(), "message");
 				}
 			}
-			const bool create = g.pending[index].item_id.empty();
+			const bool create = g.pending[index].item_id.empty() && !g.pending[index].remove;
 			const auto kind = ClassifyGraphError(status, code);
 			const bool retry = create ? IsRetryableWhenNotIdempotent(kind) : IsRetryable(kind);
 			if (!retry || attempt >= kMaxBatchAttempts) {
-				const string row = create ? "a new item" : "item " + g.pending[index].item_id;
+				const string row = create                   ? "a new item"
+				                   : g.pending[index].remove ? "deleting item " + g.pending[index].item_id
+				                                             : "item " + g.pending[index].item_id;
 				throw IOException("sharepoint: writing %s to %s failed: HTTP %d %s: %s%s", row, g.target.what, status,
 				                  code, message,
 				                  create && !retry && status >= 500 ? " (it may or may not have been created)" : "");
@@ -1153,37 +1186,50 @@ unique_ptr<LocalFunctionData> ListWriteInitLocal(ExecutionContext &, FunctionDat
 	return make_uniq<LocalFunctionData>();
 }
 
+//! Queue one row (values aligned with g.columns) as a create, or an update
+//! of `id` (else of the row's own id column, if any); flush every 20.
+void AddRow(ListWriteGlobalState &g, const vector<Value> &row, const Value &id) {
+	PendingRequest p;
+	if (!id.IsNull()) {
+		p.item_id = id.ToString();
+	}
+	for (idx_t c = 0; c < row.size(); c++) {
+		auto &col = g.columns[c];
+		if (col.target == ListWriteTarget::SKIP) {
+			continue;
+		}
+		const auto &v = row[c];
+		if (col.target == ListWriteTarget::ID) {
+			if (!v.IsNull() && id.IsNull()) {
+				p.item_id = v.ToString();
+			}
+			continue;
+		}
+		auto json = col.date_only && !v.IsNull()
+		                ? picojson::value(FormatDateOnly(v.DefaultCastAs(LogicalType::DATE).GetValue<date_t>().days))
+		                : ToJsonField(v, col.field);
+		if (json.is<picojson::array>()) {
+			// A multi-choice value: Graph needs the collection's type.
+			p.fields[col.field + "@odata.type"] = picojson::value("Collection(Edm.String)");
+		}
+		p.fields[col.field] = std::move(json);
+	}
+	g.pending.push_back(std::move(p));
+	if (g.pending.size() >= kBatchRequests) {
+		FlushBatch(g);
+	}
+}
+
 void ListWriteSink(ExecutionContext &, FunctionData &, GlobalFunctionData &gstate_p, LocalFunctionData &,
                    DataChunk &input) {
 	auto &g = gstate_p.Cast<ListWriteGlobalState>();
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		for (idx_t r = 0; r < input.size(); r++) {
-			PendingRequest p;
+			vector<Value> row;
 			for (idx_t c = 0; c < input.ColumnCount(); c++) {
-				auto &col = g.columns[c];
-				if (col.target == ListWriteTarget::SKIP) {
-					continue;
-				}
-				auto v = input.GetValue(c, r);
-				if (col.target == ListWriteTarget::ID) {
-					if (!v.IsNull()) {
-						p.item_id = v.ToString();
-					}
-					continue;
-				}
-				auto json = col.date_only && !v.IsNull()
-				                ? picojson::value(FormatDateOnly(v.DefaultCastAs(LogicalType::DATE).GetValue<date_t>().days))
-				                : ToJsonField(v, col.field);
-				if (json.is<picojson::array>()) {
-					// A multi-choice value: Graph needs the collection's type.
-					p.fields[col.field + "@odata.type"] = picojson::value("Collection(Edm.String)");
-				}
-				p.fields[col.field] = std::move(json);
+				row.push_back(input.GetValue(c, r));
 			}
-			g.pending.push_back(std::move(p));
-			if (g.pending.size() >= kBatchRequests) {
-				FlushBatch(g);
-			}
+			AddRow(g, row, Value());
 		}
 	});
 }
@@ -1560,11 +1606,120 @@ void FilesScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 
 } // namespace
 
-void RegisterListFunctions(ExtensionLoader &loader) {
+struct ListItemWriter::State {
+	ListWriteGlobalState g;
+};
+
+ListItemWriter::ListItemWriter(ClientContext &context, const string &list_id, const string &site_id,
+                               const vector<string> &column_names, bool ids_only)
+    : state(make_uniq<State>()) {
+	state->g.target = ResolveList(context, "id:" + list_id, site_id);
+	if (!ids_only) {
+		string error;
+		if (!PlanListWrite(column_names, state->g.target.plan, state->g.columns, error)) {
+			throw InvalidInputException("sharepoint: %s: %s", state->g.target.what, error);
+		}
+	}
+}
+
+ListItemWriter::~ListItemWriter() {
+}
+
+void ListItemWriter::Write(const vector<Value> &values, const Value &id) {
+	AddRow(state->g, values, id);
+	written++;
+}
+
+void ListItemWriter::Delete(const Value &id) {
+	if (id.IsNull()) {
+		return;
+	}
+	PendingRequest p;
+	p.item_id = id.ToString();
+	p.remove = true;
+	state->g.pending.push_back(std::move(p));
+	written++;
+	if (state->g.pending.size() >= kBatchRequests) {
+		FlushBatch(state->g);
+	}
+}
+
+void ListItemWriter::Flush() {
+	FlushBatch(state->g);
+}
+
+TableFunction ListScanFunction() {
 	TableFunction fn("read_sharepoint_list", {LogicalType::VARCHAR}, ListScan, ListBind, CursorInit);
 	fn.pushdown_complex_filter = ListPushdownFilter;
 	fn.projection_pushdown = true;
 	fn.to_string = ListToString;
+	return fn;
+}
+
+unique_ptr<FunctionData> BindListForCatalog(ClientContext &context, const string &list_id, const string &site_id,
+                                            vector<string> &names, vector<LogicalType> &types) {
+	auto data = BindListData(context, "id:" + list_id, site_id, true);
+	for (auto &col : data->plan) {
+		names.push_back(col.name);
+		types.push_back(ToLogicalType(col.type));
+	}
+	return std::move(data);
+}
+
+vector<CatalogList> ListCatalogLists(ClientContext &context, const string &site, string &site_id) {
+	auto opener = ClientData::Get(context).file_opener.get();
+	const auto auth = GetAuthContext(opener, SHAREPOINT_SCHEME);
+	GraphClient client(auth);
+	site_id = ResolveSite(client, auth, site);
+	const string what = "the lists of site '" + (site.empty() ? string("(the secret's)") : site) + "'";
+	vector<CatalogList> lists;
+	string next = "/v1.0/sites/" + site_id + "/lists?$select=id,displayName,list&$expand=columns";
+	for (int pages = 0; !next.empty(); pages++) {
+		if (pages >= kMaxItemPages) {
+			throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxItemPages);
+		}
+		picojson::value holder;
+		const auto &page = AsObject(client.GraphGet(next, what), what, holder);
+		auto values = page.find("value");
+		if (values != page.end() && values->second.is<picojson::array>()) {
+			for (auto &v : values->second.get<picojson::array>()) {
+				if (!v.is<picojson::object>()) {
+					continue;
+				}
+				const auto &l = v.get<picojson::object>();
+				auto info = l.find("list");
+				if (info != l.end() && info->second.is<picojson::object>() &&
+				    BoolField(info->second.get<picojson::object>(), "hidden")) {
+					continue;
+				}
+				vector<ListColumnDef> defs;
+				auto cols = l.find("columns");
+				if (cols != l.end() && cols->second.is<picojson::array>()) {
+					for (auto &c : cols->second.get<picojson::array>()) {
+						if (c.is<picojson::object>()) {
+							defs.push_back(ParseColumnDef(c.get<picojson::object>()));
+						}
+					}
+				}
+				CatalogList entry;
+				entry.id = StringField(l, "id");
+				entry.name = StringField(l, "displayName");
+				for (auto &col : PlanListColumns(defs)) {
+					entry.column_names.push_back(col.name);
+					entry.column_types.push_back(ToLogicalType(col.may_be_multi ? ListColumnType::VARCHAR_LIST : col.type));
+				}
+				lists.push_back(std::move(entry));
+			}
+		}
+		auto link = page.find("@odata.nextLink");
+		next = (link != page.end() && link->second.is<string>()) ? GraphPathOfLink(link->second.get<string>())
+		                                                         : string();
+	}
+	return lists;
+}
+
+void RegisterListFunctions(ExtensionLoader &loader) {
+	TableFunction fn = ListScanFunction();
 	duckdb_compat::NameParameters(fn, {"list"});
 	duckdb_compat::AddNamedParameter(fn, "site", LogicalType::VARCHAR);
 	CreateTableFunctionInfo info(fn);
