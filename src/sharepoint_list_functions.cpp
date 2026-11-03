@@ -27,6 +27,7 @@
 #include <picojson.h>
 
 #include <algorithm>
+#include <set>
 #include <cmath>
 #include <cstdint>
 #include "duckdb_compat.hpp"
@@ -51,6 +52,8 @@ int64_t ListPageSize(ClientContext &context) {
 }
 //! A nextLink chain longer than this is a server bug, not a list.
 constexpr int kMaxItemPages = 100000;
+//! People looked up per $batch call (Graph's $batch limit).
+constexpr idx_t kPeoplePerBatch = 20;
 
 const picojson::object &AsObject(const string &body, const string &what, picojson::value &holder) {
 	if (!picojson::parse(holder, body).empty() || !holder.is<picojson::object>()) {
@@ -116,6 +119,9 @@ ListColumnDef ParseColumnDef(const picojson::object &o) {
 		auto it = o.find(facet);
 		if (it != o.end() && it->second.is<picojson::object>()) {
 			def.facet = FacetOf(facet);
+			if (def.facet == ListFacet::PERSON) {
+				def.multi = BoolField(it->second.get<picojson::object>(), "allowMultipleSelection");
+			}
 			if (def.facet == ListFacet::CHOICE) {
 				const auto shown = StringField(it->second.get<picojson::object>(), "displayAs");
 				def.single_choice = shown == "dropDownMenu" || shown == "radioButtons";
@@ -145,6 +151,8 @@ LogicalType ToLogicalType(ListColumnType t) {
 		return LogicalType::BOOLEAN;
 	case ListColumnType::TIMESTAMP:
 		return LogicalType::TIMESTAMP;
+	case ListColumnType::BIGINT_LIST:
+		return LogicalType::LIST(LogicalType::BIGINT);
 	case ListColumnType::BIGINT:
 		return LogicalType::BIGINT;
 	default:
@@ -257,6 +265,49 @@ vector<picojson::object> FetchItems(GraphClient &client, const string &base, con
 	return items;
 }
 
+//! A person column's value from an item's fields (#63). The id comes from
+//! <internal>LookupId (one id, or a list of them), or from the objects of
+//! <internal> ([{LookupId, LookupValue, Email}], as Graph may send several
+//! people); a name or email only from those objects -- else NULL, for
+//! ListScan to look up in the User Information List.
+Value PersonValue(const picojson::object &fields, const ListOutputColumn &col) {
+	const bool multi = col.type == ListColumnType::VARCHAR_LIST || col.type == ListColumnType::BIGINT_LIST;
+	const auto type = ToLogicalType(col.type);
+	const auto element = multi ? ListType::GetChildType(type) : type;
+	vector<Value> values;
+	auto objects = fields.find(col.person_field);
+	if (objects != fields.end() && objects->second.is<picojson::array>()) {
+		for (auto &o : objects->second.get<picojson::array>()) {
+			if (!o.is<picojson::object>()) {
+				continue;
+			}
+			auto &person = o.get<picojson::object>();
+			const char *key = col.person == ListPersonPart::NAME ? "LookupValue"
+			                  : col.person == ListPersonPart::EMAIL ? "Email"
+			                                                        : "LookupId";
+			auto it = person.find(key);
+			values.push_back(ToValue(it == person.end() ? nullptr : &it->second,
+			                         col.person == ListPersonPart::ID ? ListColumnType::BIGINT
+			                                                          : ListColumnType::VARCHAR));
+		}
+	} else if (col.person == ListPersonPart::ID) {
+		auto ids = fields.find(col.field);
+		if (ids != fields.end() && ids->second.is<picojson::array>()) {
+			for (auto &id : ids->second.get<picojson::array>()) {
+				values.push_back(ToValue(&id, ListColumnType::BIGINT));
+			}
+		} else if (ids != fields.end()) {
+			values.push_back(ToValue(&ids->second, ListColumnType::BIGINT));
+		}
+	} else {
+		return Value(type); // looked up by ListScan
+	}
+	if (multi) {
+		return values.empty() ? Value(type) : Value::LIST(element, std::move(values));
+	}
+	return values.empty() ? Value(type) : values[0].DefaultCastAs(type);
+}
+
 vector<vector<Value>> RowsOf(const vector<picojson::object> &items, const vector<ListOutputColumn> &plan) {
 	vector<vector<Value>> rows;
 	rows.reserve(items.size());
@@ -264,6 +315,10 @@ vector<vector<Value>> RowsOf(const vector<picojson::object> &items, const vector
 		vector<Value> row;
 		row.reserve(plan.size());
 		for (auto &col : plan) {
+			if (col.person != ListPersonPart::NONE) {
+				row.push_back(PersonValue(fields, col));
+				continue;
+			}
 			auto it = fields.find(col.field);
 			row.push_back(ToValue(it == fields.end() ? nullptr : &it->second, col.type));
 		}
@@ -402,8 +457,17 @@ unique_ptr<FunctionData> ListBind(ClientContext &context, TableFunctionBindInput
 		// when it is selected explicitly (by default Graph sends <name>LookupId
 		// alone -- found live).
 		string select;
+		std::set<string> selected;
 		for (auto &col : plan) {
-			select += (select.empty() ? "" : ",") + EncodeWorkbookName(col.field);
+			// Several people may come only as <internal>: [{LookupId,
+			// LookupValue, Email}], so it is asked for too.
+			const bool multi_person = col.person != ListPersonPart::NONE && col.type != ListColumnType::BIGINT &&
+			                          col.type != ListColumnType::VARCHAR;
+			for (auto &field : {col.field, multi_person ? col.person_field : string()}) {
+				if (!field.empty() && selected.insert(field).second) {
+					select += (select.empty() ? "" : ",") + EncodeWorkbookName(field);
+				}
+			}
 		}
 		const auto page_size = ListPageSize(context);
 		auto data = make_uniq<ListBindData>();
@@ -634,17 +698,118 @@ InsertionOrderPreservingMap<string> ListToString(TableFunctionToStringInput &inp
 	return result;
 }
 
+//! The id of the site's User Information List, or "" if it cannot be read.
+//! Not by its title: it is hidden, Graph answers lists/User Information List
+//! with 404 (live CI, 2026-11-03), and the title is in the site's language.
+//! It is the system list at _catalogs/users; system lists are listed only
+//! when `system` is selected.
+string UserListId(GraphClient &client, const string &site, const string &what) {
+	try {
+		string next = "/v1.0" + site + "/lists?$select=id,webUrl,system&$top=999";
+		for (int pages = 0; !next.empty() && pages < 50; pages++) {
+			picojson::value holder;
+			const auto &page = AsObject(client.GraphGet(next, what), what, holder);
+			auto values = page.find("value");
+			if (values != page.end() && values->second.is<picojson::array>()) {
+				for (auto &v : values->second.get<picojson::array>()) {
+					if (v.is<picojson::object>() &&
+					    StringUtil::EndsWith(StringUtil::Lower(StringField(v.get<picojson::object>(), "webUrl")),
+					                         "/_catalogs/users")) {
+						return StringField(v.get<picojson::object>(), "id");
+					}
+				}
+			}
+			auto link = page.find("@odata.nextLink");
+			next = (link != page.end() && link->second.is<string>()) ? GraphPathOfLink(link->second.get<string>())
+			                                                         : string();
+		}
+	} catch (std::exception &) {
+	}
+	return string();
+}
+
+//! A person's name and email in the site's User Information List.
+struct PersonInfo {
+	Value name;
+	Value email;
+};
+
+//! Look the people up in the User Information List of the list's site, in
+//! $batch calls of 20. Best effort: a person not found (removed from the
+//! site's list) or a refused call leaves their name and email NULL.
+unordered_map<int64_t, PersonInfo> ResolvePeople(GraphClient &client, const ListBindData &data,
+                                                 const vector<int64_t> &ids) {
+	unordered_map<int64_t, PersonInfo> people;
+	// "/v1.0/sites/{site}/lists/{id}" -> "/sites/{site}"; $batch urls are relative to /v1.0.
+	const auto site = data.base.substr(5, data.base.find("/lists/") - 5);
+	const auto users = UserListId(client, site, data.what);
+	if (users.empty()) {
+		return people;
+	}
+	for (idx_t start = 0; start < ids.size(); start += kPeoplePerBatch) {
+		picojson::array requests;
+		for (idx_t i = start; i < ids.size() && i < start + kPeoplePerBatch; i++) {
+			picojson::object r;
+			r["id"] = picojson::value(std::to_string(ids[i]));
+			r["method"] = picojson::value("GET");
+			r["url"] = picojson::value(site + "/lists/" + users + "/items/" + std::to_string(ids[i]) +
+			                           "?$select=id&$expand=fields($select=Title,EMail)");
+			requests.emplace_back(r);
+		}
+		picojson::object batch;
+		batch["requests"] = picojson::value(requests);
+		picojson::value holder;
+		try {
+			const auto &reply = AsObject(
+			    client.GraphSend("POST", "/v1.0/$batch", picojson::value(batch).serialize(), data.what, true),
+			    data.what, holder);
+			auto responses = reply.find("responses");
+			if (responses == reply.end() || !responses->second.is<picojson::array>()) {
+				continue;
+			}
+			for (auto &resp : responses->second.get<picojson::array>()) {
+				if (!resp.is<picojson::object>()) {
+					continue;
+				}
+				auto &o = resp.get<picojson::object>();
+				auto body = o.find("body");
+				if (body == o.end() || !body->second.is<picojson::object>()) {
+					continue;
+				}
+				auto fields = body->second.get<picojson::object>().find("fields");
+				if (fields == body->second.get<picojson::object>().end() || !fields->second.is<picojson::object>()) {
+					continue;
+				}
+				auto &f = fields->second.get<picojson::object>();
+				auto title = StringField(f, "Title");
+				auto email = StringField(f, "EMail");
+				people[std::stoll(StringField(o, "id"))] = {title.empty() ? Value() : Value(title),
+				                                             email.empty() ? Value() : Value(email)};
+			}
+		} catch (std::exception &) {
+			// Names are a convenience; the ids are in the result either way.
+		}
+	}
+	return people;
+}
+
 struct CursorState : public GlobalTableFunctionState {
 	idx_t cursor = 0;
 	//! The rows of a deferred read (ListBindData::deferred).
 	vector<vector<Value>> rows;
+	//! Projection pushdown: the plan column of each output column.
+	vector<column_t> column_ids;
+	//! For a person's name or email column: the plan index of its id column.
+	unordered_map<idx_t, idx_t> id_column;
+	unordered_map<int64_t, PersonInfo> people;
 };
 
 unique_ptr<GlobalTableFunctionState> CursorInit(ClientContext &, TableFunctionInitInput &input) {
 	auto state = make_uniq<CursorState>();
 	auto &data = input.bind_data->Cast<ListBindData>();
+	state->column_ids = input.column_ids;
+	GraphClient client(data.auth);
 	if (data.deferred) {
-		GraphClient client(data.auth);
 		vector<picojson::object> items;
 		if (data.filter.empty()) {
 			items = FetchItems(client, data.base, data.select, data.page_size, "", data.what);
@@ -659,7 +824,71 @@ unique_ptr<GlobalTableFunctionState> CursorInit(ClientContext &, TableFunctionIn
 		}
 		state->rows = RowsOf(items, data.plan);
 	}
+	// People are looked up only when a name or email column is read.
+	for (auto c : state->column_ids) {
+		if (c >= data.plan.size() || (data.plan[c].person != ListPersonPart::NAME &&
+		                              data.plan[c].person != ListPersonPart::EMAIL)) {
+			continue;
+		}
+		for (idx_t i = 0; i < data.plan.size(); i++) {
+			if (data.plan[i].person == ListPersonPart::ID && data.plan[i].field == data.plan[c].field) {
+				state->id_column[c] = i;
+			}
+		}
+	}
+	if (!state->id_column.empty()) {
+		std::set<int64_t> ids;
+		auto &rows = data.deferred ? state->rows : data.rows;
+		for (auto &row : rows) {
+			for (auto &named : state->id_column) {
+				if (!row[named.first].IsNull()) {
+					continue; // Graph sent the name with the item
+				}
+				auto &id = row[named.second];
+				if (id.IsNull()) {
+					continue;
+				}
+				if (id.type().id() == LogicalTypeId::LIST) {
+					for (auto &e : ListValue::GetChildren(id)) {
+						if (!e.IsNull()) {
+							ids.insert(e.GetValue<int64_t>());
+						}
+					}
+				} else {
+					ids.insert(id.GetValue<int64_t>());
+				}
+			}
+		}
+		state->people = ResolvePeople(client, data, vector<int64_t>(ids.begin(), ids.end()));
+	}
 	return std::move(state);
+}
+
+//! A person's name or email, looked up by the id(s) in the row.
+Value LookedUp(const CursorState &state, const ListOutputColumn &col, const Value &id) {
+	const auto type = ToLogicalType(col.type);
+	auto one = [&](const Value &v) {
+		if (v.IsNull()) {
+			return Value(LogicalType::VARCHAR);
+		}
+		auto it = state.people.find(v.GetValue<int64_t>());
+		if (it == state.people.end()) {
+			return Value(LogicalType::VARCHAR);
+		}
+		const auto &found = col.person == ListPersonPart::NAME ? it->second.name : it->second.email;
+		return found.IsNull() ? Value(LogicalType::VARCHAR) : found;
+	};
+	if (id.IsNull()) {
+		return Value(type);
+	}
+	if (id.type().id() != LogicalTypeId::LIST) {
+		return one(id);
+	}
+	vector<Value> out;
+	for (auto &e : ListValue::GetChildren(id)) {
+		out.push_back(one(e));
+	}
+	return Value::LIST(LogicalType::VARCHAR, std::move(out));
 }
 
 void ListScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
@@ -669,8 +898,18 @@ void ListScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	idx_t out = 0;
 	while (state.cursor < rows.size() && out < STANDARD_VECTOR_SIZE) {
 		auto &row = rows[state.cursor];
-		for (idx_t c = 0; c < row.size(); c++) {
-			output.SetValue(c, out, row[c]);
+		for (idx_t c = 0; c < state.column_ids.size(); c++) {
+			const auto col = state.column_ids[c];
+			if (col >= row.size()) {
+				output.SetValue(c, out, Value(output.data[c].GetType())); // the row id: none
+				continue;
+			}
+			auto named = state.id_column.find(col);
+			if (named != state.id_column.end() && row[col].IsNull()) {
+				output.SetValue(c, out, LookedUp(state, data.plan[col], row[named->second]));
+			} else {
+				output.SetValue(c, out, row[col]);
+			}
 		}
 		state.cursor++;
 		out++;
@@ -960,6 +1199,7 @@ BoundStatement ListCopyPlan(Binder &binder, CopyStatement &stmt) {
 void RegisterListFunctions(ExtensionLoader &loader) {
 	TableFunction fn("read_sharepoint_list", {LogicalType::VARCHAR}, ListScan, ListBind, CursorInit);
 	fn.pushdown_complex_filter = ListPushdownFilter;
+	fn.projection_pushdown = true;
 	fn.to_string = ListToString;
 	duckdb_compat::NameParameters(fn, {"list"});
 	duckdb_compat::AddNamedParameter(fn, "site", LogicalType::VARCHAR);

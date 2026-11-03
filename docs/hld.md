@@ -738,9 +738,16 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- /sites/Sales o
   column is midnight in the *site's* time zone, so it can read as the evening
   before -- not corrected yet), choice -> VARCHAR or VARCHAR[], hyperlink ->
   the URL, calculated -> by its output type, other -> VARCHAR (JSON text).
-  Lookup -> the display value plus `<name>_id` (`<internal>LookupId`); person
-  -> only `<name>_id`, since Graph gives a person's id in the user information
-  list, not a name. A field missing from an item (Graph omits empty ones) is
+  Lookup -> the display value plus `<name>_id` (`<internal>LookupId`). Person
+  (#63) -> `<name>`, `<name>_email`, `<name>_id`, lists for
+  `allowMultipleSelection`; Author/Editor -> `created_by*` / `modified_by*`
+  after `modified`. Graph gives a person's id in the site's User Information
+  List; for several people it may instead send `<internal>` as
+  `[{LookupId, LookupValue, Email}]`, which is selected and used when
+  present. Otherwise names and emails are looked up in that list
+  (`lists/User Information List/items/{id}`, `$batch` of 20), at init and
+  only for the columns read (projection pushdown). Best effort: a person
+  missing from the list, or a refused call, leaves the name NULL. A field missing from an item (Graph omits empty ones) is
   NULL.
 
 ### 10.1 Writing: `COPY ... TO '<list>' (FORMAT sharepoint_list)`

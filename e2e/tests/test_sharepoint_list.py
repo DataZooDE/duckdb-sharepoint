@@ -121,12 +121,15 @@ def test_list_types_paging_and_lookup(fixture_lists, sql, secret_sql):
     # From the end: CREATE SECRET and CALL print a "true" line each before these.
     out = out[-7:]
     pages = int(out[0])
-    # drive -> site, list, columns, then one call per page
-    # (plus possibly one empty last page when ITEMS is a multiple of PAGE)
-    assert 3 + math.ceil(ITEMS / PAGE) <= pages <= 4 + math.ceil(ITEMS / PAGE), f"{pages} Graph calls"
+    # drive -> site, list, columns, then one call per page (plus possibly one
+    # empty last page when ITEMS is a multiple of PAGE), then for the names of
+    # Created By / Modified By (#63) the site's lists (to find its User
+    # Information List) and one $batch (the app, at most a few people).
+    assert 5 + math.ceil(ITEMS / PAGE) <= pages <= 6 + math.ceil(ITEMS / PAGE), f"{pages} Graph calls"
     assert out[1] == ("id BIGINT, Title VARCHAR, Amount DOUBLE, Price DECIMAL(18,4), Done BOOLEAN, "
                       "Due TIMESTAMP, Status VARCHAR, Customer VARCHAR, Customer_id BIGINT, "
-                      "created TIMESTAMP, modified TIMESTAMP")
+                      "created TIMESTAMP, modified TIMESTAMP, created_by VARCHAR, created_by_email VARCHAR, "
+                      "created_by_id BIGINT, modified_by VARCHAR, modified_by_email VARCHAR, modified_by_id BIGINT")
     last_due = dt.datetime(2026, 1, 1) + dt.timedelta(hours=ITEMS - 1)
     assert out[2] == (f"{ITEMS}|{sum(i * 0.5 for i in range(ITEMS))}|"
                       f"{sum(round(i * 1.25, 2) for i in range(ITEMS)):.4f}|{ITEMS // 2}|"
@@ -197,5 +200,50 @@ def test_copy_creates_and_updates_items(graph, fixture_lists, sql, secret_sql):
 
         out = sql(f"{secret_sql} COPY (SELECT 1 AS nope) TO '{name}' (FORMAT sharepoint_list);", expect_error=True)
         assert 'has no column "nope"' in out
+    finally:
+        graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}")
+
+
+def test_people_by_name_email_and_id(graph, fixture_lists, sql, secret_sql):
+    """Person columns (#63): one person and several, each as name, email and
+    id, looked up in the site's User Information List; Created By / Modified
+    By the same way. Names are looked up only when they are read."""
+    site, _, _ = fixture_lists
+    lists = _ok(graph._req("GET", f"{GRAPH}/sites/{site}/lists?$select=id,webUrl,system&$top=999"), "lists")["value"]
+    uil = [x["id"] for x in lists if x.get("webUrl", "").lower().endswith("/_catalogs/users")]
+    assert uil, "no User Information List (_catalogs/users) among the site's lists"
+    users = _ok(graph._req("GET", f"{GRAPH}/sites/{site}/lists/{uil[0]}/items"
+                                  "?$top=200&$expand=fields($select=Title,EMail)"), "user information list")["value"]
+    people = [(int(u["id"]), u["fields"]["Title"], u["fields"].get("EMail"))
+              for u in users if u["fields"].get("EMail") and u["fields"].get("Title")][:2]
+    if len(people) < 2:
+        pytest.skip("the test site's User Information List has fewer than two people with an email")
+    import uuid
+    name = f"_duckdb_sharepoint_e2e_people_{uuid.uuid4().hex[:8]}"
+    created = _ok(graph._req("POST", f"{GRAPH}/sites/{site}/lists", json={
+        "displayName": name, "list": {"template": "genericList"},
+        "columns": [{"name": "Owner", "personOrGroup": {}},
+                    {"name": "Team", "personOrGroup": {"allowMultipleSelection": True}}]}), "create people list")["id"]
+    try:
+        _ok(graph._req("POST", f"{GRAPH}/sites/{site}/lists/{created}/items", json={"fields": {
+            "Title": "row", "OwnerLookupId": str(people[0][0]),
+            "TeamLookupId@odata.type": "Collection(Edm.String)",
+            "TeamLookupId": [str(p[0]) for p in people]}}), "create item")
+        out = sql(f"""{secret_sql}
+            SELECT string_agg(column_name || ' ' || column_type, ', ')
+            FROM (DESCRIBE SELECT Owner, Owner_email, Owner_id, Team, Team_email, Team_id FROM read_sharepoint_list('{name}'));
+            SELECT Owner, Owner_email, Owner_id, Team, Team_email, Team_id,
+                   created_by IS NOT NULL, modified_by_id IS NOT NULL
+            FROM read_sharepoint_list('{name}');
+            CALL sharepoint_reset_stats();
+            SELECT count(*), max(Owner_id) FROM read_sharepoint_list('{name}');
+            SELECT (SELECT value FROM sharepoint_stats() WHERE metric = 'list');
+        """).splitlines()
+        assert out[-5] == ("Owner VARCHAR, Owner_email VARCHAR, Owner_id BIGINT, Team VARCHAR[], "
+                           "Team_email VARCHAR[], Team_id BIGINT[]")
+        (i0, n0, e0), (i1, n1, e1) = people
+        assert out[-4] == f"{n0}|{e0}|{i0}|[{n0}, {n1}]|[{e0}, {e1}]|[{i0}, {i1}]|true|true"
+        # No name or email read: no lookup (drive -> site, list, columns, one page).
+        assert out[-1] == "4", f"{out[-1]} list calls"
     finally:
         graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}")

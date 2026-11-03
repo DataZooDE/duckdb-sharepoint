@@ -83,8 +83,9 @@ SRC = f"read_sharepoint_list('{BIG}')"
 def test_indexed_predicates_are_pushed_down(big_list, sql, secret_sql, where, keep):
     pages, result = _pages_and_result(sql, secret_sql, f"SELECT * FROM {SRC} WHERE {where}")
     assert result == _expected(keep)
-    # drive -> site, list, columns, then one page: not the 6 of a full read.
-    assert pages <= 4, f"{pages} list calls -- the filter was not pushed down"
+    # drive -> site, list, columns, one page, then the site's lists and one
+    # $batch for the people's names: not the 6 pages of a full read.
+    assert pages <= 6, f"{pages} list calls -- the filter was not pushed down"
 
 
 def test_unpushed_predicates_give_the_same_rows(big_list, sql, secret_sql):
@@ -93,7 +94,7 @@ def test_unpushed_predicates_give_the_same_rows(big_list, sql, secret_sql):
     DuckDB filters. Same rows as the pushed form."""
     pages, result = _pages_and_result(sql, secret_sql, f"SELECT * FROM {SRC} WHERE Note = 'n0' AND Status = 'rare'")
     assert result == _expected(lambda i: i % 10 == 0 and _status(i) == "rare")
-    assert pages <= 4  # Status is still pushed; Note is filtered locally
+    assert pages <= 6  # Status is still pushed; Note is filtered locally
 
     pages, result = _pages_and_result(sql, secret_sql, f"SELECT * FROM {SRC} WHERE lower(Status) = 'rare'")
     assert result == _expected(lambda i: _status(i) == "rare")

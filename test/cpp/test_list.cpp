@@ -28,11 +28,16 @@ ListColumnDef Col(const std::string &name, const std::string &display, ListFacet
 std::string Describe(const std::vector<ListOutputColumn> &cols) {
 	std::string out;
 	for (auto &c : cols) {
-		static const char *types[] = {"VARCHAR", "VARCHAR[]", "DOUBLE", "DECIMAL", "BOOLEAN", "TIMESTAMP", "BIGINT"};
+		static const char *types[] = {"VARCHAR", "VARCHAR[]", "DOUBLE", "DECIMAL", "BOOLEAN", "TIMESTAMP", "BIGINT", "BIGINT[]"};
 		out += c.name + ":" + types[static_cast<int>(c.type)] + "<-" + c.field + (c.may_be_multi ? "*" : "") + " ";
 	}
 	return out;
 }
+
+//! Created By / Modified By, after created and modified on every list.
+const std::string kPeople = "created_by:VARCHAR<-AuthorLookupId created_by_email:VARCHAR<-AuthorLookupId "
+                            "created_by_id:BIGINT<-AuthorLookupId modified_by:VARCHAR<-EditorLookupId "
+                            "modified_by_email:VARCHAR<-EditorLookupId modified_by_id:BIGINT<-EditorLookupId ";
 
 } // namespace
 
@@ -50,7 +55,8 @@ TEST_CASE("PlanListColumns: system columns kept, plumbing left out", "[list]") {
 	};
 	REQUIRE(Describe(PlanListColumns(defs)) ==
 	        "id:BIGINT<-id Title:VARCHAR<-Title Amount:DOUBLE<-Amount created:TIMESTAMP<-Created "
-	        "modified:TIMESTAMP<-Modified ");
+	        "modified:TIMESTAMP<-Modified " +
+	            kPeople);
 }
 
 TEST_CASE("PlanListColumns: one type per facet", "[list]") {
@@ -65,7 +71,8 @@ TEST_CASE("PlanListColumns: one type per facet", "[list]") {
 	REQUIRE(Describe(PlanListColumns(defs)) ==
 	        "id:BIGINT<-id Price:DECIMAL<-Price Done:BOOLEAN<-Done Due Date:TIMESTAMP<-Due Status:VARCHAR<-Status* "
 	        "Link:VARCHAR<-Link Margin:DOUBLE<-Margin Where:VARCHAR<-Geo created:TIMESTAMP<-Created "
-	        "modified:TIMESTAMP<-Modified ");
+	        "modified:TIMESTAMP<-Modified " +
+	            kPeople);
 }
 
 TEST_CASE("PlanListColumns: lookups and people by id", "[list]") {
@@ -75,7 +82,40 @@ TEST_CASE("PlanListColumns: lookups and people by id", "[list]") {
 	};
 	REQUIRE(Describe(PlanListColumns(defs)) ==
 	        "id:BIGINT<-id Customer:VARCHAR<-Customer Customer_id:BIGINT<-CustomerLookupId "
-	        "Owner_id:BIGINT<-OwnerLookupId created:TIMESTAMP<-Created modified:TIMESTAMP<-Modified ");
+	        "Owner:VARCHAR<-OwnerLookupId Owner_email:VARCHAR<-OwnerLookupId Owner_id:BIGINT<-OwnerLookupId "
+	        "created:TIMESTAMP<-Created modified:TIMESTAMP<-Modified " +
+	            kPeople);
+}
+
+TEST_CASE("PlanListColumns: a person is name, email and id; several people are lists", "[list][people]") {
+	auto team = Col("Team", "Team", ListFacet::PERSON);
+	team.multi = true;
+	auto owner = Col("Owner", "Owner", ListFacet::PERSON);
+	owner.indexed = true;
+	auto plan = PlanListColumns({owner, team, Col("created_by", "created_by", ListFacet::TEXT)});
+	REQUIRE(Describe(plan) == "id:BIGINT<-id Owner:VARCHAR<-OwnerLookupId Owner_email:VARCHAR<-OwnerLookupId "
+	                          "Owner_id:BIGINT<-OwnerLookupId Team:VARCHAR[]<-TeamLookupId "
+	                          "Team_email:VARCHAR[]<-TeamLookupId Team_id:BIGINT[]<-TeamLookupId "
+	                          "created_by_2:VARCHAR<-created_by created:TIMESTAMP<-Created "
+	                          "modified:TIMESTAMP<-Modified " +
+	                              kPeople);
+	REQUIRE(plan[1].person == ListPersonPart::NAME);
+	REQUIRE(plan[1].person_field == "Owner");
+	REQUIRE(plan[2].person == ListPersonPart::EMAIL);
+	REQUIRE(plan[3].person == ListPersonPart::ID);
+	REQUIRE(plan[3].filter == ListFilterKind::NUMBER); // an indexed single person, by id
+	REQUIRE(plan[6].filter == ListFilterKind::NONE);   // several people: not pushed down
+
+	// Written back as read: names, emails and the system people are skipped,
+	// a person is set through its _id.
+	std::vector<ListWriteColumn> out;
+	std::string error;
+	REQUIRE(PlanListWrite({"Owner", "Owner_email", "Owner_id", "created_by", "modified_by_id"}, plan, out, error));
+	REQUIRE(out[0].target == ListWriteTarget::SKIP);
+	REQUIRE(out[1].target == ListWriteTarget::SKIP);
+	REQUIRE((out[2].target == ListWriteTarget::FIELD && out[2].field == "OwnerLookupId"));
+	REQUIRE(out[3].target == ListWriteTarget::SKIP);
+	REQUIRE(out[4].target == ListWriteTarget::SKIP);
 }
 
 TEST_CASE("PlanListColumns: names unique case-insensitively", "[list]") {
@@ -87,7 +127,8 @@ TEST_CASE("PlanListColumns: names unique case-insensitively", "[list]") {
 	};
 	REQUIRE(Describe(PlanListColumns(defs)) ==
 	        "id:BIGINT<-id Title:VARCHAR<-Title title_2:VARCHAR<-Title0 ID_2:VARCHAR<-ID0 "
-	        "Created_2:VARCHAR<-Created0 created:TIMESTAMP<-Created modified:TIMESTAMP<-Modified ");
+	        "Created_2:VARCHAR<-Created0 created:TIMESTAMP<-Created modified:TIMESTAMP<-Modified " +
+	            kPeople);
 }
 
 TEST_CASE("ParseIsoTimestamp", "[list]") {
@@ -196,7 +237,8 @@ TEST_CASE("PlanListColumns: only indexed columns of a safe kind are filterable",
 		out += c.name + "=" + kinds[static_cast<int>(c.filter)] + " ";
 	}
 	REQUIRE(out == "id=- Title=text Note=- Amount=number Price=number Due=timestamp Done=- Customer=- "
-	               "Customer_id=number Calc=- created=- modified=timestamp ");
+	               "Customer_id=number Calc=- created=- modified=timestamp created_by=- created_by_email=- "
+	               "created_by_id=- modified_by=- modified_by_email=- modified_by_id=- ");
 }
 
 TEST_CASE("ODataClause: text equality, IN and prefix; quotes doubled", "[list][pushdown]") {
@@ -269,7 +311,8 @@ TEST_CASE("PlanListColumns: a drop-down or radio choice is single-valued and fil
 	auto multi = Indexed(Col("Tags", "Tags", ListFacet::CHOICE)); // check boxes, or unknown
 	auto plan = PlanListColumns({single, multi});
 	REQUIRE(Describe(plan) == "id:BIGINT<-id Status:VARCHAR<-Status Tags:VARCHAR<-Tags* created:TIMESTAMP<-Created "
-	                          "modified:TIMESTAMP<-Modified ");
+	                          "modified:TIMESTAMP<-Modified " +
+	            kPeople);
 	REQUIRE(plan[1].filter == ListFilterKind::TEXT);
 	REQUIRE(plan[2].filter == ListFilterKind::NONE);
 }

@@ -46,14 +46,20 @@ struct ListColumnDef {
 	//! CHOICE shown as a drop-down or radio buttons: one value at most. A
 	//! multi-select (check boxes) or unknown display may hold several.
 	bool single_choice = false;
+	//! PERSON allowing several people (allowMultipleSelection).
+	bool multi = false;
 };
 
 //! How a WHERE predicate on a column may become Graph's $filter (#61):
 //! NONE, or the kind of literal it compares with.
 enum class ListFilterKind { NONE, TEXT, NUMBER, TIMESTAMP };
 
+//! Which part of a person a column is (#63): Graph gives the person's id in
+//! the site's User Information List; the name and email are looked up there.
+enum class ListPersonPart { NONE, NAME, EMAIL, ID };
+
 //! The DuckDB type a result column becomes.
-enum class ListColumnType { VARCHAR, VARCHAR_LIST, DOUBLE, DECIMAL, BOOLEAN, TIMESTAMP, BIGINT };
+enum class ListColumnType { VARCHAR, VARCHAR_LIST, DOUBLE, DECIMAL, BOOLEAN, TIMESTAMP, BIGINT, BIGINT_LIST };
 
 struct ListOutputColumn {
 	std::string name;  // result column name (unique, case-insensitively)
@@ -66,6 +72,12 @@ struct ListOutputColumn {
 	//! Set for an indexed text, choice, number, currency or date column, a
 	//! lookup's or person's id, and created/modified when indexed.
 	ListFilterKind filter = ListFilterKind::NONE;
+	//! A person's name, email or id; `field` is then `<internal>LookupId` and
+	//! `person_field` `<internal>` (where Graph may also send the people).
+	ListPersonPart person = ListPersonPart::NONE;
+	std::string person_field;
+	//! Never written: Graph sets it, or it is written through another column.
+	bool read_only = false;
 };
 
 //! The result columns for a list:
@@ -80,8 +92,10 @@ struct ListOutputColumn {
 //!    multi-valued), hyperlink -> VARCHAR (the URL), calculated -> by its
 //!    output type, anything else -> VARCHAR;
 //!  - lookup -> its display value (VARCHAR) plus `<name>_id` (BIGINT, field
-//!    `<internal>LookupId`); person -> only `<name>_id`, since Graph gives a
-//!    person's id, not their name.
+//!    `<internal>LookupId`); person -> `<name>` and `<name>_email` (VARCHAR)
+//!    and `<name>_id` (BIGINT), all lists for a column of several people;
+//!  - after created/modified: Created By and Modified By as `created_by`,
+//!    `created_by_email`, `created_by_id` and the same for `modified_by`.
 //! Names repeated (case-insensitively) get "_2", "_3".
 std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &defs);
 
