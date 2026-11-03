@@ -108,6 +108,12 @@ std::string FormatGraphError(const std::string &op, int http_status, const std::
 		}
 		out += ": " + msg;
 	}
+	if (kind == GraphErrorKind::FORBIDDEN) {
+		// The one 403 users can fix themselves. With Sites.Selected, a site the
+		// app was not granted answers exactly like a missing permission.
+		out += " -- the credentials lack access here: grant the Graph permission (with admin consent), or, for an "
+		       "app with Sites.Selected, grant it this site (README: Least privilege)";
+	}
 	return out;
 }
 
