@@ -217,6 +217,19 @@ TO 'Orders' (FORMAT sharepoint_list);
 set through `<name>_id`), so a list read with `read_sharepoint_list` can be
 changed and written back as it is.
 
+### What's in a library: `read_sharepoint_files`
+
+```sql
+SELECT name, path, size, modified, modified_by, "Department", "Status"
+FROM read_sharepoint_files('sharepoint://Finance/**/*.xlsx');
+```
+
+One row per file the path or glob matches (the same glob syntax as
+`sharepoint://`): `path`, `name`, `size`, `created`, `modified`, `created_by`,
+`modified_by` (and their `_email`), `content_type`, `id` and `web_url`, then
+the library's own metadata columns, typed as `read_sharepoint_list` types a
+list's.
+
 ## Search
 
 `search_sharepoint` runs Microsoft Search across the tenant's files, list
