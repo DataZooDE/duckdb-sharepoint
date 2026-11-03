@@ -877,3 +877,16 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   token (410 `resyncRequired`) is an error telling to start over.
 - Lists (`/sites/{s}/lists/{l}/items/delta`) are not done yet: they build on
   the list column plan of #79–#82.
+
+## 18. Planner and To Do (#68)
+
+- Here rather than a sibling extension: same secret, Graph client and
+  install (#52's proposal). `read_planner_tasks`: the plan by id, or by name
+  among a group's plans (app-only) or the user's (delegated); buckets by
+  name; assignees are user ids (the keys of `assignments`).
+  `read_todo_tasks`: `/me` or `/users/{u}` (app-only has no `/me`), every
+  list or one by name; To Do dates come as `dateTime` + `timeZone` (UTC by
+  default) and are read as UTC.
+- Not verified live: needs `Tasks.Read.All` for the CI app and a test plan
+  (`SHAREPOINT_PLANNER_PLAN_ID`, `SHAREPOINT_TODO_USER`).
+

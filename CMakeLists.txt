@@ -115,6 +115,7 @@ file(GLOB DUCKDB_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_vfs_functions.cpp
     src/sharepoint_excel_functions.cpp
     src/sharepoint_list_functions.cpp
+    src/sharepoint_tasks.cpp
     src/sharepoint_changes.cpp
     src/sharepoint_versions.cpp
     src/sharepoint_search_functions.cpp
