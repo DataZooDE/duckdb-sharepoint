@@ -58,7 +58,8 @@ Rules that bite:
 - Lists: `Sites.ReadWrite.All`; creating lists (only fixtures do): `Sites.Manage.All`.
 - Least privilege: `Sites.Selected` + a per-site grant
   (`POST /sites/{site-id}/permissions` with `{"roles":["write"],"grantedToIdentities":[{"application":{"id":"<app id>"}}]}`).
-  A site not granted answers HTTP 403 with a hint naming Sites.Selected.
+  Graph hides a site the app was not granted: `site '…' not found` (404 `itemNotFound`,
+  not 403); the error names Sites.Selected.
 - Delegated: `Files.ReadWrite.All Sites.ReadWrite.All offline_access`.
 
 ## Errors
@@ -68,6 +69,7 @@ Rules that bite:
 | `AADSTS7000218` | *Authentication → Allow public client flows* → Enabled (device_code / authorization_code) |
 | `AADSTS50173`, `invalid_grant` | refresh token expired: recreate the secret without `REFRESH_TOKEN` |
 | HTTP 403 `accessDenied` | missing permission or consent, or (Sites.Selected) the site is not granted |
+| `site '…' not found` | wrong site name, or (Sites.Selected) the site is not granted |
 
 Settings: `sharepoint_graph_endpoint` / `sharepoint_login_endpoint` (national clouds; only
 Microsoft hosts accepted), `sharepoint_block_size_bytes`, `sharepoint_upload_chunk_bytes`,
