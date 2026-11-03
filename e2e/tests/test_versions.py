@@ -27,11 +27,14 @@ def test_list_and_read_an_earlier_version(scratch, sql, secret_sql):
     assert earlier.startswith(f"{path}?version="), earlier
 
     out = sql(f"""{secret_sql}
-        SELECT content::VARCHAR = '{first}' FROM read_blob('{earlier}');
+        SELECT hex(content), size FROM read_blob('{earlier}');
+        SELECT size FROM sharepoint_versions('{path}') WHERE path = '{earlier}';
         SELECT sum(n) FROM read_csv('{earlier}');
         SELECT sum(n) FROM read_csv('{path}');
     """).splitlines()
-    assert out[-3:] == ["true", "3", "60"]
+    assert out[-2:] == ["3", "60"]
+    # Byte for byte (shown in hex, with the sizes, when it is not).
+    assert out[-4] == f"{first.encode().hex().upper()}|{len(first)}", (out[-4], "version size", out[-3])
 
     out = sql(f"{secret_sql} SELECT write_blob('{earlier}', 'x'::BLOB);", expect_error=True)
     assert "read-only" in out
