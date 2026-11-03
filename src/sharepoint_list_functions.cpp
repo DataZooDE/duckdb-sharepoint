@@ -111,6 +111,8 @@ ListColumnDef ParseColumnDef(const picojson::object &o) {
 		auto it = o.find(facet);
 		if (it != o.end() && it->second.is<picojson::object>()) {
 			def.facet = FacetOf(facet);
+			// dateTime and calculated both say "format": "dateOnly" | "dateTime".
+			def.date_only = StringField(it->second.get<picojson::object>(), "format") == "dateOnly";
 			if (def.facet == ListFacet::CALCULATED) {
 				auto output = StringField(it->second.get<picojson::object>(), "outputType");
 				def.calculated_output = output == "number"     ? ListFacet::NUMBER
@@ -136,6 +138,8 @@ LogicalType ToLogicalType(ListColumnType t) {
 		return LogicalType::BOOLEAN;
 	case ListColumnType::TIMESTAMP:
 		return LogicalType::TIMESTAMP;
+	case ListColumnType::DATE:
+		return LogicalType::DATE;
 	case ListColumnType::BIGINT:
 		return LogicalType::BIGINT;
 	default:
@@ -195,6 +199,13 @@ Value ToValue(const picojson::value *v, ListColumnType t) {
 		int64_t us;
 		if (v->is<string>() && ParseIsoTimestamp(v->get<string>(), us)) {
 			return Value::TIMESTAMP(timestamp_t(us));
+		}
+		return Value(type);
+	}
+	case ListColumnType::DATE: {
+		int64_t us;
+		if (v->is<string>() && ParseIsoTimestamp(v->get<string>(), us)) {
+			return Value::DATE(date_t(DateOnlyDays(us)));
 		}
 		return Value(type);
 	}
@@ -661,7 +672,9 @@ void ListWriteSink(ExecutionContext &, FunctionData &, GlobalFunctionData &gstat
 					}
 					continue;
 				}
-				auto json = ToJsonField(v, col.field);
+				auto json = col.date_only && !v.IsNull()
+				                ? picojson::value(FormatDateOnly(v.DefaultCastAs(LogicalType::DATE).GetValue<date_t>().days))
+				                : ToJsonField(v, col.field);
 				if (json.is<picojson::array>()) {
 					// A multi-choice value: Graph needs the collection's type.
 					p.fields[col.field + "@odata.type"] = picojson::value("Collection(Edm.String)");

@@ -41,10 +41,12 @@ struct ListColumnDef {
 	ListFacet calculated_output = ListFacet::TEXT;
 	bool hidden = false;
 	bool read_only = false;
+	//! DATETIME (or a calculated date) with format dateOnly: a DATE.
+	bool date_only = false;
 };
 
 //! The DuckDB type a result column becomes.
-enum class ListColumnType { VARCHAR, VARCHAR_LIST, DOUBLE, DECIMAL, BOOLEAN, TIMESTAMP, BIGINT };
+enum class ListColumnType { VARCHAR, VARCHAR_LIST, DOUBLE, DECIMAL, BOOLEAN, TIMESTAMP, BIGINT, DATE };
 
 struct ListOutputColumn {
 	std::string name;  // result column name (unique, case-insensitively)
@@ -64,7 +66,7 @@ struct ListOutputColumn {
 //!    out: list plumbing, not data. The built-in Title keeps the name `Title`
 //!    (its display name is localised, e.g. "Titel");
 //!  - text -> VARCHAR, number -> DOUBLE, currency -> DECIMAL, boolean ->
-//!    BOOLEAN, dateTime -> TIMESTAMP, choice -> VARCHAR (VARCHAR[] when
+//!    BOOLEAN, dateTime -> TIMESTAMP (DATE when date-only), choice -> VARCHAR (VARCHAR[] when
 //!    multi-valued), hyperlink -> VARCHAR (the URL), calculated -> by its
 //!    output type, anything else -> VARCHAR;
 //!  - lookup -> its display value (VARCHAR) plus `<name>_id` (BIGINT, field
@@ -81,12 +83,24 @@ bool ParseIsoTimestamp(const std::string &text, int64_t &micros_since_epoch);
 //! (".250000" added when there is a fraction).
 std::string FormatIsoTimestamp(int64_t micros_since_epoch);
 
+//! The date a date-only value stands for. Graph sends the site's local
+//! midnight as UTC, and v1.0 does not say the site's time zone; for every
+//! offset from UTC-10:00 to UTC+13:30, local midnight falls before 10:30 UTC
+//! on that date or from 10:30 UTC on the day before. (Not right for UTC-11,
+//! UTC-12, UTC+13:45 and UTC+14.) Days since 1970-01-01.
+int32_t DateOnlyDays(int64_t micros_since_epoch);
+
+//! What to send for a date-only value: 10:15 UTC on that date, which is on
+//! that date in every time zone from UTC-10:00 to UTC+13:30.
+std::string FormatDateOnly(int32_t days_since_epoch);
+
 //! Where one COPY column goes when writing items.
 enum class ListWriteTarget { FIELD, ID, SKIP };
 
 struct ListWriteColumn {
 	ListWriteTarget target = ListWriteTarget::SKIP;
 	std::string field; // FIELD: the key in the item's fields
+	bool date_only = false; // FIELD: a date-only column (FormatDateOnly)
 };
 
 //! Map COPY column names onto a list's columns (as PlanListColumns names them,
