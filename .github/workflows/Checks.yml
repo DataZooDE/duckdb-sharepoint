@@ -311,6 +311,11 @@ jobs:
           SHAREPOINT_DELEGATED_CLIENT_ID: ${{ secrets.SHAREPOINT_DELEGATED_CLIENT_ID }}
           SHAREPOINT_USER_REFRESH_TOKEN: ${{ secrets.SHAREPOINT_USER_REFRESH_TOKEN }}
           SHAREPOINT_REQUIRE_DELEGATED: '1'
+          # Certificate auth (#71): skips until these secrets exist; then set
+          # SHAREPOINT_REQUIRE_CERTIFICATE to '1' here.
+          SHAREPOINT_CERT_CLIENT_ID: ${{ secrets.SHAREPOINT_CERT_CLIENT_ID }}
+          SHAREPOINT_CERTIFICATE_PEM: ${{ secrets.SHAREPOINT_CERTIFICATE_PEM }}
+          SHAREPOINT_CERTIFICATE_PASSWORD: ${{ secrets.SHAREPOINT_CERTIFICATE_PASSWORD }}
           # Least privilege (#70): a second app with only Sites.Selected,
           # granted the test site. Skips until these secrets exist; then set
           # SHAREPOINT_REQUIRE_SELECTED to '1' here.

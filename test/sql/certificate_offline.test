@@ -1,0 +1,35 @@
+# name: test/sql/certificate_offline.test
+# description: PROVIDER client_certificate (#71) without a tenant: what the
+#              secret needs, that the key's password is redacted, and that a
+#              file that is not a certificate is refused before any request.
+# group: [sharepoint]
+
+require sharepoint
+
+statement error
+CREATE SECRET c (TYPE sharepoint, PROVIDER client_certificate, TENANT_ID 't.onmicrosoft.com', CLIENT_ID 'x');
+----
+needs TENANT_ID, CLIENT_ID and CERTIFICATE_PATH
+
+statement ok
+CREATE SECRET c (TYPE sharepoint, PROVIDER client_certificate, TENANT_ID 't.onmicrosoft.com', CLIENT_ID 'x',
+    CERTIFICATE_PATH '__TEST_DIR__/not-a-cert.pem', CERTIFICATE_PASSWORD 'hunter2', DRIVE_ID 'b!x');
+
+query I
+SELECT secret_string LIKE '%certificate_password=redacted%' AND secret_string NOT LIKE '%hunter2%'
+FROM duckdb_secrets() WHERE name = 'c';
+----
+true
+
+statement error
+SELECT * FROM read_csv('sharepoint://a.csv');
+----
+cannot read CERTIFICATE_PATH
+
+statement ok
+COPY (SELECT 'not a certificate' AS x) TO '__TEST_DIR__/not-a-cert.pem' (FORMAT csv, HEADER false);
+
+statement error
+SELECT * FROM read_csv('sharepoint://a.csv');
+----
+no PEM certificate
