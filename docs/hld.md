@@ -552,6 +552,11 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
 - **`createSession` answers a transient HTTP 504 (`UnknownError`).** It is
   retried like a read; a duplicate session after a lost reply is harmless
   (it expires unused).
+- **A table or worksheet created in a workbook session is not at once
+  visible outside it** (2026-11-03, both seen in live CI): after
+  `tables/add` (or `worksheets/add`) and `closeSession`, a sessionless read
+  got 404 `ItemNotFound`. A COPY that creates either now polls it until it is
+  visible (bounded; the rows are written either way).
 - **A missing workbook table is a 404 `ItemNotFound`**, with the message in
   the tenant's language ("Die angeforderte Ressource ist nicht vorhanden."),
   so tests match the name we put in the message, never Graph's text.
