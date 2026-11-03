@@ -937,6 +937,10 @@ void ExcelWriteSink(ExecutionContext &context, FunctionData &bind_p, GlobalFunct
 void ExcelWriteCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
 }
 
+//! Polls for a new table to become visible outside its session (~30 s of
+//! backoff in all).
+constexpr int kMaxTableVisibleAttempts = 6;
+
 void ExcelWriteFinalize(ClientContext &context, FunctionData &bind_p, GlobalFunctionData &gstate_p) {
 	auto &bind = bind_p.Cast<ExcelWriteBindData>();
 	auto &g = gstate_p.Cast<ExcelWriteGlobalState>();
@@ -969,6 +973,22 @@ void ExcelWriteFinalize(ClientContext &context, FunctionData &bind_p, GlobalFunc
 			client.WorkbookCall("POST", g.wb.item_id, "closeSession", "{}", g.session_id,
 			                    "workbook session for '" + g.wb.path + "'", true);
 			g.session_id.clear();
+		}
+		if (g.create_table) {
+			// A table made in a session is not at once visible outside it: a
+			// read right after the COPY got 404 ItemNotFound (live CI,
+			// 2026-11-03). Wait until it is, so COPY-then-read works; the rows
+			// are written either way, so running out of patience is no error.
+			const string resource = "tables/" + EncodeWorkbookName(bind.table) + "?$select=name";
+			for (int attempt = 1; attempt <= kMaxTableVisibleAttempts; attempt++) {
+				int status = 0;
+				client.WorkbookCall("GET", g.wb.item_id, resource, string(), string(),
+				                    Quoted("table", bind.table, g.wb), true, &status);
+				if (status != 404) {
+					break;
+				}
+				SleepBeforeRetry(attempt, 0);
+			}
 		}
 	});
 }
