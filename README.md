@@ -359,8 +359,9 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
 - **Lists.**
   - No filter pushdown yet.
   - A person column gives the person's id, not their name.
-  - A date-only column comes back as midnight in the site's time zone,
-    converted to UTC.
+  - A date-only column is read as a DATE on sites from UTC-10:00 to
+    UTC+13:30. Graph doesn't say a site's time zone, so sites at UTC-11,
+    UTC-12, UTC+13:45 and UTC+14 read such dates a day off.
 
 ## Network and privacy
 
