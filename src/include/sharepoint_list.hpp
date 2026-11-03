@@ -41,7 +41,16 @@ struct ListColumnDef {
 	ListFacet calculated_output = ListFacet::TEXT;
 	bool hidden = false;
 	bool read_only = false;
+	//! Graph may filter on it: past 5,000 items, only indexed columns can be.
+	bool indexed = false;
+	//! CHOICE shown as a drop-down or radio buttons: one value at most. A
+	//! multi-select (check boxes) or unknown display may hold several.
+	bool single_choice = false;
 };
+
+//! How a WHERE predicate on a column may become Graph's $filter (#61):
+//! NONE, or the kind of literal it compares with.
+enum class ListFilterKind { NONE, TEXT, NUMBER, TIMESTAMP };
 
 //! The DuckDB type a result column becomes.
 enum class ListColumnType { VARCHAR, VARCHAR_LIST, DOUBLE, DECIMAL, BOOLEAN, TIMESTAMP, BIGINT };
@@ -54,6 +63,9 @@ struct ListOutputColumn {
 	bool may_be_multi = false;
 	//! A lookup's display value: read-only (it is written through `<name>_id`).
 	bool lookup_value = false;
+	//! Set for an indexed text, choice, number, currency or date column, a
+	//! lookup's or person's id, and created/modified when indexed.
+	ListFilterKind filter = ListFilterKind::NONE;
 };
 
 //! The result columns for a list:
@@ -80,6 +92,31 @@ bool ParseIsoTimestamp(const std::string &text, int64_t &micros_since_epoch);
 //! Microseconds since 1970-01-01 UTC as Graph writes them: "2026-01-31T08:15:00Z"
 //! (".250000" added when there is a fraction).
 std::string FormatIsoTimestamp(int64_t micros_since_epoch);
+
+//! One WHERE predicate on a filterable column, as read_sharepoint_list's
+//! filter pushdown extracts it: `field <op> literal(s)`.
+enum class ListFilterOp { EQ, LT, LE, GT, GE, IN, PREFIX };
+
+struct ListPredicate {
+	std::string field; // the item field (ListOutputColumn::field)
+	ListFilterKind kind = ListFilterKind::NONE;
+	ListFilterOp op = ListFilterOp::EQ;
+	std::vector<std::string> texts; // TEXT: one value, several for IN
+	std::vector<double> numbers;    // NUMBER: likewise
+	int64_t micros = 0;             // TIMESTAMP, UTC
+};
+
+//! The OData clause for one predicate, or "" when it is not pushed. DuckDB
+//! still applies every predicate itself, so a clause must never be stricter
+//! than the SQL -- it may only let through more:
+//!  - text: =, IN and a non-empty prefix (SharePoint compares text
+//!    case-insensitively, so these match a superset); no ranges or <>;
+//!  - number: =, IN, and ranges made inclusive (> becomes ge);
+//!  - timestamp: inclusive ranges widened to whole seconds; no =.
+std::string ODataClause(const ListPredicate &p);
+
+//! The pushed clauses joined with " and "; "" when none is pushed.
+std::string BuildListFilter(const std::vector<ListPredicate> &predicates);
 
 //! Where one COPY column goes when writing items.
 enum class ListWriteTarget { FIELD, ID, SKIP };

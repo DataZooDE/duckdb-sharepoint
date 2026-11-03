@@ -19,6 +19,10 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include <picojson.h>
 
@@ -105,12 +109,17 @@ ListColumnDef ParseColumnDef(const picojson::object &o) {
 	def.display_name = StringField(o, "displayName");
 	def.hidden = BoolField(o, "hidden");
 	def.read_only = BoolField(o, "readOnly");
+	def.indexed = BoolField(o, "indexed");
 	// The facet is the one object-valued key naming a kind.
 	for (const char *facet : {"text", "number", "currency", "boolean", "dateTime", "choice", "lookup", "personOrGroup",
 	                          "hyperlinkOrPicture", "calculated"}) {
 		auto it = o.find(facet);
 		if (it != o.end() && it->second.is<picojson::object>()) {
 			def.facet = FacetOf(facet);
+			if (def.facet == ListFacet::CHOICE) {
+				const auto shown = StringField(it->second.get<picojson::object>(), "displayAs");
+				def.single_choice = shown == "dropDownMenu" || shown == "radioButtons";
+			}
 			if (def.facet == ListFacet::CALCULATED) {
 				auto output = StringField(it->second.get<picojson::object>(), "outputType");
 				def.calculated_output = output == "number"     ? ListFacet::NUMBER
@@ -214,9 +223,70 @@ Value ToValue(const picojson::value *v, ListColumnType t) {
 	}
 }
 
+//! Every item of a list, as its `fields` object, page by page; `filter` is
+//! an OData $filter ("" for none).
+vector<picojson::object> FetchItems(GraphClient &client, const string &base, const string &select, int64_t page_size,
+                                    const string &filter, const string &what) {
+	vector<picojson::object> items;
+	string next = base + "/items?$expand=fields($select=" + select + ")&$top=" + std::to_string(page_size);
+	if (!filter.empty()) {
+		next += "&$filter=" + EncodeWorkbookName(filter);
+	}
+	for (int pages = 0; !next.empty(); pages++) {
+		if (pages >= kMaxItemPages) {
+			throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxItemPages);
+		}
+		picojson::value page_holder;
+		const auto &page = AsObject(client.GraphGet(next, what), what, page_holder);
+		auto page_items = page.find("value");
+		if (page_items != page.end() && page_items->second.is<picojson::array>()) {
+			for (auto &item : page_items->second.get<picojson::array>()) {
+				if (!item.is<picojson::object>()) {
+					continue;
+				}
+				auto fields = item.get<picojson::object>().find("fields");
+				items.push_back(fields != item.get<picojson::object>().end() && fields->second.is<picojson::object>()
+				                    ? fields->second.get<picojson::object>()
+				                    : picojson::object());
+			}
+		}
+		auto link = page.find("@odata.nextLink");
+		next = (link != page.end() && link->second.is<string>()) ? GraphPathOfLink(link->second.get<string>())
+		                                                         : string();
+	}
+	return items;
+}
+
+vector<vector<Value>> RowsOf(const vector<picojson::object> &items, const vector<ListOutputColumn> &plan) {
+	vector<vector<Value>> rows;
+	rows.reserve(items.size());
+	for (auto &fields : items) {
+		vector<Value> row;
+		row.reserve(plan.size());
+		for (auto &col : plan) {
+			auto it = fields.find(col.field);
+			row.push_back(ToValue(it == fields.end() ? nullptr : &it->second, col.type));
+		}
+		rows.push_back(std::move(row));
+	}
+	return rows;
+}
+
 struct ListBindData : public TableFunctionData {
 	vector<ListColumnType> types;
+	//! Read at bind (a choice column may hold several values, which only the
+	//! data shows, and the type must be known at bind) ...
 	vector<vector<Value>> rows;
+	//! ... or, when `deferred`, at init, with the WHERE predicates on indexed
+	//! columns pushed down as `filter` (#61).
+	bool deferred = false;
+	AuthContext auth;
+	string base;
+	string select;
+	string what;
+	int64_t page_size = 0;
+	vector<ListOutputColumn> plan;
+	string filter;
 };
 
 //! The Graph site id ("host,siteGuid,webGuid") for `site`: the secret's own
@@ -328,9 +398,6 @@ unique_ptr<FunctionData> ListBind(ClientContext &context, TableFunctionBindInput
 		const auto &base = target.base;
 		const auto &what = target.what;
 
-		// Every item first: whether a choice column is multi-valued shows only
-		// in the data.
-		vector<picojson::object> items;
 		// Name every planned field: a lookup's display value is only returned
 		// when it is selected explicitly (by default Graph sends <name>LookupId
 		// alone -- found live).
@@ -338,79 +405,270 @@ unique_ptr<FunctionData> ListBind(ClientContext &context, TableFunctionBindInput
 		for (auto &col : plan) {
 			select += (select.empty() ? "" : ",") + EncodeWorkbookName(col.field);
 		}
-		string next = base + "/items?$expand=fields($select=" + select + ")&$top=" +
-		              std::to_string(ListPageSize(context));
-		for (int pages = 0; !next.empty(); pages++) {
-			if (pages >= kMaxItemPages) {
-				throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxItemPages);
-			}
-			picojson::value page_holder;
-			const auto &page = AsObject(client.GraphGet(next, what), what, page_holder);
-			auto page_items = page.find("value");
-			if (page_items != page.end() && page_items->second.is<picojson::array>()) {
-				for (auto &item : page_items->second.get<picojson::array>()) {
-					if (!item.is<picojson::object>()) {
-						continue;
-					}
-					auto fields = item.get<picojson::object>().find("fields");
-					items.push_back(fields != item.get<picojson::object>().end() &&
-					                        fields->second.is<picojson::object>()
-					                    ? fields->second.get<picojson::object>()
-					                    : picojson::object());
-				}
-			}
-			auto link = page.find("@odata.nextLink");
-			next = (link != page.end() && link->second.is<string>()) ? GraphPathOfLink(link->second.get<string>())
-			                                                         : string();
-		}
-		for (auto &col : plan) {
-			if (!col.may_be_multi) {
-				continue;
-			}
-			for (auto &fields : items) {
-				auto it = fields.find(col.field);
-				if (it != fields.end() && it->second.is<picojson::array>()) {
-					col.type = ListColumnType::VARCHAR_LIST;
-					break;
-				}
-			}
-		}
-
+		const auto page_size = ListPageSize(context);
 		auto data = make_uniq<ListBindData>();
+		data->deferred = std::none_of(plan.begin(), plan.end(), [](const ListOutputColumn &c) { return c.may_be_multi; });
+		if (!data->deferred) {
+			// Every item first: whether a choice column is multi-valued shows
+			// only in the data.
+			auto items = FetchItems(client, base, select, page_size, "", what);
+			for (auto &col : plan) {
+				if (!col.may_be_multi) {
+					continue;
+				}
+				for (auto &fields : items) {
+					auto it = fields.find(col.field);
+					if (it != fields.end() && it->second.is<picojson::array>()) {
+						col.type = ListColumnType::VARCHAR_LIST;
+						break;
+					}
+				}
+			}
+			data->rows = RowsOf(items, plan);
+		}
 		for (auto &col : plan) {
 			data->types.push_back(col.type);
 			return_types.push_back(ToLogicalType(col.type));
 			names.emplace_back(col.name);
 		}
-		data->rows.reserve(items.size());
-		for (auto &fields : items) {
-			vector<Value> row;
-			row.reserve(plan.size());
-			for (auto &col : plan) {
-				auto it = fields.find(col.field);
-				row.push_back(ToValue(it == fields.end() ? nullptr : &it->second, col.type));
-			}
-			data->rows.push_back(std::move(row));
-		}
+		data->auth = target.auth;
+		data->base = base;
+		data->select = select;
+		data->what = what;
+		data->page_size = page_size;
+		data->plan = plan;
 		result = std::move(data);
 	});
 	return result;
 }
 
+// --- WHERE pushdown (#61) ---------------------------------------------------
+// The filters stay where they are: DuckDB applies each one after the scan, so
+// a pushed $filter only has to let through at least the rows the SQL keeps
+// (ODataClause). Expressions are walked with ExpressionIterator and expression
+// types only: 2.0 turned comparisons into function expressions.
+
+namespace detail {
+template <class E>
+auto Binding(const E &expr, int) -> decltype(expr.Binding()) {
+	return expr.Binding();
+}
+template <class E>
+auto Binding(const E &expr, long) -> decltype((expr.binding)) {
+	return expr.binding;
+}
+} // namespace detail
+
+vector<reference<const Expression>> ChildrenOf(const Expression &expr) {
+	vector<reference<const Expression>> out;
+	ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) { out.push_back(child); });
+	return out;
+}
+
+//! The plan column `expr` reads, when it is a plain column of this scan.
+const ListOutputColumn *ColumnOf(const Expression &expr, const LogicalGet &get, const ListBindData &data) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+		return nullptr;
+	}
+	const auto &binding = detail::Binding(expr.Cast<BoundColumnRefExpression>(), 0);
+	if (!(binding.table_index == get.table_index)) {
+		return nullptr;
+	}
+	auto &ids = get.GetColumnIds();
+	const idx_t pos = binding.column_index;
+	if (pos >= ids.size() || ids[pos].IsRowIdColumn() || ids[pos].IsVirtualColumn()) {
+		return nullptr;
+	}
+	const auto col = ids[pos].GetPrimaryIndex();
+	return col < data.plan.size() ? &data.plan[col] : nullptr;
+}
+
+//! Add the constant to `p` as its kind's literal; false if it is not one.
+bool AddLiteral(const Expression &expr, ListPredicate &p) {
+	if (expr.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	const auto &v = duckdb_compat::ConstantValue(expr.Cast<BoundConstantExpression>());
+	if (v.IsNull()) {
+		return false;
+	}
+	switch (p.kind) {
+	case ListFilterKind::TEXT:
+		if (v.type().id() != LogicalTypeId::VARCHAR) {
+			return false;
+		}
+		p.texts.push_back(StringValue::Get(v));
+		return true;
+	case ListFilterKind::NUMBER:
+		if (!v.type().IsNumeric()) {
+			return false;
+		}
+		p.numbers.push_back(v.GetValue<double>());
+		// An integer past 2^53 is not a double: its = would be stricter.
+		if (v.type().IsIntegral() && std::fabs(p.numbers.back()) > 9007199254740992.0) {
+			return false;
+		}
+		return true;
+	case ListFilterKind::TIMESTAMP:
+		if (v.type().id() != LogicalTypeId::TIMESTAMP) {
+			return false;
+		}
+		p.micros = Timestamp::GetEpochMicroSeconds(v.GetValue<timestamp_t>());
+		return true;
+	default:
+		return false;
+	}
+}
+
+bool ToPredicate(const Expression &expr, const LogicalGet &get, const ListBindData &data, ListPredicate &p) {
+	auto children = ChildrenOf(expr);
+	ListFilterOp op;
+	bool flip = false;
+	switch (expr.GetExpressionType()) {
+	case ExpressionType::COMPARE_EQUAL:
+		op = ListFilterOp::EQ;
+		break;
+	case ExpressionType::COMPARE_LESSTHAN:
+		op = ListFilterOp::LT;
+		break;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		op = ListFilterOp::LE;
+		break;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		op = ListFilterOp::GT;
+		break;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		op = ListFilterOp::GE;
+		break;
+	case ExpressionType::COMPARE_IN:
+		op = ListFilterOp::IN;
+		break;
+	case ExpressionType::BOUND_FUNCTION: {
+		// col LIKE 'abc%' is rewritten to prefix(col, 'abc').
+		const auto text = expr.ToString();
+		if (!StringUtil::StartsWith(text, "prefix(") && !StringUtil::StartsWith(text, "starts_with(")) {
+			return false;
+		}
+		op = ListFilterOp::PREFIX;
+		break;
+	}
+	default:
+		return false;
+	}
+	if (children.size() < 2) {
+		return false;
+	}
+	auto col = ColumnOf(children[0], get, data);
+	if (!col && op != ListFilterOp::IN && op != ListFilterOp::PREFIX && children.size() == 2) {
+		col = ColumnOf(children[1], get, data); // 5 < Amount
+		flip = true;
+	}
+	if (!col || col->filter == ListFilterKind::NONE) {
+		return false;
+	}
+	if (op != ListFilterOp::IN && children.size() != 2) {
+		return false;
+	}
+	p.field = col->field;
+	p.kind = col->filter;
+	p.op = op;
+	if (flip) {
+		p.op = op == ListFilterOp::LT   ? ListFilterOp::GT
+		       : op == ListFilterOp::LE ? ListFilterOp::GE
+		       : op == ListFilterOp::GT ? ListFilterOp::LT
+		       : op == ListFilterOp::GE ? ListFilterOp::LE
+		                                : op;
+		return AddLiteral(children[0], p);
+	}
+	for (idx_t i = 1; i < children.size(); i++) {
+		if (!AddLiteral(children[i], p)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void ListPushdownFilter(ClientContext &, LogicalGet &get, FunctionData *bind_data,
+                        vector<unique_ptr<Expression>> &filters) {
+	auto &data = bind_data->Cast<ListBindData>();
+	if (!data.deferred) {
+		return;
+	}
+	vector<ListPredicate> predicates;
+	for (auto &filter : filters) {
+		ListPredicate p;
+		if (ToPredicate(*filter, get, data, p)) {
+			predicates.push_back(std::move(p));
+		} else if (filter->GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+			// DuckDB folds `a > x AND a < y` into a BETWEEN (found live): two
+			// inclusive bounds (ODataClause widens either way).
+			auto children = ChildrenOf(*filter);
+			auto col = children.size() == 3 ? ColumnOf(children[0], get, data) : nullptr;
+			if (!col || col->filter == ListFilterKind::NONE) {
+				continue;
+			}
+			ListPredicate lower, upper;
+			for (auto bound : {&lower, &upper}) {
+				bound->field = col->field;
+				bound->kind = col->filter;
+			}
+			lower.op = ListFilterOp::GE;
+			upper.op = ListFilterOp::LE;
+			if (AddLiteral(children[1], lower) && AddLiteral(children[2], upper)) {
+				predicates.push_back(std::move(lower));
+				predicates.push_back(std::move(upper));
+			}
+		}
+	}
+	data.filter = BuildListFilter(predicates);
+}
+
+//! EXPLAIN shows the list and the $filter sent to Graph.
+InsertionOrderPreservingMap<string> ListToString(TableFunctionToStringInput &input) {
+	InsertionOrderPreservingMap<string> result;
+	auto &data = input.bind_data->Cast<ListBindData>();
+	result["List"] = data.what;
+	if (!data.filter.empty()) {
+		result["Graph $filter"] = data.filter;
+	}
+	return result;
+}
+
 struct CursorState : public GlobalTableFunctionState {
 	idx_t cursor = 0;
+	//! The rows of a deferred read (ListBindData::deferred).
+	vector<vector<Value>> rows;
 };
 
-unique_ptr<GlobalTableFunctionState> CursorInit(ClientContext &, TableFunctionInitInput &) {
-	return make_uniq<CursorState>();
+unique_ptr<GlobalTableFunctionState> CursorInit(ClientContext &, TableFunctionInitInput &input) {
+	auto state = make_uniq<CursorState>();
+	auto &data = input.bind_data->Cast<ListBindData>();
+	if (data.deferred) {
+		GraphClient client(data.auth);
+		vector<picojson::object> items;
+		if (data.filter.empty()) {
+			items = FetchItems(client, data.base, data.select, data.page_size, "", data.what);
+		} else {
+			try {
+				items = FetchItems(client, data.base, data.select, data.page_size, data.filter, data.what);
+			} catch (std::exception &) {
+				// A filter Graph refuses costs speed, never the result: read
+				// everything and let DuckDB filter.
+				items = FetchItems(client, data.base, data.select, data.page_size, "", data.what);
+			}
+		}
+		state->rows = RowsOf(items, data.plan);
+	}
+	return std::move(state);
 }
 
 void ListScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	auto &data = input.bind_data->Cast<ListBindData>();
 	auto &state = input.global_state->Cast<CursorState>();
+	auto &rows = data.deferred ? state.rows : data.rows;
 	idx_t out = 0;
-	while (state.cursor < data.rows.size() && out < STANDARD_VECTOR_SIZE) {
-		auto &row = data.rows[state.cursor];
+	while (state.cursor < rows.size() && out < STANDARD_VECTOR_SIZE) {
+		auto &row = rows[state.cursor];
 		for (idx_t c = 0; c < row.size(); c++) {
 			output.SetValue(c, out, row[c]);
 		}
@@ -701,6 +959,8 @@ BoundStatement ListCopyPlan(Binder &binder, CopyStatement &stmt) {
 
 void RegisterListFunctions(ExtensionLoader &loader) {
 	TableFunction fn("read_sharepoint_list", {LogicalType::VARCHAR}, ListScan, ListBind, CursorInit);
+	fn.pushdown_complex_filter = ListPushdownFilter;
+	fn.to_string = ListToString;
 	duckdb_compat::NameParameters(fn, {"list"});
 	duckdb_compat::AddNamedParameter(fn, "site", LogicalType::VARCHAR);
 	CreateTableFunctionInfo info(fn);

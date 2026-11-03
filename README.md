@@ -193,6 +193,12 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- another site o
   person column gives `<name>_id`.
 - Every row also has **`id`, `created` and `modified`**. Lists of any size
   are read page by page, including past the 5,000-item list view threshold.
+- **Filters on indexed columns run in SharePoint.** `WHERE` with `=`, `IN`,
+  a range or `LIKE 'abc%'` on an indexed column is sent to Graph as a
+  `$filter`, so a large list returns only the matching items (`EXPLAIN` shows
+  it). Other predicates are applied by DuckDB after the read. Index a column
+  under *List settings → Indexed columns*. A list with a multi-select choice
+  column is always read whole.
 
 Write items back with `COPY`. A row with an `id` updates that item, a row
 without one creates a new item, and columns are matched by name:
@@ -376,7 +382,8 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
     sizes; a sheet of millions of cells belongs in Parquet.
   - Workbooks in the 1904 date system (old Mac files) read four years early.
 - **Lists.**
-  - No filter pushdown yet.
+  - Only predicates on indexed columns are sent to SharePoint, and none for
+    a list with a multi-select choice column.
   - A person column gives the person's id, not their name.
   - A date-only column comes back as midnight in the site's time zone,
     converted to UTC.
