@@ -1,0 +1,15 @@
+{
+  "name": "duckdb-sharepoint",
+  "owner": {
+    "name": "DataZoo GmbH",
+    "url": "https://github.com/DataZooDE"
+  },
+  "plugins": [
+    {
+      "name": "duckdb-sharepoint",
+      "source": "./plugins/duckdb-sharepoint",
+      "description": "Skills for the sharepoint DuckDB extension: SharePoint / OneDrive in SQL -- secrets and sign-in, the sharepoint:// filesystem (globs, versions, change feeds, search, library metadata), live Excel workbooks (read and write), and SharePoint lists (typed reads with filter pushdown, writes).",
+      "keywords": ["duckdb", "sharepoint", "onedrive", "microsoft-graph", "excel", "sql", "claude-code"]
+    }
+  ]
+}
