@@ -396,8 +396,9 @@ string ResolveSite(GraphClient &client, const AuthContext &auth, const string &s
 	int status = 0;
 	auto body = client.GraphGet("/v1.0/sites/" + address + "?$select=id", what, &status);
 	if (status == 404) {
-		// Not a 403: an app with Sites.Selected cannot see a site it was not
-		// granted, and Graph answers itemNotFound (seen live, #70).
+		// A 404 here is a mistyped site -- or, possibly, one an app with
+		// Sites.Selected was not granted (unconfirmed live, hld §7a), so the
+		// grant hint goes here as well as on the 403.
 		throw InvalidInputException("sharepoint: %s not found -- check the name, or, for an app with Sites.Selected, "
 		                            "grant it this site (README: Least privilege)",
 		                            what);
