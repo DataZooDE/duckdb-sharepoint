@@ -127,8 +127,27 @@ bool Digits(const std::string &s, size_t pos, size_t n, int64_t &out) {
 std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &defs) {
 	// The system columns claim their names first: a user column called "ID"
 	// or "Created" is the one that gets the suffix.
-	std::set<std::string> used = {"id", "created", "modified"};
+	std::set<std::string> used = {"id",         "created",          "modified",      "created_by",
+	                              "created_by_email", "created_by_id", "modified_by", "modified_by_email",
+	                              "modified_by_id"};
 	std::vector<ListOutputColumn> out;
+	auto person = [&](const std::string &base, const std::string &field, bool multi, bool indexed, bool claim) {
+		static const char *suffix[] = {"", "_email", "_id"};
+		static const ListPersonPart parts[] = {ListPersonPart::NAME, ListPersonPart::EMAIL, ListPersonPart::ID};
+		for (int i = 0; i < 3; i++) {
+			ListOutputColumn col;
+			col.name = claim ? Claim(used, base + suffix[i]) : base + suffix[i];
+			col.field = field + "LookupId";
+			col.person = parts[i];
+			col.person_field = field;
+			const bool id = parts[i] == ListPersonPart::ID;
+			col.type = id ? (multi ? ListColumnType::BIGINT_LIST : ListColumnType::BIGINT)
+			              : (multi ? ListColumnType::VARCHAR_LIST : ListColumnType::VARCHAR);
+			col.read_only = !id || !claim; // set a person through <name>_id; Graph sets Author/Editor
+			col.filter = id && indexed && !multi ? ListFilterKind::NUMBER : ListFilterKind::NONE;
+			out.push_back(col);
+		}
+	};
 	ListOutputColumn id;
 	id.name = "id";
 	id.field = "id";
@@ -144,12 +163,17 @@ std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &
 		if (base.empty()) {
 			base = def.name;
 		}
-		if (def.facet == ListFacet::PERSON || def.facet == ListFacet::LOOKUP) {
-			if (def.facet == ListFacet::LOOKUP) {
+		if (def.facet == ListFacet::PERSON) {
+			person(base, def.name, def.multi, def.indexed, true);
+			continue;
+		}
+		if (def.facet == ListFacet::LOOKUP) {
+			{
 				ListOutputColumn value;
 				value.name = Claim(used, base);
 				value.field = def.name;
 				value.lookup_value = true;
+				value.read_only = true;
 				out.push_back(value);
 			}
 			ListOutputColumn key;
@@ -183,6 +207,8 @@ std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &
 	};
 	system_column("created", "Created");
 	system_column("modified", "Modified");
+	person("created_by", "Author", false, false, false);
+	person("modified_by", "Editor", false, false, false);
 	return out;
 }
 
@@ -339,7 +365,7 @@ bool PlanListWrite(const std::vector<std::string> &copy_names, const std::vector
 		}
 		if (match->field == "id") {
 			w.target = ListWriteTarget::ID;
-		} else if (match->lookup_value || match->name == "created" || match->name == "modified") {
+		} else if (match->read_only || match->name == "created" || match->name == "modified") {
 			w.target = ListWriteTarget::SKIP;
 		} else {
 			w.target = ListWriteTarget::FIELD;

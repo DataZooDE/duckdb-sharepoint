@@ -190,7 +190,11 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- another site o
   currency (DECIMAL), yes/no, date and time (TIMESTAMP, UTC), and choice
   (VARCHAR, or VARCHAR[] for several choices).
 - **Lookups and people:** a lookup column gives its value plus `<name>_id`; a
-  person column gives `<name>_id`.
+  person column gives `<name>`, `<name>_email` and `<name>_id` (lists when
+  it allows several people). Created By and Modified By come as
+  `created_by`, `created_by_email`, `created_by_id` and the same for
+  `modified_by`. Names and emails are looked up in the site's user list, only
+  when the query reads them.
 - Every row also has **`id`, `created` and `modified`**. Lists of any size
   are read page by page, including past the 5,000-item list view threshold.
 - **Filters on indexed columns run in SharePoint.** `WHERE` with `=`, `IN`,
@@ -365,7 +369,6 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
 - **Lists.**
   - Only predicates on indexed columns are sent to SharePoint, and none for
     a list with a multi-select choice column.
-  - A person column gives the person's id, not their name.
   - A date-only column comes back as midnight in the site's time zone,
     converted to UTC.
 
