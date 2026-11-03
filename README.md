@@ -249,6 +249,7 @@ LOAD sharepoint;
 | provider | use | fields |
 |---|---|---|
 | `client_credentials` *(default)* | unattended jobs, as an app | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` |
+| `client_certificate` | unattended jobs, as an app, with a certificate | `TENANT_ID`, `CLIENT_ID`, `CERTIFICATE_PATH` *(optional `CERTIFICATE_PASSWORD`)* |
 | `device_code` | **as yourself**, any shell | `TENANT_ID`, `CLIENT_ID` *(optional `REFRESH_TOKEN`)* |
 | `authorization_code` | **as yourself**, browser on this machine | `TENANT_ID`, `CLIENT_ID` *(optional `REFRESH_TOKEN`, `REDIRECT_PORT`, default 8020)* |
 | `config` | a token you already have | `ACCESS_TOKEN` *(or `REFRESH_TOKEN` + `TENANT_ID`/`CLIENT_ID`, + `CLIENT_SECRET` for a confidential client)* |
@@ -298,6 +299,27 @@ Creating or deleting lists themselves needs `manage` or `fullcontrol`; the
 extension never does either. Every call stays inside the drive and the sites
 you name, so nothing needs tenant-wide rights. A site the app was not granted
 is refused with HTTP 403 `accessDenied`.
+
+**With a certificate.** Microsoft recommends certificates over client
+secrets for app-only access: they don't get copied around as text, and they
+expire on a schedule you set. Upload the certificate (public part) to the
+app registration under *Certificates & secrets*, and point the secret at a
+local PEM file holding the certificate and its RSA private key:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -subj "/CN=duckdb" -days 365
+cat cert.pem key.pem > /etc/sp/app.pem && chmod 600 /etc/sp/app.pem   # upload cert.pem to Entra
+```
+
+```sql
+CREATE SECRET sp (TYPE sharepoint, PROVIDER client_certificate,
+    TENANT_ID 'contoso.onmicrosoft.com', CLIENT_ID '...', CERTIFICATE_PATH '/etc/sp/app.pem',
+    DRIVE_ID 'b!...');
+```
+
+The file is read each time the secret is used, so a renewed certificate at
+the same path is picked up without a new secret. `CERTIFICATE_PASSWORD`
+decrypts an encrypted key and is redacted like a client secret.
 
 **As a user.** `device_code` and `authorization_code` act as the signed-in
 user: files are authored by them, and they see only what they may. Both are

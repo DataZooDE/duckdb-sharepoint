@@ -309,6 +309,11 @@ jobs:
           SHAREPOINT_SELECTED_CLIENT_ID: ${{ secrets.SHAREPOINT_SELECTED_CLIENT_ID }}
           SHAREPOINT_SELECTED_CLIENT_SECRET: ${{ secrets.SHAREPOINT_SELECTED_CLIENT_SECRET }}
           SHAREPOINT_UNGRANTED_SITE: ${{ secrets.SHAREPOINT_UNGRANTED_SITE }}
+          # Certificate auth (#71): skips until these secrets exist; then set
+          # SHAREPOINT_REQUIRE_CERTIFICATE to '1' here.
+          SHAREPOINT_CERT_CLIENT_ID: ${{ secrets.SHAREPOINT_CERT_CLIENT_ID }}
+          SHAREPOINT_CERTIFICATE_PEM: ${{ secrets.SHAREPOINT_CERTIFICATE_PEM }}
+          SHAREPOINT_CERTIFICATE_PASSWORD: ${{ secrets.SHAREPOINT_CERTIFICATE_PASSWORD }}
           DATAZOO_DISABLE_TELEMETRY: '1'
         run: cd e2e && uv run --locked pytest -v
 
