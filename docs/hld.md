@@ -394,7 +394,7 @@ sessions", a Conditional Access change, or 90 days without any redemption.
    (`test/sql/sharepoint_excel.live.template`, `e2e/tests/test_excel_workbook.py`).
    Write side implemented 2026-11-02: `COPY ... (FORMAT excel_table|excel_range)`
    (§9.1); `OVERWRITE` replaces a table's rows / clears a range first
-   (2026-11-02). Open: the 1904 date system.
+   (2026-11-02). 1904 date system detected (2026-11-03, #64).
 9. **SharePoint lists (#49).** Read side implemented 2026-11-02:
    `read_sharepoint_list` (§10). Open: verified live (e2e, which needs the
    app's Sites.Manage.All to create its fixture lists once); multi-choice and
@@ -620,8 +620,14 @@ step) needs too.
   -> DOUBLE; anything mixed with text -> VARCHAR. Dates are 1900-system
   serials (with Lotus' phantom 1900-02-29), rounded to the millisecond. Error
   cells (`#DIV/0!`) are NULL in a typed column. `all_varchar := true` reads
-  text, dates as ISO text. The 1904 date system (old Mac workbooks) is not
-  detected: their dates read four years early.
+  text, dates as ISO text. A workbook in the 1904 date system (old Mac
+  Excel) has serials 1462 days smaller; the workbook API does not say which
+  system a workbook uses, so `xl/workbook.xml` is read for
+  `<workbookPr date1904="1">` by three ranged reads (the zip's end record,
+  its central directory, the entry), inflated through DuckDB's gzip decoder
+  in a gzip frame (miniz itself is not exported to a loadable extension).
+  Reads add the offset and writes take it off; anything unexpected in the
+  zip means the 1900 system, never an error (#64).
 - **Header.** A table's header row; for a range the first row unless
   `header := false`. Empty names become `column<N>`, duplicates get `_2`
   (case-insensitive, as DuckDB names are).
