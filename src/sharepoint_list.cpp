@@ -4,7 +4,9 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <set>
 
 namespace duckdb {
@@ -53,6 +55,47 @@ ListColumnType TypeFor(ListFacet facet) {
 	default:
 		return ListColumnType::VARCHAR;
 	}
+}
+
+ListFilterKind FilterKindFor(ListFacet facet) {
+	switch (facet) {
+	case ListFacet::TEXT:
+	case ListFacet::CHOICE:
+		return ListFilterKind::TEXT;
+	case ListFacet::NUMBER:
+	case ListFacet::CURRENCY:
+		return ListFilterKind::NUMBER;
+	case ListFacet::DATETIME:
+		return ListFilterKind::TIMESTAMP;
+	default:
+		return ListFilterKind::NONE;
+	}
+}
+
+std::string ODataText(const std::string &text) {
+	std::string out = "'";
+	for (char c : text) {
+		out += c;
+		if (c == '\'') {
+			out += '\'';
+		}
+	}
+	return out + "'";
+}
+
+//! The shortest decimal that reads back as `v`; "" for NaN and infinities.
+std::string ODataNumber(double v) {
+	if (!std::isfinite(v)) {
+		return "";
+	}
+	char buf[40];
+	for (int precision = 15; precision <= 17; precision++) {
+		std::snprintf(buf, sizeof(buf), "%.*g", precision, v);
+		if (std::strtod(buf, nullptr) == v) {
+			break;
+		}
+	}
+	return buf;
 }
 
 // Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant).
@@ -113,6 +156,7 @@ std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &
 			key.name = Claim(used, base + "_id");
 			key.field = def.name + "LookupId";
 			key.type = ListColumnType::BIGINT;
+			key.filter = def.indexed ? ListFilterKind::NUMBER : ListFilterKind::NONE;
 			out.push_back(key);
 			continue;
 		}
@@ -120,18 +164,25 @@ std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &
 		col.name = Claim(used, base);
 		col.field = def.name;
 		col.type = TypeFor(def.facet == ListFacet::CALCULATED ? def.calculated_output : def.facet);
-		col.may_be_multi = def.facet == ListFacet::CHOICE;
+		col.may_be_multi = def.facet == ListFacet::CHOICE && !def.single_choice;
+		col.filter = def.indexed && !col.may_be_multi ? FilterKindFor(def.facet) : ListFilterKind::NONE;
 		out.push_back(col);
 	}
-	ListOutputColumn created;
-	created.name = "created";
-	created.field = "Created";
-	created.type = ListColumnType::TIMESTAMP;
-	out.push_back(created);
-	ListOutputColumn modified = created;
-	modified.name = "modified";
-	modified.field = "Modified";
-	out.push_back(modified);
+	// Created and Modified are read-only, so skipped above; they can be indexed.
+	auto system_column = [&](const std::string &name, const std::string &field) {
+		ListOutputColumn col;
+		col.name = name;
+		col.field = field;
+		col.type = ListColumnType::TIMESTAMP;
+		for (auto &def : defs) {
+			if (def.name == field && def.indexed) {
+				col.filter = ListFilterKind::TIMESTAMP;
+			}
+		}
+		out.push_back(col);
+	};
+	system_column("created", "Created");
+	system_column("modified", "Modified");
 	return out;
 }
 
@@ -168,6 +219,93 @@ std::string FormatIsoTimestamp(int64_t micros) {
 		out += buf;
 	}
 	return out + "Z";
+}
+
+std::string ODataClause(const ListPredicate &p) {
+	const std::string field = "fields/" + p.field;
+	switch (p.kind) {
+	case ListFilterKind::TEXT:
+		if ((p.op == ListFilterOp::EQ || p.op == ListFilterOp::PREFIX) && p.texts.size() != 1) {
+			return "";
+		}
+		if (p.op == ListFilterOp::EQ) {
+			return field + " eq " + ODataText(p.texts[0]);
+		}
+		if (p.op == ListFilterOp::PREFIX) {
+			return p.texts[0].empty() ? "" : "startswith(" + field + "," + ODataText(p.texts[0]) + ")";
+		}
+		if (p.op == ListFilterOp::IN && !p.texts.empty()) {
+			std::string out;
+			for (auto &t : p.texts) {
+				out += (out.empty() ? "(" : " or ") + field + " eq " + ODataText(t);
+			}
+			return out + ")";
+		}
+		return "";
+	case ListFilterKind::NUMBER: {
+		if (p.numbers.empty() || (p.op != ListFilterOp::IN && p.numbers.size() != 1)) {
+			return "";
+		}
+		std::vector<std::string> literals;
+		for (auto v : p.numbers) {
+			literals.push_back(ODataNumber(v));
+			if (literals.back().empty()) {
+				return "";
+			}
+		}
+		switch (p.op) {
+		case ListFilterOp::EQ:
+			return field + " eq " + literals[0];
+		case ListFilterOp::LT:
+		case ListFilterOp::LE:
+			return field + " le " + literals[0];
+		case ListFilterOp::GT:
+		case ListFilterOp::GE:
+			return field + " ge " + literals[0];
+		case ListFilterOp::IN: {
+			std::string out;
+			for (auto &l : literals) {
+				out += (out.empty() ? "(" : " or ") + field + " eq " + l;
+			}
+			return out + ")";
+		}
+		default:
+			return "";
+		}
+	}
+	case ListFilterKind::TIMESTAMP: {
+		// SharePoint keeps whole seconds: widen to them, floor below, ceil above.
+		constexpr int64_t kSecond = 1000000;
+		int64_t floor = p.micros / kSecond * kSecond;
+		if (floor > p.micros) {
+			floor -= kSecond;
+		}
+		const int64_t ceil = floor == p.micros ? floor : floor + kSecond;
+		switch (p.op) {
+		case ListFilterOp::LT:
+		case ListFilterOp::LE:
+			return field + " le '" + FormatIsoTimestamp(ceil) + "'";
+		case ListFilterOp::GT:
+		case ListFilterOp::GE:
+			return field + " ge '" + FormatIsoTimestamp(floor) + "'";
+		default:
+			return "";
+		}
+	}
+	default:
+		return "";
+	}
+}
+
+std::string BuildListFilter(const std::vector<ListPredicate> &predicates) {
+	std::string out;
+	for (auto &p : predicates) {
+		auto clause = ODataClause(p);
+		if (!clause.empty()) {
+			out += (out.empty() ? "" : " and ") + clause;
+		}
+	}
+	return out;
 }
 
 bool PlanListWrite(const std::vector<std::string> &copy_names, const std::vector<ListOutputColumn> &plan,

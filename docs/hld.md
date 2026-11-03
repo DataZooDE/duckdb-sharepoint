@@ -706,10 +706,24 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- /sites/Sales o
   pages a 300-item fixture 50 at a time instead of building a 5,000-item list:
   creating that many items is throttled to a crawl, and nextLink paging is the
   same at any size.
-  Paging alone works past the 5,000-item list view threshold; a filter would
-  need indexed columns, so there is no pushdown yet. Counted as `list` in
-  `sharepoint_stats()`. Like the Excel reads, everything is read at bind --
-  here because a choice column is multi-valued only if its data says so.
+  Paging alone works past the 5,000-item list view threshold. Counted as
+  `list` in `sharepoint_stats()`.
+- **When the items are read, and WHERE pushdown (#61).** A choice column
+  shown as check boxes (or with no `displayAs`) may hold several values, and
+  only the data says whether it does; such a list is read at bind, as the
+  Excel reads are, and nothing is pushed down. Every other list is read at
+  init, after `pushdown_complex_filter` has turned the WHERE predicates on
+  **indexed** columns into `$filter` (past 5,000 items Graph refuses a filter
+  on a non-indexed column; the `Prefer: HonorNonIndexedQueriesWarningMayFailRandomly`
+  header is unreliable and not used). DuckDB keeps every predicate, so a
+  pushed clause only has to be never stricter than its SQL
+  (`ODataClause`, pure): text `=`, `IN` and `LIKE 'x%'` (SharePoint compares
+  case-insensitively, a superset); number `=`, `IN`, and ranges made
+  inclusive; timestamp ranges widened to whole seconds. No `<>`, no text
+  ranges, no booleans. A filter Graph refuses falls back to the full read.
+  EXPLAIN shows it as `Graph $filter`. Expressions are walked with
+  `ExpressionIterator` and expression types only: 2.0 made comparisons
+  function expressions.
 - **Columns** (pure, `sharepoint_list.*`): `id` first, `created` / `modified`
   last (UTC); every column neither hidden nor read-only, named by its display
   name, ContentType and Attachments left out. The system names win a clash

@@ -193,6 +193,12 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- another site o
   person column gives `<name>_id`.
 - Every row also has **`id`, `created` and `modified`**. Lists of any size
   are read page by page, including past the 5,000-item list view threshold.
+- **Filters on indexed columns run in SharePoint.** `WHERE` with `=`, `IN`,
+  a range or `LIKE 'abc%'` on an indexed column is sent to Graph as a
+  `$filter`, so a large list returns only the matching items (`EXPLAIN` shows
+  it). Other predicates are applied by DuckDB after the read. Index a column
+  under *List settings → Indexed columns*. A list with a multi-select choice
+  column is always read whole.
 
 Write items back with `COPY`. A row with an `id` updates that item, a row
 without one creates a new item, and columns are matched by name:

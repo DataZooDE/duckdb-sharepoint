@@ -6,6 +6,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -152,4 +153,123 @@ TEST_CASE("PlanListColumns: built-in Title keeps its name in any site language",
 	REQUIRE(plan[1].name == "Title");
 	REQUIRE(plan[1].field == "Title");
 	REQUIRE(plan[2].name == "Betrag"); // user columns keep their display name
+}
+
+// ---------------------------------------------------------------------------
+// WHERE pushdown (#61): which columns Graph may filter on, and the $filter
+// text. DuckDB keeps every predicate, so a pushed clause only has to be never
+// stricter than the SQL it came from.
+// ---------------------------------------------------------------------------
+namespace {
+
+ListColumnDef Indexed(ListColumnDef d) {
+	d.indexed = true;
+	return d;
+}
+
+ListPredicate Pred(const std::string &field, ListFilterKind kind, ListFilterOp op) {
+	ListPredicate p;
+	p.field = field;
+	p.kind = kind;
+	p.op = op;
+	return p;
+}
+
+} // namespace
+
+TEST_CASE("PlanListColumns: only indexed columns of a safe kind are filterable", "[list][pushdown]") {
+	std::vector<ListColumnDef> defs = {
+	    Indexed(Col("Title", "Title", ListFacet::TEXT)),
+	    Col("Note", "Note", ListFacet::TEXT), // not indexed
+	    Indexed(Col("Amount", "Amount", ListFacet::NUMBER)),
+	    Indexed(Col("Price", "Price", ListFacet::CURRENCY)),
+	    Indexed(Col("Due", "Due", ListFacet::DATETIME)),
+	    Indexed(Col("Done", "Done", ListFacet::BOOLEAN)),
+	    Indexed(Col("Customer", "Customer", ListFacet::LOOKUP)),
+	    Indexed(Col("Calc", "Calc", ListFacet::CALCULATED)),
+	    Indexed(Col("Modified", "Modified", ListFacet::DATETIME, false, true)),
+	    Col("Created", "Created", ListFacet::DATETIME, false, true),
+	};
+	std::string out;
+	for (auto &c : PlanListColumns(defs)) {
+		static const char *kinds[] = {"-", "text", "number", "timestamp"};
+		out += c.name + "=" + kinds[static_cast<int>(c.filter)] + " ";
+	}
+	REQUIRE(out == "id=- Title=text Note=- Amount=number Price=number Due=timestamp Done=- Customer=- "
+	               "Customer_id=number Calc=- created=- modified=timestamp ");
+}
+
+TEST_CASE("ODataClause: text equality, IN and prefix; quotes doubled", "[list][pushdown]") {
+	auto eq = Pred("Status", ListFilterKind::TEXT, ListFilterOp::EQ);
+	eq.texts = {"it's"};
+	REQUIRE(ODataClause(eq) == "fields/Status eq 'it''s'");
+	auto in = Pred("Status", ListFilterKind::TEXT, ListFilterOp::IN);
+	in.texts = {"a", "b"};
+	REQUIRE(ODataClause(in) == "(fields/Status eq 'a' or fields/Status eq 'b')");
+	auto prefix = Pred("Title", ListFilterKind::TEXT, ListFilterOp::PREFIX);
+	prefix.texts = {"ord"};
+	REQUIRE(ODataClause(prefix) == "startswith(fields/Title,'ord')");
+	// SharePoint compares text case-insensitively and in its own collation:
+	// a range or an empty prefix is not pushed.
+	auto range = Pred("Title", ListFilterKind::TEXT, ListFilterOp::GT);
+	range.texts = {"m"};
+	REQUIRE(ODataClause(range).empty());
+	auto empty_prefix = Pred("Title", ListFilterKind::TEXT, ListFilterOp::PREFIX);
+	empty_prefix.texts = {""};
+	REQUIRE(ODataClause(empty_prefix).empty());
+}
+
+TEST_CASE("ODataClause: number ranges are made inclusive", "[list][pushdown]") {
+	auto gt = Pred("Amount", ListFilterKind::NUMBER, ListFilterOp::GT);
+	gt.numbers = {5};
+	REQUIRE(ODataClause(gt) == "fields/Amount ge 5");
+	auto lt = Pred("Amount", ListFilterKind::NUMBER, ListFilterOp::LT);
+	lt.numbers = {0.1};
+	REQUIRE(ODataClause(lt) == "fields/Amount le 0.1");
+	auto in = Pred("CustomerLookupId", ListFilterKind::NUMBER, ListFilterOp::IN);
+	in.numbers = {1, 3};
+	REQUIRE(ODataClause(in) == "(fields/CustomerLookupId eq 1 or fields/CustomerLookupId eq 3)");
+	auto neg = Pred("Amount", ListFilterKind::NUMBER, ListFilterOp::EQ);
+	neg.numbers = {-2.5};
+	REQUIRE(ODataClause(neg) == "fields/Amount eq -2.5");
+	auto nan = Pred("Amount", ListFilterKind::NUMBER, ListFilterOp::EQ);
+	nan.numbers = {std::numeric_limits<double>::quiet_NaN()};
+	REQUIRE(ODataClause(nan).empty());
+}
+
+TEST_CASE("ODataClause: timestamps as inclusive whole-second ranges only", "[list][pushdown]") {
+	int64_t t;
+	REQUIRE(ParseIsoTimestamp("2026-01-01T10:00:00.500000Z", t));
+	auto ge = Pred("Modified", ListFilterKind::TIMESTAMP, ListFilterOp::GT);
+	ge.micros = t;
+	REQUIRE(ODataClause(ge) == "fields/Modified ge '2026-01-01T10:00:00Z'");
+	auto le = Pred("Modified", ListFilterKind::TIMESTAMP, ListFilterOp::LT);
+	le.micros = t;
+	REQUIRE(ODataClause(le) == "fields/Modified le '2026-01-01T10:00:01Z'");
+	auto eq = Pred("Modified", ListFilterKind::TIMESTAMP, ListFilterOp::EQ);
+	eq.micros = t;
+	REQUIRE(ODataClause(eq).empty());
+}
+
+TEST_CASE("BuildListFilter joins the pushable clauses with and", "[list][pushdown]") {
+	auto a = Pred("Status", ListFilterKind::TEXT, ListFilterOp::EQ);
+	a.texts = {"open"};
+	auto skipped = Pred("Status", ListFilterKind::TEXT, ListFilterOp::LT);
+	skipped.texts = {"x"};
+	auto b = Pred("Amount", ListFilterKind::NUMBER, ListFilterOp::GE);
+	b.numbers = {10};
+	REQUIRE(BuildListFilter({a, skipped, b}) == "fields/Status eq 'open' and fields/Amount ge 10");
+	REQUIRE(BuildListFilter({skipped}).empty());
+	REQUIRE(BuildListFilter({}).empty());
+}
+
+TEST_CASE("PlanListColumns: a drop-down or radio choice is single-valued and filterable", "[list][pushdown]") {
+	auto single = Indexed(Col("Status", "Status", ListFacet::CHOICE));
+	single.single_choice = true;
+	auto multi = Indexed(Col("Tags", "Tags", ListFacet::CHOICE)); // check boxes, or unknown
+	auto plan = PlanListColumns({single, multi});
+	REQUIRE(Describe(plan) == "id:BIGINT<-id Status:VARCHAR<-Status Tags:VARCHAR<-Tags* created:TIMESTAMP<-Created "
+	                          "modified:TIMESTAMP<-Modified ");
+	REQUIRE(plan[1].filter == ListFilterKind::TEXT);
+	REQUIRE(plan[2].filter == ListFilterKind::NONE);
 }
