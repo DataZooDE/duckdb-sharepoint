@@ -111,6 +111,7 @@ file(GLOB DUCKDB_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_vfs_functions.cpp
     src/sharepoint_excel_functions.cpp
     src/sharepoint_list_functions.cpp
+    src/sharepoint_versions.cpp
 )
 
 set(EXTENSION_SOURCES ${PURE_SOURCES} ${DUCKDB_SOURCES})
