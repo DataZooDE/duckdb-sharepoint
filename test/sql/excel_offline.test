@@ -85,3 +85,25 @@ statement error
 COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast');
 ----
 no `sharepoint` secret configured for 'sharepoint://Finance/plan.xlsx'
+
+# OVERWRITE means "replace in the workbook": carried past the binder, which
+# would otherwise treat it as a file option. The other file modes are refused.
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE);
+----
+no `sharepoint` secret configured
+
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Out!A1', OVERWRITE true);
+----
+no `sharepoint` secret configured
+
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Out!A1', OVERWRITE_OR_IGNORE);
+----
+overwrite_or_ignore is a file option
+
+statement error
+COPY (SELECT 1 AS a) TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'T', APPEND);
+----
+append is a file option

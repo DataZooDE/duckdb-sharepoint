@@ -325,3 +325,21 @@ TEST_CASE("ExcelBlockAt: the cells a write covers from its anchor", "[excel][wri
 	REQUIRE_FALSE(ExcelBlockAt(ParseExcelAddress("S!XFD1").address, 1, 2, block, error));
 	REQUIRE_FALSE(ExcelBlockAt(anchor, 0, 4, block, error)); // nothing to write
 }
+
+TEST_CASE("ExcelClearRegion: from the anchor down and right, within the used range", "[excel][write]") {
+	ExcelAddress region;
+	// Used A1:F40, anchor B3: clear B3:F40 -- column A and rows 1-2 stay.
+	REQUIRE(ExcelClearRegion(ParseExcelAddress("Out!B3").address, ParseExcelAddress("Out!A1:F40").address, region));
+	REQUIRE(FormatExcelAddress(region) == "Out!B3:F40");
+	// A bare sheet anchors at A1: the whole used range.
+	REQUIRE(ExcelClearRegion(ParseExcelAddress("Out").address, ParseExcelAddress("Out!C2:D9").address, region));
+	REQUIRE(FormatExcelAddress(region) == "Out!A1:D9");
+	// Only the anchor's top-left cell counts.
+	REQUIRE(ExcelClearRegion(ParseExcelAddress("Out!B3:C4").address, ParseExcelAddress("Out!A1:F40").address, region));
+	REQUIRE(FormatExcelAddress(region) == "Out!B3:F40");
+	// Nothing below or right of the anchor: nothing to clear.
+	REQUIRE_FALSE(
+	    ExcelClearRegion(ParseExcelAddress("Out!G1").address, ParseExcelAddress("Out!A1:F40").address, region));
+	REQUIRE_FALSE(
+	    ExcelClearRegion(ParseExcelAddress("Out!A41").address, ParseExcelAddress("Out!A1:F40").address, region));
+}
