@@ -1,102 +1,136 @@
-# duckdb-sharepoint
+<h1 align="center">duckdb-sharepoint</h1>
+<p align="center"><strong>Microsoft 365 business data in SQL: files, Excel workbooks and SharePoint lists for DuckDB</strong></p>
 
-A DuckDB extension that registers a **`sharepoint://`** filesystem over
-**Microsoft Graph**, so any DuckDB path expression can address a file in a
-SharePoint document library (or OneDrive) with no download or copy step.
-Because DuckDB dispatches file access through its virtual filesystem,
-everything layered on it inherits the scheme: `read_parquet`, `read_csv`,
-`COPY`, `glob`, `ATTACH` of a DuckDB database file, and table formats such as
-DuckLake whose `DATA_PATH` lives on SharePoint.
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+  <a href="https://duckdb.org"><img src="https://img.shields.io/badge/DuckDB-1.5.6%20%7C%202.0-green.svg" alt="DuckDB 1.5.6 | 2.0"></a>
+  <a href="https://duckdb.org/community_extensions/extensions/sharepoint"><img src="https://img.shields.io/badge/DuckDB-community%20extension-yellow.svg" alt="DuckDB community extension"></a>
+  <a href="https://github.com/DataZooDE/duckdb-sharepoint/actions/workflows/MainDistributionPipeline.yml"><img src="https://github.com/DataZooDE/duckdb-sharepoint/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=main" alt="Build"></a>
+</p>
 
-It is the sibling of [`duckdb-gdrive`](https://github.com/DataZooDE/duckdb-gdrive)
-and shares its design, its glob syntax and its scheme-generic `write_blob` /
-`remove_file` / `move_file` / `file_size` SQL functions. Both extensions load
-into one database side by side.
-
-> **Status:** verified end to end against a real Microsoft 365 tenant —
-> the live SQL suite (`make test_live`) and the e2e harness (`make e2e`:
-> out-of-band changes, restarts, 16-thread scans, DuckLake, two drives) pass.
-> Built for DuckDB **v1.5.6** and **2.0**.
-
-## Why SharePoint is simpler than Drive
-
-Google Drive has **no path addressing** — resolving `a/b/c.parquet` costs one
-`files.list` per segment, which is why `duckdb-gdrive` carries a substantial
-path→id cache. Microsoft Graph addresses driveItems **by path** natively:
-
-```
-GET /drives/{drive-id}/root:/Finance/2026/actuals.parquet:/content
-```
-
-So this extension needs **no path cache**, and because SharePoint forbids two
-items of the same name in one folder, it needs none of gdrive's
-duplicate-sibling-name disambiguation either.
-
-## Installation
-
-### From erpl.io (recommended)
-
-Published to the erpl.io distribution bucket on every release. The binary is
-**unsigned**, so start DuckDB with the `-unsigned` flag (or set
-`allow_unsigned_extensions`):
+**Microsoft 365 business data in SQL.** Query files, Excel workbooks and
+SharePoint lists in SharePoint and OneDrive directly from DuckDB, and write
+results back where your team already works. There's no export step and no
+copies to keep in sync.
 
 ```sql
--- duckdb -unsigned
-INSTALL 'sharepoint' FROM 'http://get.erpl.io';
-LOAD sharepoint;
+SELECT * FROM 'sharepoint://Finance/2026/actuals.parquet';           -- files
+SELECT * FROM read_excel_table('Finance/plan.xlsx', 'Sales');         -- Excel, live
+SELECT * FROM read_sharepoint_list('Orders');                         -- SharePoint lists
+COPY results TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE);   -- and back
 ```
 
-### From the DuckDB community registry
+| | read | write |
+|---|---|---|
+| **Files** in document libraries and OneDrive | `read_parquet`, `read_csv`, `read_json`, `glob`, `ATTACH`, DuckLake: anything on a `sharepoint://` path | `COPY … TO 'sharepoint://…'`, streamed |
+| **Excel workbooks**, through the workbook API | `read_excel_table`, `read_excel_range` | `COPY … (FORMAT excel_table \| excel_range)`, in place |
+| **SharePoint lists** | `read_sharepoint_list` | `COPY … (FORMAT sharepoint_list)`: create, or update by `id` |
 
-```sql
-INSTALL sharepoint FROM community;   -- once the community-extensions submission lands
-LOAD sharepoint;
-```
+One install, one secret, and app-only or user sign-in. Built for DuckDB
+**v1.5.6** and **2.0**, by [DataZoo](https://data-zoo.de), and the sibling of
+[duckdb-gdrive](https://github.com/DataZooDE/duckdb-gdrive) for Google Drive.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Examples](#examples): forecasting, regression, data quality, lead scoring
+- [Files: `sharepoint://`](#files-sharepoint)
+- [Excel workbooks](#excel-workbooks)
+- [SharePoint lists](#sharepoint-lists)
+- [Installation](#installation) · [Authentication](#authentication) · [Settings](#settings) · [Diagnostics](#diagnostics) · [Limitations](#limitations)
+- [Network and privacy](#network-and-privacy) · [How it works](#how-it-works) · [Building and testing](#building-and-testing)
+- [Support and feedback](#support-and-feedback) · [License](#license) · [Citation](#citation)
 
 ## Quick start
 
 ```sql
+INSTALL sharepoint FROM community;
 LOAD sharepoint;
 
--- Unattended app-only auth (the default). Register an app in Entra ID, grant it
--- the Sites.ReadWrite.All (or Files.ReadWrite.All) APPLICATION permission with
--- admin consent, then bind it to a document library by DRIVE_ID (or SITE_ID).
+-- Sign in as yourself: DuckDB prints a URL and a code to enter in a browser.
 CREATE SECRET sp (
     TYPE sharepoint,
-    PROVIDER client_credentials,
-    TENANT_ID     '00000000-0000-0000-0000-000000000000',
-    CLIENT_ID     '11111111-1111-1111-1111-111111111111',
-    CLIENT_SECRET '...',
-    DRIVE_ID      'b!AbCdEf...'          -- or SITE_ID 'contoso.sharepoint.com,<siteId>,<webId>'
+    PROVIDER device_code,
+    TENANT_ID 'contoso.onmicrosoft.com',
+    CLIENT_ID '11111111-1111-1111-1111-111111111111',   -- an Entra app, see Authentication
+    DRIVE_ID  'b!AbCdEf...'                             -- or SITE_ID 'contoso.sharepoint.com,<siteId>,<webId>'
 );
 
--- Read a file by path (one Graph call — no per-segment walk).
+-- A Parquet file in the document library
 SELECT count(*) FROM 'sharepoint://Finance/2026/actuals.parquet';
 
--- Or by driveItem id — stable across a rename.
+-- The "Sales" table of an Excel workbook, as it is right now
+SELECT region, sum(revenue) FROM read_excel_table('Finance/plan.xlsx', 'Sales') GROUP BY ALL;
+
+-- A SharePoint list, one row per item
+SELECT Status, count(*) FROM read_sharepoint_list('Orders') GROUP BY ALL;
+```
+
+For unattended jobs, use `PROVIDER client_credentials` with an app secret.
+[Authentication](#authentication) covers both.
+
+## Examples
+
+Each example is one SQL file and a small synthetic data set. Each reads
+Microsoft 365 data live, runs a DataZoo extension on it, and writes the result
+back.
+
+| example | from | with | back to |
+|---|---|---|---|
+| [**Sales forecast**](examples/excel-forecast/) | Excel table of monthly sales | [anofox_forecast](https://github.com/DataZooDE/anofox-forecast): AutoETS, 12 months ahead per product | a `Forecast` table in the same workbook |
+| [**Marketing-mix regression**](examples/excel-statistics/) | Excel table of spend and sales | [anofox_statistics](https://github.com/DataZooDE/anofox-statistics): OLS with CIs and p-values | a `Model` sheet in the same workbook |
+| [**PII and data quality**](examples/list-data-quality/) | SharePoint list of customers | [anofox_tabular](https://github.com/DataZooDE/anofox-tabular): PII scan, email/phone/VAT/IBAN checks | an `Issues` column on every item, plus a masked Parquet copy |
+| [**Lead scoring**](examples/list-lead-scoring/) | SharePoint list of leads | [anofox_tabfm](https://github.com/DataZooDE/anofox-tabfm): zero-shot classification, no training | `Prediction` and `Score` on every open lead |
+
+The forecast, end to end:
+
+```sql
+CREATE TABLE sales AS SELECT * FROM read_excel_table('Finance/sales.xlsx', 'Sales');     -- live from the workbook
+CREATE TABLE forecast AS                                                                -- anofox_forecast
+SELECT product, ds AS month, yhat AS forecast, yhat_lower AS low, yhat_upper AS high
+FROM ts_forecast_by('sales', product, month, revenue, 'AutoETS', 12, '1mo');
+COPY forecast TO 'Finance/sales.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE); -- back, as an Excel table
+```
+
+## Files: `sharepoint://`
+
+The extension registers a `sharepoint://` filesystem. DuckDB sends all file
+access through its virtual filesystem, so everything built on it accepts the
+scheme: `read_parquet`, `read_csv`, `read_json`, `COPY`, `glob`, `ATTACH` of a
+DuckDB database file, and table formats such as DuckLake with their
+`DATA_PATH` on SharePoint.
+
+```sql
+-- By path: one Graph call, with no folder-by-folder walk.
+SELECT count(*) FROM 'sharepoint://Finance/2026/actuals.parquet';
+
+-- By driveItem id: stable across a rename.
 SELECT * FROM read_csv('sharepoint://id:01ABCDEF23456789');
 
 -- Glob: * ? [a-z] [!x] ** and {a,b} alternation, as in duckdb-gdrive.
 SELECT * FROM read_parquet('sharepoint://exports/**/part-[0-9]*.parquet');
 
--- Write a whole file. Graph replaces whole files, so a positional write or an
--- append raises rather than corrupting.
+-- Write a file. It is streamed in bounded memory and appears when complete.
 COPY (SELECT * FROM t) TO 'sharepoint://reports/out.parquet' (FORMAT parquet);
 
--- Attach a DuckDB database file stored in SharePoint, read-only.
+-- A DuckDB database file stored in SharePoint, read-only.
 ATTACH 'sharepoint://warehouse/sales.duckdb' AS sales (READ_ONLY);
 
--- Byte-exact round trip for any content, no CSV/Parquet in between.
+-- Byte-exact round trip for any content, with no CSV or Parquet in between.
 SELECT write_blob('sharepoint://notes/readme.md', '# Title'::BLOB);
 SELECT remove_file('sharepoint://notes/readme.md');   -- true, then false
 ```
 
-## Excel workbooks, live
+`write_blob`, `remove_file`, `move_file` and `file_size` don't depend on the
+scheme, so they work for any filesystem DuckDB can reach (`s3://`, `gs://`,
+local paths). They are shared with duckdb-gdrive, so both extensions can be
+loaded into one database.
+
+## Excel workbooks
 
 `read_excel_table` and `read_excel_range` read an `.xlsx` in SharePoint or
-OneDrive through the Microsoft Graph workbook API. They return the values the
-workbook holds now, without downloading the file, and use the same secret as
-`sharepoint://`.
+OneDrive through the Microsoft Graph **workbook API**. They return the values
+the workbook holds right now, without downloading the file.
 
 ```sql
 -- A named Excel table: the header row gives the column names.
@@ -110,22 +144,22 @@ SELECT * FROM read_excel_range('Finance/plan.xlsx', 'Input', header := false);
 SELECT * FROM read_excel_table('id:01ABCDEF23456789', 'Sales');
 ```
 
-The path is a `sharepoint://` path (the scheme may be left out) or `id:…`.
-Each column gets one type, inferred from the values and number formats:
-BOOLEAN, BIGINT, DOUBLE, DATE, TIMESTAMP, TIME, or VARCHAR when a column mixes
-kinds. Empty cells and error values such as `#DIV/0!` are NULL.
-`all_varchar := true` reads every column as text, with dates as ISO text.
-Sheet names with spaces are quoted Excel-style: `'''My Sheet''!A1:B9'` in SQL.
+- **Types.** Each column gets one type, inferred from its values and number
+  formats: BOOLEAN, BIGINT, DOUBLE, DATE, TIMESTAMP, TIME, or VARCHAR when a
+  column mixes kinds. Empty cells and error values such as `#DIV/0!` are NULL.
+  `all_varchar := true` reads everything as text, with dates as ISO text.
+- **Paths.** A `sharepoint://` path (the scheme may be left out) or `id:…`.
+  Sheet names with spaces are quoted Excel-style: `'''My Sheet''!A1:B9'` in SQL.
 
 Write results back with `COPY`. The workbook is changed in place through the
-same API, never re-uploaded, so it can stay open in Excel:
+same API and never re-uploaded, so it can stay open in Excel while you write:
 
 ```sql
--- Append rows to a table, matching columns by name; a missing table is
+-- Append rows to a table, matching columns by name. A missing table is
 -- created on a new sheet of its name (or SHEET '<name>').
 COPY (SELECT month, forecast FROM fc) TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast');
 
--- Overwrite a block from its top-left cell, the column names first (HEADER false: data only).
+-- Overwrite a block from its top-left cell, column names first (HEADER false: data only).
 COPY (SELECT * FROM summary) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Summary!B2');
 ```
 
@@ -139,36 +173,97 @@ COPY forecast TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVER
 ```
 
 Dates, timestamps and times are written with a date format, so they read back
-typed. Text stays text: `=1+1` is not turned into a formula.
+typed. Text stays text: `=1+1` doesn't become a formula, and `00123` doesn't
+become a number.
+
+## SharePoint lists
+
+`read_sharepoint_list` reads a SharePoint list as a table, one row per item:
+
+```sql
+SELECT * FROM read_sharepoint_list('Orders');                  -- a list on the secret's site
+SELECT * FROM read_sharepoint_list('id:4f2c…');                -- by list id
+SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- another site on the same host
+```
+
+- **Columns** are named by their display names and typed: text, number,
+  currency (DECIMAL), yes/no, date and time (TIMESTAMP, UTC), and choice
+  (VARCHAR, or VARCHAR[] for several choices).
+- **Lookups and people:** a lookup column gives its value plus `<name>_id`; a
+  person column gives `<name>_id`.
+- Every row also has **`id`, `created` and `modified`**. Lists of any size
+  are read page by page, including past the 5,000-item list view threshold.
+
+Write items back with `COPY`. A row with an `id` updates that item, a row
+without one creates a new item, and columns are matched by name:
+
+```sql
+COPY (SELECT 'A-17' AS Title, 120.0 AS Amount, 2 AS Customer_id) TO 'Orders' (FORMAT sharepoint_list);
+COPY (SELECT id, Amount * 1.1 AS Amount FROM read_sharepoint_list('Orders') WHERE Status = 'open')
+TO 'Orders' (FORMAT sharepoint_list);
+```
+
+`created`, `modified` and a lookup's display value are skipped (a lookup is
+set through `<name>_id`), so a list read with `read_sharepoint_list` can be
+changed and written back as it is.
+
+## Installation
+
+```sql
+INSTALL sharepoint FROM community;
+LOAD sharepoint;
+```
+
+The community repository serves DuckDB 2.0. Until its DuckDB v1.5.6 build is
+published, v1.5.6 users can install from erpl.io. That binary is unsigned, so
+start DuckDB with `-unsigned` (or set `allow_unsigned_extensions`):
+
+```sql
+-- duckdb -unsigned
+INSTALL 'sharepoint' FROM 'http://get.erpl.io';
+LOAD sharepoint;
+```
 
 ## Authentication
 
 | provider | use | fields |
 |---|---|---|
-| `client_credentials` *(default)* | headless daemon | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` |
-| `config` | paste a pre-obtained token | `ACCESS_TOKEN` *(or `REFRESH_TOKEN` + `TENANT_ID`/`CLIENT_ID`, + `CLIENT_SECRET` for a confidential client)* |
-| `device_code` | **as a user**, headless shells | `TENANT_ID`, `CLIENT_ID` *(optional `REFRESH_TOKEN`)* |
-| `authorization_code` | **as a user**, browser on this machine | `TENANT_ID`, `CLIENT_ID` *(optional `REFRESH_TOKEN`, `REDIRECT_PORT`, default 8020)* |
+| `client_credentials` *(default)* | unattended jobs, as an app | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` |
+| `device_code` | **as yourself**, any shell | `TENANT_ID`, `CLIENT_ID` *(optional `REFRESH_TOKEN`)* |
+| `authorization_code` | **as yourself**, browser on this machine | `TENANT_ID`, `CLIENT_ID` *(optional `REFRESH_TOKEN`, `REDIRECT_PORT`, default 8020)* |
+| `config` | a token you already have | `ACCESS_TOKEN` *(or `REFRESH_TOKEN` + `TENANT_ID`/`CLIENT_ID`, + `CLIENT_SECRET` for a confidential client)* |
 
-Common to all: `DRIVE_ID` **or** `SITE_ID` (the drive the paths hang off;
-a `SITE_ID` is resolved to the site's default library once and cached), and an
-optional `GRAPH_SCOPE` (defaults to `<graph endpoint>/.default`, i.e. the right
-cloud). Several secrets can coexist; DuckDB picks the one whose `SCOPE` path
-prefix matches best, so different folders can map to different drives (moves
-between two drives are refused rather than silently landing in one of them).
+**Common to all providers:**
+- `DRIVE_ID` **or** `SITE_ID`: the document library paths hang off. A
+  `SITE_ID` resolves to the site's default library, once.
+- Optional `GRAPH_SCOPE`, which defaults to `<graph endpoint>/.default`, i.e.
+  the right cloud.
 
-Tokens are cached per **fingerprint of the credentials** (never per secret
-name), so a secret recreated under the same name with different credentials
-authenticates afresh.
+Several secrets can coexist. DuckDB picks the one whose `SCOPE` path prefix
+matches best, so different folders can map to different drives. A move
+between two drives is refused rather than silently landing in one of them.
+Lists have no path, so they use the secret in scope for `sharepoint://`.
 
-### Delegated (user) auth
+**App-only.** Register an app in Entra ID and grant it the
+`Sites.ReadWrite.All` **application** permission, with admin consent.
+`Files.ReadWrite.All` is enough for files and Excel workbooks, but SharePoint
+lists need `Sites.ReadWrite.All`:
 
-`device_code` and `authorization_code` act **as the signed-in user** (files are
-authored by them, and they see only what they may). Both are public clients —
-no client secret. Register an Entra app with *Allow public client flows*
-enabled (and, for `authorization_code`, an `http://localhost` *Mobile and
-desktop applications* redirect), with the **delegated** permissions
-`Files.ReadWrite.All`, `Sites.ReadWrite.All` and `offline_access` consented.
+```sql
+CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,
+    TENANT_ID '00000000-0000-0000-0000-000000000000', CLIENT_ID '...', CLIENT_SECRET '...',
+    DRIVE_ID 'b!AbCdEf...');
+```
+
+**As a user.** `device_code` and `authorization_code` act as the signed-in
+user: files are authored by them, and they see only what they may. Both are
+public clients, with no client secret. Register an Entra app with these
+settings:
+- *Allow public client flows* enabled.
+- For `authorization_code`, an `http://localhost` redirect under *Mobile and
+  desktop applications*.
+- The **delegated** permissions `Files.ReadWrite.All`, `Sites.ReadWrite.All`
+  and `offline_access`, consented.
 
 ```sql
 CREATE PERSISTENT SECRET sp_me (TYPE sharepoint, PROVIDER device_code,
@@ -177,78 +272,132 @@ SELECT * FROM read_csv('sharepoint://Shared/report.csv');
 -- sharepoint: to sign in, open https://login.microsoft.com/device and enter the code ABCD1234 (valid for 15 minutes)
 ```
 
-The sign-in runs once, on first use; the refresh token is then stored in the
+The sign-in runs once, on first use. The refresh token is then stored in the
 secret (on disk for a `PERSISTENT` one, redacted in `duckdb_secrets()`) and
 refreshed silently from then on. `sharepoint_device_code_timeout_seconds`
 bounds the wait. Pass `REFRESH_TOKEN` to skip the sign-in entirely, e.g. with
-a token from `scripts/delegated_login.py` (`make delegated_login`), which runs
-the device-code flow and writes the token to the git-ignored
-`.env.sharepoint.delegated` — never to the terminal.
+a token from `make delegated_login`, which writes it to the git-ignored
+`.env.sharepoint.delegated` and never to the terminal.
 
 > **What a delegated secret holds.** The refresh token acts as the user for
-> everything the default scope covers — read/write on every file and site the
-> user can reach (`Files.ReadWrite.All Sites.ReadWrite.All`). Narrow it with
-> `GRAPH_SCOPE` (keep `offline_access`). A `PERSISTENT` secret stores the token
-> in DuckDB's secret directory **in plain text** (DuckDB's design, as for every
-> persistent secret), protected only by file permissions; prefer a temporary
-> secret on shared machines. Entra rotates the token on each refresh and the
-> extension writes the newest one back, so an active secret keeps working; one
-> unused for ~90 days needs a new sign-in.
+> everything the default scope covers: read and write on every file and site
+> the user can reach. Narrow it with `GRAPH_SCOPE` (keep `offline_access`).
+> A `PERSISTENT` secret stores the token in DuckDB's secret directory **in
+> plain text**, protected only by file permissions; that is DuckDB's design
+> for every persistent secret. Prefer a temporary secret on shared machines.
+> Entra rotates the token on each refresh and the extension writes the newest
+> one back. A token unused for about 90 days needs a new sign-in.
 
-> The option is `GRAPH_SCOPE`, **not** `SCOPE`: DuckDB's `CREATE SECRET` grammar
-> reserves `SCOPE` for the secret's path-matching prefix list, so an OAuth scope
-> named `scope` would silently rescope the secret to match no path at all. This
-> is the same trap `duckdb-gdrive` documents for `DRIVE_SCOPE`.
+Tokens are cached per **fingerprint of the credentials**, never per secret
+name, so a secret recreated under the same name with different credentials
+authenticates afresh.
+
+**Where the IDs come from.** All of them are on the app registration's
+*Overview* page in the Entra admin center (*App registrations → All
+applications → your app*): **Application (client) ID** is `CLIENT_ID`, and
+**Directory (tenant) ID** is `TENANT_ID` (a verified domain such as
+`contoso.onmicrosoft.com` works too). The *Object ID* is not used. `DRIVE_ID`
+and `SITE_ID` are SharePoint's, not Entra's.
+
+**When a sign-in fails**, Entra's error code says what to fix:
+
+| error | meaning | fix |
+|---|---|---|
+| `AADSTS700016` | no app with this client ID in this tenant | copy both IDs from the same app's *Overview* page; use the *Application (client) ID*, not the *Object ID* |
+| `AADSTS7000218` | the app is not a public client | *Authentication → Allow public client flows* → **Enabled**, then **Save** |
+| `AADSTS50173` / `invalid_grant` | the refresh token expired or was revoked | sign in again (recreate the secret without `REFRESH_TOKEN`) |
+| HTTP 403 `accessDenied` | the app lacks a permission | add it under *API permissions* and click **Grant admin consent** (it shows *Not granted* until then) |
+
+> The option is `GRAPH_SCOPE`, **not** `SCOPE`: DuckDB's `CREATE SECRET`
+> grammar reserves `SCOPE` for the secret's path-prefix list. An OAuth scope
+> named `scope` would silently rescope the secret so that it matches no path.
 
 ## Settings
 
 | setting | default | meaning |
 |---|---|---|
-| `sharepoint_block_size_bytes` | 8 MiB | Reads are served from a shared, single-flight block cache (256 MiB, LRU, keyed by credentials + item + cTag). Capped at 64 MiB; `0` disables it. |
-| `sharepoint_upload_chunk_bytes` | 10 MiB | Upload chunk size — and the most memory one file being written holds. Files up to this size upload in one PUT on close; larger ones stream through a resumable upload session, one chunk at a time, as they are written (a multiple of 320 KiB, below 60 MiB). `sharepoint_stats()` reports `upload_chunk`, `upload_commit`, `upload_abort` and the high-water mark `upload_buffer_peak`. |
-| `sharepoint_permanent_delete` | `false` | `remove_file` sends items to the site's recycle bin unless this is set. |
+| `sharepoint_block_size_bytes` | 8 MiB | Block size of the shared, single-flight read cache (256 MiB, LRU, keyed by credentials + item + cTag). At most 64 MiB; `0` disables it. |
+| `sharepoint_upload_chunk_bytes` | 10 MiB | Upload chunk size, and the most memory one file being written holds. Smaller files go up in one PUT on close; larger ones stream through a resumable upload session (a multiple of 320 KiB, below 60 MiB). |
+| `sharepoint_permanent_delete` | `false` | `remove_file` moves items to the site's recycle bin unless this is set. |
 | `sharepoint_immutable_prefixes` | *(empty)* | Comma-separated `sharepoint://` prefixes whose files are **never rewritten in place** (e.g. a DuckLake `DATA_PATH`). Their metadata is remembered, saving a Graph call per open. **Declaring a prefix whose files change causes stale reads.** |
-| `sharepoint_device_code_timeout_seconds` | 900 | How long `PROVIDER device_code` waits for the user to sign in (1–3600; also capped by the code's own lifetime). |
-| `sharepoint_graph_endpoint` / `sharepoint_login_endpoint` | global cloud | National clouds: `https://graph.microsoft.us` / `https://login.microsoftonline.us` (GCC High), `https://dod-graph.microsoft.us`, or the China cloud. Only these Microsoft hosts are accepted, so credentials cannot be redirected elsewhere. |
-| `sharepoint_telemetry_enabled` | `true` | Anonymous usage telemetry, shared with the sibling DataZoo extensions. `false` stops it for the rest of the session; the one-time load event is sent before any setting can exist (DuckDB rejects a setting for an extension that is not loaded yet), so to suppress that too set the environment variable `DATAZOO_DISABLE_TELEMETRY=1`. |
+| `sharepoint_device_code_timeout_seconds` | 900 | How long `PROVIDER device_code` waits for the sign-in (1–3600, also capped by the code's own lifetime). |
+| `sharepoint_graph_endpoint` / `sharepoint_login_endpoint` | global cloud | National clouds: `https://graph.microsoft.us` / `https://login.microsoftonline.us` (GCC High), `https://dod-graph.microsoft.us`, or the China cloud. Only Microsoft hosts are accepted, so credentials can't be redirected elsewhere. |
+| `sharepoint_telemetry_enabled` | `true` | Anonymous usage telemetry, shared with the sibling DataZoo extensions. `false` stops it for the session. To suppress the one-time load event too, set the environment variable `DATAZOO_DISABLE_TELEMETRY=1`. |
 
 ## Diagnostics
 
 ```sql
 CALL sharepoint_reset_stats();
 SELECT * FROM read_parquet('sharepoint://exports/**/*.parquet');
-SELECT * FROM sharepoint_stats();   -- token_request, stat, read_range, list_page,
-                                    -- upload_*, retries, throttled, bytes_read, ...
-                                    -- (upload_buffer_peak is a high-water mark)
+SELECT * FROM sharepoint_stats();   -- token_request, stat, read_range, list_page, upload_*,
+                                    -- workbook, list, retries, throttled, bytes_read, ...
 ```
 
-Graph throttles SharePoint aggressively; every call is retried with jittered
+Graph throttles SharePoint aggressively. Every call is retried with jittered
 exponential backoff (500 ms → 20 s, honouring `Retry-After`), and the
-`throttled` / `retries` counters show it happening. Errors carry Graph's error
-code (`HTTP 409 (conflict, nameAlreadyExists): ...`) and map to
-`PermissionException` (403) or `InvalidInputException` (400) where that is what
-they are.
+`throttled` / `retries` counters show it happening. Requests that must not
+run twice, such as adding rows to a table or creating list items, are
+re-sent only when Graph refused them, never after an ambiguous failure.
+Errors carry Graph's own error code, e.g. `HTTP 409 (conflict,
+nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
+`InvalidInputException` for a 400.
 
 ## Limitations
 
-- **Whole-file writes, streamed.** Graph replaces files; there is no
-  positional write or append (both are refused). A write is **streamed**: the
-  file being written holds at most one upload chunk in memory
-  (`sharepoint_upload_chunk_bytes`), and anything larger goes up chunk by chunk
-  through an upload session as it is written — a 373 MiB `COPY` peaks at
-  ~120 MiB RSS for the whole process (it was ~520 MiB when writes were
-  buffered). The session is opened with `deferCommit`, so the file is published
-  only by the commit on close: an overwritten file keeps its old content until
-  then, and a write that fails mid-stream — or a query that errors part-way
-  through a `COPY` — discards the session and publishes nothing. While a NEW
-  file's session is open, SharePoint shows a 0-byte placeholder at its path
-  (removed if the session is discarded); `COPY` writes to a `tmp_` name and
-  moves it into place, so the real name never shows it.
+- **Whole-file writes, streamed.** Graph replaces files, so positional writes
+  and appends are refused. A write holds at most one upload chunk in memory;
+  a 373 MiB `COPY` peaks at about 120 MiB RSS. The file is published only when
+  it is closed: an overwritten file keeps its old content until then, and a
+  write that fails part-way publishes nothing.
 - **Names.** SharePoint forbids `" * : < > ? \ |` in file and folder names;
   such writes are refused up front.
-- **ATTACH is read-only** (a DuckDB database file cannot be updated in place).
-- **Error class for a missing secret** is `InvalidInputException` here and
-  `IOException` in `duckdb-gdrive`.
+- **ATTACH is read-only.** A DuckDB database file can't be updated in place.
+- **Excel.**
+  - Workbooks are read whole when the query is planned, which suits Excel's
+    sizes; a sheet of millions of cells belongs in Parquet.
+  - Workbooks in the 1904 date system (old Mac files) read four years early.
+- **Lists.**
+  - No filter pushdown yet.
+  - A person column gives the person's id, not their name.
+  - A date-only column comes back as midnight in the site's time zone,
+    converted to UTC.
+
+## Network and privacy
+
+Your data goes only between DuckDB and Microsoft:
+
+| what | where | opt out |
+|---|---|---|
+| Files, workbooks, lists | Microsoft Graph (`graph.microsoft.com`, or your national cloud) | — |
+| Sign-in and token refresh | Entra ID (`login.microsoftonline.com`, or your national cloud) | — |
+| File downloads and upload chunks | your tenant's own SharePoint host, via pre-authenticated URLs Graph hands out | — |
+| Telemetry | one anonymous `extension_loaded` event to PostHog EU: the extension's name, version and platform, and a random installation id | `SET sharepoint_telemetry_enabled = false`, or `DATAZOO_DISABLE_TELEMETRY=1` to stop the load event too |
+
+Only Microsoft hosts are accepted as endpoints, so a setting can't send your
+credentials elsewhere. Access tokens are held in memory only. Refresh tokens
+are stored only in a `PERSISTENT` secret, in DuckDB's secret directory (see
+[Authentication](#authentication)). Telemetry never includes your data,
+paths, table or list names, or SQL.
+
+## How it works
+
+Google Drive has **no path addressing**: resolving `a/b/c.parquet` costs one
+`files.list` per segment, which is why duckdb-gdrive carries a large
+path→id cache. Microsoft Graph addresses items **by path** natively:
+
+```
+GET /drives/{drive-id}/root:/Finance/2026/actuals.parquet:/content
+```
+
+So this extension needs no path cache. SharePoint also forbids two items of
+the same name in one folder, so there is no duplicate-name ambiguity to
+resolve either.
+- **Reads** are ranged and served from a block cache.
+- **Writes** stream through a resumable upload session.
+- **Excel and list writes** go through their APIs, never as file uploads.
+
+The design, and the Graph behaviours found along the way, are in
+[docs/hld.md](docs/hld.md).
 
 ## Building and testing
 
@@ -257,25 +406,31 @@ git clone --recursive https://github.com/DataZooDE/duckdb-sharepoint
 cd duckdb-sharepoint
 GEN=ninja make      # extension + Catch2 binary
 make test           # Catch2 pure-logic + credential-free SQL tests
-make test_live      # SQL round trip against a real tenant
+make test_live      # SQL suites against a real tenant
 make e2e            # live end-to-end harness (Python + uv)
 make check_pin check_credentials check_cstdint check_stamp smoke_loadable
 ```
 
-Live tests read `SHAREPOINT_TENANT_ID`, `SHAREPOINT_CLIENT_ID`,
-`SHAREPOINT_CLIENT_SECRET` and `SHAREPOINT_DRIVE_ID` from the environment (or a
-git-ignored `.env.sharepoint`, see `.env.sharepoint.example`). There are no
-mocks: everything Graph-facing is proven against a real tenant.
+There are no mocks: everything Graph-facing is proven against a real
+Microsoft 365 tenant. The test tenant needs two apps: an **app-only** one
+with the application permissions `Sites.ReadWrite.All` and
+`Sites.Manage.All` (the e2e harness creates its own fixture lists once; the
+extension itself never needs it), and a **public-client** one for the
+delegated tests (see [Authentication](#authentication)). Live tests read `SHAREPOINT_TENANT_ID`,
+`SHAREPOINT_CLIENT_ID`, `SHAREPOINT_CLIENT_SECRET` and `SHAREPOINT_DRIVE_ID`
+from the environment, or from a git-ignored `.env.sharepoint` (see
+`.env.sharepoint.example`).
 
 The delegated live tests use a test user's refresh token from
 `make delegated_login` (`.env.sharepoint.delegated`). In CI it is the repo
-secret `SHAREPOINT_USER_REFRESH_TOKEN`; the weekly `RotateRefreshToken.yml`
-workflow redeems it and writes the rotated token back, using
-`SECRETS_ROTATION_TOKEN` (a fine-grained PAT for this repository only with
-"Secrets: Read and write", stored in the `secrets-rotation` environment, which
-only `main` can use). To check the token locally without writing anything,
-load the env file `make delegated_login` wrote, from the repo root, in a
-subshell so the token does not stay in your shell:
+secret `SHAREPOINT_USER_REFRESH_TOKEN`. The weekly `RotateRefreshToken.yml`
+workflow redeems it and writes the rotated token back using
+`SECRETS_ROTATION_TOKEN`. That token is a fine-grained PAT for this repository
+only, with "Secrets: Read and write", stored in the `secrets-rotation`
+environment, which only `main` can use.
+
+To check the token locally without writing anything, run this from the repo
+root. The subshell keeps the token out of your shell:
 
 ```sh
 (set -a; . ./.env.sharepoint.delegated; set +a; python3 scripts/rotate_refresh_token.py --dry-run)
@@ -285,6 +440,37 @@ It prints only SHA-256 fingerprints of the old and rotated tokens. If it
 reports `invalid_grant`, sign in again with `make delegated_login` and update
 the secret. Details: [docs/hld.md §5.2](docs/hld.md).
 
+## Support and feedback
+
+- Design notes and the Graph behaviours found along the way: [docs/hld.md](docs/hld.md)
+- Issues: [GitHub Issues](https://github.com/DataZooDE/duckdb-sharepoint/issues)
+
+If `sharepoint` misbehaves, please [open an issue](https://github.com/DataZooDE/duckdb-sharepoint/issues).
+That includes a sign-in that won't complete, a workbook or list that reads
+wrong, or a write that doesn't land. SharePoint behaves differently with
+tenant settings, permissions and throttling in ways we can't reproduce here,
+so a report with your setup is the fastest path to a fix. Errors end with
+that link.
+
+If it saved you time, a star on the repo helps other people find it.
+
+The first time you load the extension in an interactive terminal each day, a
+small banner says the same. It never prints when output is piped, in notebooks
+or in CI. Silence it with `SET datazoo_banner = false;` or `DATAZOO_NO_BANNER=1`.
+
 ## License
 
-MIT © 2026 DataZoo GmbH.
+MIT © 2026 DataZoo GmbH. See [LICENSE](LICENSE).
+
+## Citation
+
+If you use this extension in research, please cite:
+
+```bibtex
+@software{duckdb_sharepoint,
+  title  = {duckdb-sharepoint: Microsoft 365 Business Data in SQL for DuckDB},
+  author = {Joachim Rosskopf and DataZoo GmbH},
+  year   = {2026},
+  url    = {https://github.com/DataZooDE/duckdb-sharepoint}
+}
+```

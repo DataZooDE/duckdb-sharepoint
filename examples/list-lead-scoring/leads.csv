@@ -1,0 +1,301 @@
+Title,Industry,Employees,Visits,Downloads,Source,Outcome
+Lead 001,Public sector,170,22,3,Webinar,lost
+Lead 002,Public sector,956,23,0,Website,lost
+Lead 003,Software,4348,11,5,Webinar,won
+Lead 004,Software,13,7,3,Webinar,won
+Lead 005,Manufacturing,88,24,5,Webinar,won
+Lead 006,Public sector,4470,1,2,Trade fair,lost
+Lead 007,Software,129,14,1,Cold call,lost
+Lead 008,Manufacturing,161,26,3,Referral,won
+Lead 009,Retail,3845,7,1,Cold call,won
+Lead 010,Software,1219,29,3,Referral,won
+Lead 011,Retail,14,13,1,Webinar,lost
+Lead 012,Manufacturing,4446,10,5,Webinar,won
+Lead 013,Manufacturing,39,15,2,Trade fair,won
+Lead 014,Manufacturing,65,23,5,Cold call,won
+Lead 015,Logistics,16,4,5,Trade fair,won
+Lead 016,Logistics,43,9,1,Cold call,won
+Lead 017,Public sector,205,7,1,Trade fair,lost
+Lead 018,Public sector,22,5,2,Website,lost
+Lead 019,Retail,2553,30,6,Trade fair,won
+Lead 020,Public sector,895,17,6,Referral,won
+Lead 021,Retail,745,8,4,Webinar,lost
+Lead 022,Retail,4149,5,6,Cold call,lost
+Lead 023,Retail,14,17,3,Referral,won
+Lead 024,Software,3685,14,3,Trade fair,won
+Lead 025,Logistics,425,11,0,Webinar,won
+Lead 026,Logistics,1101,16,4,Cold call,lost
+Lead 027,Software,51,27,3,Website,won
+Lead 028,Public sector,564,1,0,Referral,lost
+Lead 029,Public sector,625,15,5,Referral,won
+Lead 030,Retail,19,24,3,Cold call,won
+Lead 031,Software,4573,13,4,Cold call,lost
+Lead 032,Manufacturing,509,25,0,Cold call,won
+Lead 033,Retail,23,17,3,Webinar,won
+Lead 034,Logistics,459,7,5,Referral,won
+Lead 035,Software,616,23,3,Cold call,won
+Lead 036,Manufacturing,519,14,2,Trade fair,lost
+Lead 037,Manufacturing,3598,4,4,Trade fair,won
+Lead 038,Logistics,295,11,4,Webinar,won
+Lead 039,Logistics,22,20,2,Webinar,won
+Lead 040,Retail,376,27,2,Webinar,won
+Lead 041,Logistics,529,27,6,Referral,won
+Lead 042,Software,270,11,0,Referral,won
+Lead 043,Retail,396,24,1,Trade fair,won
+Lead 044,Software,2092,24,3,Trade fair,won
+Lead 045,Manufacturing,1460,29,2,Website,won
+Lead 046,Software,566,3,0,Webinar,lost
+Lead 047,Retail,240,20,6,Website,won
+Lead 048,Software,48,18,1,Webinar,won
+Lead 049,Logistics,453,29,4,Trade fair,won
+Lead 050,Logistics,4893,3,2,Trade fair,lost
+Lead 051,Software,3585,7,1,Cold call,lost
+Lead 052,Retail,15,11,5,Webinar,lost
+Lead 053,Manufacturing,2396,14,2,Trade fair,lost
+Lead 054,Software,205,6,2,Website,won
+Lead 055,Manufacturing,17,25,3,Referral,won
+Lead 056,Retail,2866,16,4,Webinar,lost
+Lead 057,Manufacturing,19,10,0,Website,won
+Lead 058,Retail,39,28,2,Referral,won
+Lead 059,Public sector,63,3,0,Referral,won
+Lead 060,Public sector,2926,20,2,Cold call,won
+Lead 061,Manufacturing,1149,15,2,Website,won
+Lead 062,Software,50,14,0,Webinar,lost
+Lead 063,Public sector,485,10,1,Webinar,lost
+Lead 064,Manufacturing,239,28,5,Cold call,won
+Lead 065,Retail,24,1,5,Cold call,lost
+Lead 066,Logistics,42,28,0,Referral,lost
+Lead 067,Manufacturing,20,28,3,Cold call,won
+Lead 068,Public sector,3917,23,0,Cold call,won
+Lead 069,Logistics,98,4,4,Referral,won
+Lead 070,Public sector,367,5,3,Webinar,lost
+Lead 071,Retail,599,9,5,Trade fair,won
+Lead 072,Logistics,16,10,1,Cold call,lost
+Lead 073,Retail,12,26,3,Cold call,won
+Lead 074,Manufacturing,965,18,1,Website,won
+Lead 075,Manufacturing,17,26,0,Trade fair,won
+Lead 076,Logistics,272,3,3,Cold call,won
+Lead 077,Manufacturing,788,29,1,Cold call,lost
+Lead 078,Public sector,1135,24,6,Cold call,lost
+Lead 079,Logistics,4702,3,2,Webinar,lost
+Lead 080,Software,85,1,5,Cold call,lost
+Lead 081,Public sector,3133,3,5,Webinar,lost
+Lead 082,Manufacturing,27,18,1,Referral,won
+Lead 083,Public sector,21,29,1,Website,lost
+Lead 084,Logistics,19,11,0,Referral,lost
+Lead 085,Logistics,51,3,1,Cold call,lost
+Lead 086,Retail,1673,14,2,Cold call,lost
+Lead 087,Manufacturing,170,1,1,Referral,won
+Lead 088,Logistics,73,2,6,Referral,won
+Lead 089,Retail,321,9,1,Referral,lost
+Lead 090,Retail,90,16,4,Referral,won
+Lead 091,Software,12,8,5,Trade fair,won
+Lead 092,Logistics,108,1,2,Cold call,lost
+Lead 093,Software,1722,14,3,Webinar,won
+Lead 094,Public sector,42,22,6,Cold call,won
+Lead 095,Public sector,11,21,6,Referral,won
+Lead 096,Retail,220,17,6,Webinar,won
+Lead 097,Manufacturing,12,3,1,Webinar,won
+Lead 098,Retail,1503,15,3,Referral,won
+Lead 099,Public sector,37,25,3,Referral,won
+Lead 100,Manufacturing,777,3,2,Webinar,won
+Lead 101,Logistics,3942,20,0,Referral,lost
+Lead 102,Software,4691,29,3,Trade fair,won
+Lead 103,Retail,78,17,0,Webinar,lost
+Lead 104,Software,3604,17,3,Cold call,won
+Lead 105,Software,348,25,2,Cold call,won
+Lead 106,Retail,22,26,5,Cold call,won
+Lead 107,Retail,940,24,2,Trade fair,lost
+Lead 108,Logistics,10,7,5,Webinar,won
+Lead 109,Manufacturing,383,6,0,Trade fair,lost
+Lead 110,Public sector,28,20,2,Webinar,won
+Lead 111,Public sector,3858,25,4,Website,won
+Lead 112,Software,431,17,6,Referral,won
+Lead 113,Retail,16,2,4,Webinar,won
+Lead 114,Logistics,2319,18,1,Referral,won
+Lead 115,Software,2856,21,1,Referral,won
+Lead 116,Retail,14,11,2,Cold call,won
+Lead 117,Software,18,30,6,Webinar,won
+Lead 118,Public sector,20,27,4,Webinar,won
+Lead 119,Retail,565,21,6,Cold call,won
+Lead 120,Manufacturing,12,16,4,Website,won
+Lead 121,Retail,521,8,6,Trade fair,won
+Lead 122,Manufacturing,23,15,0,Referral,won
+Lead 123,Retail,213,22,3,Website,won
+Lead 124,Software,86,25,5,Referral,won
+Lead 125,Retail,22,26,6,Cold call,won
+Lead 126,Logistics,3598,9,1,Webinar,lost
+Lead 127,Software,1306,12,2,Webinar,lost
+Lead 128,Manufacturing,231,10,5,Webinar,won
+Lead 129,Logistics,17,30,2,Referral,won
+Lead 130,Public sector,176,25,1,Trade fair,lost
+Lead 131,Public sector,261,5,3,Referral,won
+Lead 132,Software,360,30,3,Webinar,won
+Lead 133,Logistics,2275,16,4,Referral,won
+Lead 134,Public sector,1134,27,5,Trade fair,won
+Lead 135,Public sector,573,12,0,Referral,lost
+Lead 136,Manufacturing,2023,8,6,Cold call,won
+Lead 137,Software,19,29,1,Webinar,won
+Lead 138,Software,4079,8,3,Cold call,lost
+Lead 139,Logistics,24,3,5,Trade fair,lost
+Lead 140,Software,128,9,4,Referral,won
+Lead 141,Manufacturing,11,16,4,Cold call,won
+Lead 142,Manufacturing,203,14,4,Trade fair,won
+Lead 143,Software,105,10,0,Referral,won
+Lead 144,Public sector,28,23,6,Trade fair,won
+Lead 145,Retail,93,29,5,Webinar,won
+Lead 146,Public sector,189,18,6,Trade fair,won
+Lead 147,Logistics,481,2,1,Referral,lost
+Lead 148,Logistics,75,13,4,Webinar,won
+Lead 149,Retail,2202,2,5,Trade fair,lost
+Lead 150,Manufacturing,200,8,1,Referral,won
+Lead 151,Manufacturing,211,4,1,Website,lost
+Lead 152,Logistics,220,11,1,Referral,lost
+Lead 153,Retail,421,12,0,Referral,won
+Lead 154,Public sector,19,24,2,Referral,won
+Lead 155,Software,70,14,0,Trade fair,lost
+Lead 156,Public sector,14,29,4,Referral,won
+Lead 157,Logistics,3499,5,6,Cold call,lost
+Lead 158,Retail,119,23,0,Cold call,won
+Lead 159,Retail,2042,1,4,Referral,lost
+Lead 160,Software,31,0,0,Cold call,lost
+Lead 161,Logistics,353,9,3,Trade fair,lost
+Lead 162,Public sector,1532,6,3,Cold call,won
+Lead 163,Software,1867,8,2,Website,won
+Lead 164,Public sector,280,26,5,Trade fair,won
+Lead 165,Software,17,16,5,Referral,won
+Lead 166,Logistics,380,17,6,Cold call,won
+Lead 167,Logistics,2555,9,5,Referral,lost
+Lead 168,Logistics,3649,15,6,Referral,won
+Lead 169,Software,12,23,4,Webinar,won
+Lead 170,Logistics,4258,28,2,Trade fair,won
+Lead 171,Software,118,23,0,Webinar,won
+Lead 172,Retail,4765,15,0,Website,won
+Lead 173,Logistics,1690,21,6,Website,won
+Lead 174,Retail,19,6,6,Referral,lost
+Lead 175,Logistics,1634,11,6,Referral,won
+Lead 176,Logistics,17,2,6,Trade fair,won
+Lead 177,Software,1731,24,3,Webinar,won
+Lead 178,Manufacturing,109,29,1,Webinar,won
+Lead 179,Logistics,389,22,5,Trade fair,won
+Lead 180,Public sector,20,28,0,Cold call,lost
+Lead 181,Public sector,1285,16,5,Website,won
+Lead 182,Software,3604,11,6,Cold call,lost
+Lead 183,Public sector,218,13,2,Webinar,won
+Lead 184,Software,3919,11,4,Referral,won
+Lead 185,Logistics,10,1,5,Trade fair,lost
+Lead 186,Software,596,8,6,Referral,won
+Lead 187,Logistics,261,7,2,Webinar,lost
+Lead 188,Retail,100,24,1,Trade fair,lost
+Lead 189,Logistics,18,3,1,Trade fair,won
+Lead 190,Public sector,38,9,6,Cold call,won
+Lead 191,Logistics,455,27,6,Website,won
+Lead 192,Software,48,21,1,Referral,won
+Lead 193,Retail,424,16,4,Referral,lost
+Lead 194,Software,550,23,1,Referral,won
+Lead 195,Retail,157,23,2,Webinar,won
+Lead 196,Public sector,15,21,5,Trade fair,won
+Lead 197,Logistics,334,27,5,Referral,won
+Lead 198,Public sector,822,18,3,Cold call,won
+Lead 199,Software,11,7,0,Webinar,won
+Lead 200,Logistics,56,30,2,Cold call,won
+Lead 201,Retail,130,1,6,Referral,won
+Lead 202,Public sector,18,7,3,Website,won
+Lead 203,Retail,305,1,3,Website,won
+Lead 204,Manufacturing,2778,15,4,Trade fair,won
+Lead 205,Retail,215,10,0,Trade fair,lost
+Lead 206,Retail,62,14,3,Cold call,won
+Lead 207,Public sector,305,8,6,Website,won
+Lead 208,Logistics,531,7,1,Referral,won
+Lead 209,Logistics,87,10,0,Webinar,lost
+Lead 210,Logistics,550,18,6,Cold call,won
+Lead 211,Public sector,68,14,1,Cold call,lost
+Lead 212,Retail,512,21,5,Website,won
+Lead 213,Public sector,20,9,5,Referral,won
+Lead 214,Software,150,24,3,Website,won
+Lead 215,Logistics,149,6,0,Website,lost
+Lead 216,Retail,15,27,2,Referral,won
+Lead 217,Retail,133,4,2,Webinar,lost
+Lead 218,Retail,132,2,3,Webinar,lost
+Lead 219,Logistics,21,24,0,Trade fair,won
+Lead 220,Public sector,1184,24,4,Website,won
+Lead 221,Software,3579,25,3,Referral,won
+Lead 222,Public sector,111,27,6,Cold call,won
+Lead 223,Logistics,125,5,1,Cold call,lost
+Lead 224,Public sector,73,19,4,Trade fair,won
+Lead 225,Public sector,11,26,6,Referral,won
+Lead 226,Manufacturing,104,11,2,Cold call,lost
+Lead 227,Public sector,123,20,5,Cold call,won
+Lead 228,Public sector,13,4,2,Cold call,lost
+Lead 229,Public sector,722,13,1,Website,won
+Lead 230,Retail,3778,8,1,Cold call,lost
+Lead 231,Public sector,716,29,3,Cold call,won
+Lead 232,Software,2345,25,4,Trade fair,won
+Lead 233,Software,113,11,5,Cold call,won
+Lead 234,Manufacturing,60,23,3,Trade fair,won
+Lead 235,Software,13,6,3,Website,lost
+Lead 236,Retail,4614,3,0,Cold call,lost
+Lead 237,Retail,2495,17,3,Cold call,won
+Lead 238,Public sector,27,20,5,Website,won
+Lead 239,Manufacturing,50,24,5,Cold call,won
+Lead 240,Software,63,18,1,Website,won
+Lead 241,Retail,2713,27,4,Trade fair,
+Lead 242,Logistics,114,11,2,Trade fair,
+Lead 243,Public sector,1175,26,5,Cold call,
+Lead 244,Retail,658,1,1,Trade fair,
+Lead 245,Retail,62,29,5,Cold call,
+Lead 246,Logistics,10,23,2,Trade fair,
+Lead 247,Retail,38,1,0,Cold call,
+Lead 248,Manufacturing,2664,7,5,Website,
+Lead 249,Retail,173,27,4,Webinar,
+Lead 250,Logistics,1932,15,3,Trade fair,
+Lead 251,Software,19,2,2,Trade fair,
+Lead 252,Manufacturing,2446,15,6,Website,
+Lead 253,Software,365,23,3,Website,
+Lead 254,Software,35,15,1,Webinar,
+Lead 255,Public sector,3541,25,5,Website,
+Lead 256,Manufacturing,52,12,2,Webinar,
+Lead 257,Retail,3165,4,3,Webinar,
+Lead 258,Software,98,1,4,Website,
+Lead 259,Logistics,40,11,0,Referral,
+Lead 260,Logistics,12,18,3,Webinar,
+Lead 261,Logistics,1151,1,5,Referral,
+Lead 262,Retail,12,20,2,Cold call,
+Lead 263,Public sector,370,10,1,Trade fair,
+Lead 264,Logistics,4555,17,3,Webinar,
+Lead 265,Public sector,10,17,0,Referral,
+Lead 266,Manufacturing,939,25,3,Webinar,
+Lead 267,Manufacturing,893,18,6,Referral,
+Lead 268,Logistics,167,23,6,Website,
+Lead 269,Retail,609,25,1,Website,
+Lead 270,Software,383,23,1,Webinar,
+Lead 271,Manufacturing,2581,7,4,Webinar,
+Lead 272,Logistics,1909,19,0,Website,
+Lead 273,Software,14,15,2,Referral,
+Lead 274,Manufacturing,26,15,0,Trade fair,
+Lead 275,Manufacturing,1882,10,1,Website,
+Lead 276,Retail,98,8,5,Referral,
+Lead 277,Logistics,268,17,1,Website,
+Lead 278,Retail,325,16,3,Referral,
+Lead 279,Software,45,9,1,Referral,
+Lead 280,Logistics,177,12,6,Trade fair,
+Lead 281,Software,111,16,6,Website,
+Lead 282,Software,817,5,2,Referral,
+Lead 283,Logistics,949,0,4,Referral,
+Lead 284,Public sector,39,16,0,Webinar,
+Lead 285,Software,535,3,5,Trade fair,
+Lead 286,Logistics,16,25,2,Website,
+Lead 287,Logistics,4928,17,0,Trade fair,
+Lead 288,Logistics,991,5,5,Webinar,
+Lead 289,Software,2264,15,4,Trade fair,
+Lead 290,Retail,123,26,6,Website,
+Lead 291,Logistics,51,15,2,Cold call,
+Lead 292,Manufacturing,80,10,6,Webinar,
+Lead 293,Manufacturing,2642,5,4,Cold call,
+Lead 294,Public sector,2305,20,5,Webinar,
+Lead 295,Logistics,232,18,5,Trade fair,
+Lead 296,Public sector,4150,11,2,Webinar,
+Lead 297,Logistics,14,5,1,Website,
+Lead 298,Logistics,1036,30,2,Referral,
+Lead 299,Public sector,1053,18,1,Cold call,
+Lead 300,Logistics,18,17,5,Trade fair,

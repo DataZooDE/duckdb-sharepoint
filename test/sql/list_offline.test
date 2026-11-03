@@ -1,0 +1,69 @@
+# name: test/sql/list_offline.test
+# description: read_sharepoint_list without credentials: registered, and bad
+#              input fails before any Graph call. Reading a real list is
+#              e2e/tests/test_sharepoint_list.py.
+# group: [sharepoint]
+
+require sharepoint
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'read_sharepoint_list' AND function_type = 'table';
+----
+1
+
+statement error
+SELECT * FROM read_sharepoint_list(NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM read_sharepoint_list('id:');
+----
+name a list
+
+# No secret: a configuration error, as for files.
+statement error
+SELECT * FROM read_sharepoint_list('Orders');
+----
+no `sharepoint` secret configured
+
+statement error
+SELECT * FROM read_sharepoint_list('Orders', site := 'Sales');
+----
+no `sharepoint` secret configured
+
+# ---------------------------------------------------------------------------
+# COPY ... TO '<list>' (FORMAT sharepoint_list): rewritten in place like the
+# workbook writers; the internal writer is reachable only through it.
+# ---------------------------------------------------------------------------
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, USE_TMP_FILE true);
+----
+USE_TMP_FILE is not supported for list writes
+
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, BOGUS 1);
+----
+Unrecognized option
+
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT __sharepoint_list);
+----
+write lists with FORMAT sharepoint_list
+
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, SITE 'Sales');
+----
+no `sharepoint` secret configured
+
+# OVERWRITE has no meaning for a list (yet): refused, not passed on.
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, OVERWRITE);
+----
+OVERWRITE is not supported for list writes
+
+statement error
+SET sharepoint_list_page_size = 0;
+----
+between 1 and 999
+

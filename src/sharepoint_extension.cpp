@@ -4,6 +4,7 @@
 #include "sharepoint_banner.hpp"
 #include "sharepoint_excel_functions.hpp"
 #include "sharepoint_filesystem.hpp"
+#include "sharepoint_list_functions.hpp"
 #include "sharepoint_stats.hpp"
 #include "sharepoint_version.hpp"
 #include "sharepoint_vfs_functions.hpp"
@@ -150,6 +151,18 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    }
 	    });
 
+	// read_sharepoint_list() pages through items this many at a time. Mostly
+	// for tests: a small page exercises paging without a huge list.
+	loader.GetDatabaseInstance().config.AddExtensionOption(
+	    "sharepoint_list_page_size",
+	    "Items per Graph page when reading a SharePoint list (default 999, between 1 and 999).",
+	    LogicalType::BIGINT, Value::BIGINT(999), [](ClientContext &, SetScope, Value &parameter) {
+		    const auto v = parameter.GetValue<int64_t>();
+		    if (v < 1 || v > 999) {
+			    throw InvalidInputException("sharepoint_list_page_size must be between 1 and 999");
+		    }
+	    });
+
 	sharepoint::RegisterSharepointSecrets(loader);
 
 	// write_blob()/remove_file()/move_file()/file_size(): the FileSystem
@@ -165,6 +178,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Graph workbook API, over the same secret. Table functions beside the
 	// filesystem; they change nothing about sharepoint://.
 	sharepoint::RegisterExcelFunctions(loader);
+	// read_sharepoint_list(): a SharePoint list as a table, same secret.
+	sharepoint::RegisterListFunctions(loader);
 
 	datazoo::RegisterBannerOption(loader);
 	// Last, so a load that fails earlier never advertises itself. Silent unless

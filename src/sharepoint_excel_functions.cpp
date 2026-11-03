@@ -8,6 +8,7 @@
 #include "sharepoint_auth.hpp"
 #include "sharepoint_banner.hpp"
 #include "sharepoint_client.hpp"
+#include "sharepoint_copy_rewrite.hpp"
 #include "sharepoint_excel.hpp"
 #include "sharepoint_uri.hpp"
 
@@ -18,8 +19,6 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
-#include "duckdb/parser/statement/copy_statement.hpp"
-#include "duckdb/planner/binder.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
 #include <picojson.h>
@@ -400,10 +399,6 @@ constexpr const char *kTableFormat = "excel_table";
 constexpr const char *kRangeFormat = "excel_range";
 constexpr const char *kTableFormatInternal = "__sharepoint_excel_table";
 constexpr const char *kRangeFormatInternal = "__sharepoint_excel_range";
-constexpr const char *kInPlaceMarker = "__sharepoint_in_place";
-//! COPY's own OVERWRITE, carried past the binder (which would consume it as a
-//! file option) by the rewrite.
-constexpr const char *kOverwriteMarker = "__sharepoint_overwrite";
 
 //! How one column's values are written.
 enum class ExcelWriteKind { TEXT, NUMBER, BOOLEAN, DATE, TIMESTAMP, TIME };
@@ -501,12 +496,6 @@ picojson::value ToJsonCell(const Value &v, ExcelWriteKind kind) {
 	}
 }
 
-template <class MAP>
-const vector<Value> *FindCopyOption(const MAP &options, const string &name) {
-	auto entry = options.find(typename MAP::key_type(name));
-	return entry == options.end() ? nullptr : &entry->second;
-}
-
 string CopyStringOption(const CopyInfo &info, const char *name) {
 	auto v = FindCopyOption(info.options, name);
 	if (!v || v->size() != 1 || (*v)[0].IsNull()) {
@@ -552,7 +541,7 @@ unique_ptr<FunctionData> ExcelWriteBind(ClientContext &context, CopyFunctionBind
 	// Only reachable through the rewrite, which pins USE_TMP_FILE false and
 	// leaves this marker (the binder consumes USE_TMP_FILE itself before bind).
 	// A direct FORMAT __sharepoint_excel_* could otherwise rename over the file.
-	if (!FindCopyOption(info.options, kInPlaceMarker)) {
+	if (!IsRewrittenInPlace(info)) {
 		throw InvalidInputException("sharepoint: write workbooks with FORMAT %s",
 		                            table_mode ? kTableFormat : kRangeFormat);
 	}
@@ -928,11 +917,6 @@ CopyFunctionExecutionMode ExcelWriteExecutionMode(bool, bool) {
 	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
 }
 
-template <class MAP>
-void AddCopyOption(MAP &options, const char *name, const LogicalType &type) {
-	options[typename MAP::key_type(name)] = CopyOption(type, CopyOptionMode::WRITE_ONLY);
-}
-
 void ExcelTableCopyOptions(ClientContext &, CopyOptionsInput &input) {
 	AddCopyOption(input.options, kInPlaceMarker, LogicalType::BOOLEAN);
 	AddCopyOption(input.options, kOverwriteMarker, LogicalType::BOOLEAN);
@@ -947,44 +931,12 @@ void ExcelRangeCopyOptions(ClientContext &, CopyOptionsInput &input) {
 	AddCopyOption(input.options, "header", LogicalType::BOOLEAN);
 }
 
-//! FORMAT excel_table / excel_range: rebind as the internal format with
-//! USE_TMP_FILE false (see the top of this section).
-BoundStatement RewriteExcelCopy(Binder &binder, CopyStatement &stmt, const char *internal_format) {
-	auto copy = stmt.Copy();
-	auto &info = *copy->Cast<CopyStatement>().info;
-	auto tmp = FindCopyOption(info.options, "use_tmp_file");
-	if (tmp && (tmp->empty() || (*tmp)[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>())) {
-		throw InvalidInputException("sharepoint: USE_TMP_FILE is not supported for workbook writes: they change the "
-		                            "workbook in place");
-	}
-	info.format = internal_format;
-	using Key = typename std::decay<decltype(info.options)>::type::key_type;
-	// OVERWRITE is COPY's own file option, consumed by the binder; carry it
-	// as ours, so it means "replace in the workbook" and never reaches
-	// DuckDB's file handling. The other file modes make no sense here.
-	auto overwrite = FindCopyOption(info.options, "overwrite");
-	const bool replace =
-	    overwrite && (overwrite->empty() || (*overwrite)[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>());
-	info.options.erase(Key("overwrite"));
-	for (const char *mode : {"overwrite_or_ignore", "append"}) {
-		if (FindCopyOption(info.options, mode)) {
-			throw InvalidInputException("sharepoint: %s is a file option; for a workbook use OVERWRITE", mode);
-		}
-	}
-	if (replace) {
-		info.options[Key(kOverwriteMarker)] = {Value::BOOLEAN(true)};
-	}
-	info.options[Key("use_tmp_file")] = {Value::BOOLEAN(false)};
-	info.options[Key(kInPlaceMarker)] = {Value::BOOLEAN(true)};
-	return binder.Bind(*copy);
-}
-
 BoundStatement ExcelTableCopyPlan(Binder &binder, CopyStatement &stmt) {
-	return RewriteExcelCopy(binder, stmt, kTableFormatInternal);
+	return RewriteCopyInPlace(binder, stmt, kTableFormatInternal, "workbook", true);
 }
 
 BoundStatement ExcelRangeCopyPlan(Binder &binder, CopyStatement &stmt) {
-	return RewriteExcelCopy(binder, stmt, kRangeFormatInternal);
+	return RewriteCopyInPlace(binder, stmt, kRangeFormatInternal, "workbook", true);
 }
 
 CopyFunction MakeExcelWriter(const char *name, copy_to_bind_t bind, copy_options_t options) {
