@@ -112,10 +112,14 @@ def test_list_types_paging_and_lookup(fixture_lists, sql, secret_sql):
         SELECT string_agg(column_name || ' ' || column_type, ', ') FROM (DESCRIBE o);
         SELECT count(*), sum(Amount), sum(Price), count(*) FILTER (WHERE Done), min(Due), max(Due),
                count(DISTINCT Status), count(DISTINCT id), min(created) <= max(modified) FROM o;
-        SELECT Customer, Customer_id, count(*) FROM o GROUP BY ALL ORDER BY Customer_id;
+        SELECT Customer, count(*) FROM o GROUP BY ALL ORDER BY Customer;
+        -- Every order's lookup value is the name of the customer its id points at
+        -- ($batch creates the customers in no fixed order, so ids are not 1/2/3 by name).
+        SELECT count(*) FROM o JOIN read_sharepoint_list('{CUSTOMERS}') c ON o.Customer_id = c.id
+        WHERE o.Customer IS DISTINCT FROM c.Title;
     """).splitlines()
     # From the end: CREATE SECRET and CALL print a "true" line each before these.
-    out = out[-6:]
+    out = out[-7:]
     pages = int(out[0])
     # drive -> site, list, columns, then one call per page
     # (plus possibly one empty last page when ITEMS is a multiple of PAGE)
@@ -127,7 +131,8 @@ def test_list_types_paging_and_lookup(fixture_lists, sql, secret_sql):
     assert out[2] == (f"{ITEMS}|{sum(i * 0.5 for i in range(ITEMS))}|"
                       f"{sum(round(i * 1.25, 2) for i in range(ITEMS)):.4f}|{ITEMS // 2}|"
                       f"2026-01-01 00:00:00|{last_due:%Y-%m-%d %H:%M:%S}|3|{ITEMS}|true")
-    assert out[3:] == [f"Acme|1|{ITEMS // 3}", f"Globex|2|{ITEMS // 3}", f"Initech|3|{ITEMS // 3}"]
+    assert out[3:6] == [f"Acme|{ITEMS // 3}", f"Globex|{ITEMS // 3}", f"Initech|{ITEMS // 3}"]
+    assert out[6] == "0", "lookup values disagree with the looked-up items"
 
     # By list id, and with the site named explicitly.
     out = sql(f"""{secret_sql}
