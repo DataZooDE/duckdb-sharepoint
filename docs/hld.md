@@ -729,9 +729,8 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- /sites/Sales o
   name, ContentType and Attachments left out. The system names win a clash
   (a user column "Created" becomes `Created_2`).
 - **Types.** text -> VARCHAR, number -> DOUBLE, currency -> DECIMAL(18,4),
-  boolean -> BOOLEAN, dateTime -> TIMESTAMP (Graph returns UTC; a date-only
-  column is midnight in the *site's* time zone, so it can read as the evening
-  before -- not corrected yet), choice -> VARCHAR or VARCHAR[], hyperlink ->
+  boolean -> BOOLEAN, dateTime -> TIMESTAMP (Graph returns UTC), a date-only
+  dateTime (or calculated date) -> DATE (#64), choice -> VARCHAR or VARCHAR[], hyperlink ->
   the URL, calculated -> by its output type, other -> VARCHAR (JSON text).
   Lookup -> the display value plus `<name>_id` (`<internal>LookupId`). Person
   (#63) -> `<name>`, `<name>_email`, `<name>_id`, lists for
@@ -744,6 +743,16 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- /sites/Sales o
   only for the columns read (projection pushdown). Best effort: a person
   missing from the list, or a refused call, leaves the name NULL. A field missing from an item (Graph omits empty ones) is
   NULL.
+
+- **Date-only columns (#64).** Graph returns a date-only value as midnight
+  in the *site's* time zone, in UTC (2026-03-15 on a UTC+1 site is
+  `2026-03-14T23:00:00Z`), and v1.0 has no call for the site's time zone.
+  For every offset from UTC-10:00 to UTC+13:30, local midnight is before
+  10:30 UTC on that date or from 10:30 UTC the day before, so that cut-off
+  gives the date without one (`DateOnlyDays`); UTC-11, UTC-12, UTC+13:45 and
+  UTC+14 are wrong by a day. A DATE is written as 10:15 UTC on that date
+  (`FormatDateOnly`), which is on that date in the same range of zones. Date
+  -only columns are not pushed down (#61).
 
 ### 10.1 Writing: `COPY ... TO '<list>' (FORMAT sharepoint_list)`
 

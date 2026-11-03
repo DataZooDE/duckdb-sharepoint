@@ -126,6 +126,8 @@ ListColumnDef ParseColumnDef(const picojson::object &o) {
 				const auto shown = StringField(it->second.get<picojson::object>(), "displayAs");
 				def.single_choice = shown == "dropDownMenu" || shown == "radioButtons";
 			}
+			// dateTime and calculated both say "format": "dateOnly" | "dateTime".
+			def.date_only = StringField(it->second.get<picojson::object>(), "format") == "dateOnly";
 			if (def.facet == ListFacet::CALCULATED) {
 				auto output = StringField(it->second.get<picojson::object>(), "outputType");
 				def.calculated_output = output == "number"     ? ListFacet::NUMBER
@@ -153,6 +155,8 @@ LogicalType ToLogicalType(ListColumnType t) {
 		return LogicalType::TIMESTAMP;
 	case ListColumnType::BIGINT_LIST:
 		return LogicalType::LIST(LogicalType::BIGINT);
+	case ListColumnType::DATE:
+		return LogicalType::DATE;
 	case ListColumnType::BIGINT:
 		return LogicalType::BIGINT;
 	default:
@@ -212,6 +216,13 @@ Value ToValue(const picojson::value *v, ListColumnType t) {
 		int64_t us;
 		if (v->is<string>() && ParseIsoTimestamp(v->get<string>(), us)) {
 			return Value::TIMESTAMP(timestamp_t(us));
+		}
+		return Value(type);
+	}
+	case ListColumnType::DATE: {
+		int64_t us;
+		if (v->is<string>() && ParseIsoTimestamp(v->get<string>(), us)) {
+			return Value::DATE(date_t(DateOnlyDays(us)));
 		}
 		return Value(type);
 	}
@@ -734,15 +745,14 @@ struct PersonInfo {
 	Value email;
 };
 
-//! Look the people up in the User Information List of the list's site, in
-//! $batch calls of 20. Best effort: a person not found (removed from the
-//! site's list) or a refused call leaves their name and email NULL.
-unordered_map<int64_t, PersonInfo> ResolvePeople(GraphClient &client, const ListBindData &data,
+//! Look the people up in the User Information List of `site` ("/sites/{id}",
+//! as $batch urls are relative to /v1.0), in $batch calls of 20. Best effort:
+//! a person not found (removed from the site's list) or a refused call leaves
+//! their name and email NULL.
+unordered_map<int64_t, PersonInfo> ResolvePeople(GraphClient &client, const string &site, const string &what,
                                                  const vector<int64_t> &ids) {
 	unordered_map<int64_t, PersonInfo> people;
-	// "/v1.0/sites/{site}/lists/{id}" -> "/sites/{site}"; $batch urls are relative to /v1.0.
-	const auto site = data.base.substr(5, data.base.find("/lists/") - 5);
-	const auto users = UserListId(client, site, data.what);
+	const auto users = UserListId(client, site, what);
 	if (users.empty()) {
 		return people;
 	}
@@ -761,8 +771,8 @@ unordered_map<int64_t, PersonInfo> ResolvePeople(GraphClient &client, const List
 		picojson::value holder;
 		try {
 			const auto &reply = AsObject(
-			    client.GraphSend("POST", "/v1.0/$batch", picojson::value(batch).serialize(), data.what, true),
-			    data.what, holder);
+			    client.GraphSend("POST", "/v1.0/$batch", picojson::value(batch).serialize(), what, true), what,
+			    holder);
 			auto responses = reply.find("responses");
 			if (responses == reply.end() || !responses->second.is<picojson::array>()) {
 				continue;
@@ -859,7 +869,9 @@ unique_ptr<GlobalTableFunctionState> CursorInit(ClientContext &, TableFunctionIn
 				}
 			}
 		}
-		state->people = ResolvePeople(client, data, vector<int64_t>(ids.begin(), ids.end()));
+		// "/v1.0/sites/{site}/lists/{id}" -> "/sites/{site}".
+		const auto site = data.base.substr(5, data.base.find("/lists/") - 5);
+		state->people = ResolvePeople(client, site, data.what, vector<int64_t>(ids.begin(), ids.end()));
 	}
 	return std::move(state);
 }
@@ -1158,7 +1170,9 @@ void ListWriteSink(ExecutionContext &, FunctionData &, GlobalFunctionData &gstat
 					}
 					continue;
 				}
-				auto json = ToJsonField(v, col.field);
+				auto json = col.date_only && !v.IsNull()
+				                ? picojson::value(FormatDateOnly(v.DefaultCastAs(LogicalType::DATE).GetValue<date_t>().days))
+				                : ToJsonField(v, col.field);
 				if (json.is<picojson::array>()) {
 					// A multi-choice value: Graph needs the collection's type.
 					p.fields[col.field + "@odata.type"] = picojson::value("Collection(Edm.String)");
@@ -1193,6 +1207,7 @@ void ListCopyOptions(ClientContext &, CopyOptionsInput &input) {
 BoundStatement ListCopyPlan(Binder &binder, CopyStatement &stmt) {
 	return RewriteCopyInPlace(binder, stmt, kListFormatInternal, "list");
 }
+
 
 } // namespace
 

@@ -187,8 +187,8 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- another site o
 ```
 
 - **Columns** are named by their display names and typed: text, number,
-  currency (DECIMAL), yes/no, date and time (TIMESTAMP, UTC), and choice
-  (VARCHAR, or VARCHAR[] for several choices).
+  currency (DECIMAL), yes/no, date and time (TIMESTAMP, UTC), date only
+  (DATE), and choice (VARCHAR, or VARCHAR[] for several choices).
 - **Lookups and people:** a lookup column gives its value plus `<name>_id`; a
   person column gives `<name>`, `<name>_email` and `<name>_id` (lists when
   it allows several people). Created By and Modified By come as

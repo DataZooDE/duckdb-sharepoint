@@ -28,7 +28,7 @@ ListColumnDef Col(const std::string &name, const std::string &display, ListFacet
 std::string Describe(const std::vector<ListOutputColumn> &cols) {
 	std::string out;
 	for (auto &c : cols) {
-		static const char *types[] = {"VARCHAR", "VARCHAR[]", "DOUBLE", "DECIMAL", "BOOLEAN", "TIMESTAMP", "BIGINT", "BIGINT[]"};
+		static const char *types[] = {"VARCHAR", "VARCHAR[]", "DOUBLE", "DECIMAL", "BOOLEAN", "TIMESTAMP", "BIGINT", "BIGINT[]", "DATE"};
 		out += c.name + ":" + types[static_cast<int>(c.type)] + "<-" + c.field + (c.may_be_multi ? "*" : "") + " ";
 	}
 	return out;
@@ -315,4 +315,54 @@ TEST_CASE("PlanListColumns: a drop-down or radio choice is single-valued and fil
 	            kPeople);
 	REQUIRE(plan[1].filter == ListFilterKind::TEXT);
 	REQUIRE(plan[2].filter == ListFilterKind::NONE);
+}
+
+// ---------------------------------------------------------------------------
+// Date-only columns (#64). Graph returns a date-only value as midnight in the
+// site's time zone, in UTC: 2026-03-15 on a UTC+1 site is
+// "2026-03-14T23:00:00Z". Graph v1.0 does not expose the site's time zone.
+// ---------------------------------------------------------------------------
+TEST_CASE("PlanListColumns: a date-only column is a DATE", "[list][date]") {
+	auto due = Col("Due", "Due", ListFacet::DATETIME);
+	due.date_only = true;
+	due.indexed = true; // still not pushed down: Graph compares the site-local midnight
+	auto calc = Col("Next", "Next", ListFacet::CALCULATED);
+	calc.calculated_output = ListFacet::DATETIME;
+	calc.date_only = true;
+	auto plan = PlanListColumns({due, calc, Col("At", "At", ListFacet::DATETIME)});
+	REQUIRE(Describe(plan) == "id:BIGINT<-id Due:DATE<-Due Next:DATE<-Next At:TIMESTAMP<-At "
+	                          "created:TIMESTAMP<-Created modified:TIMESTAMP<-Modified " +
+	                              kPeople);
+	std::vector<ListWriteColumn> out;
+	std::string error;
+	REQUIRE(PlanListWrite({"Due", "At"}, plan, out, error));
+	REQUIRE(plan[1].filter == ListFilterKind::NONE);
+	REQUIRE(out[0].date_only);
+	REQUIRE_FALSE(out[1].date_only);
+}
+
+TEST_CASE("DateOnlyDays: the site-local date of Graph's UTC midnight", "[list][date]") {
+	auto days = [](const char *iso) {
+		int64_t us;
+		REQUIRE(ParseIsoTimestamp(iso, us));
+		return FormatIsoTimestamp(int64_t(DateOnlyDays(us)) * 86400 * 1000000).substr(0, 10);
+	};
+	REQUIRE(days("2026-03-15T00:00:00Z") == "2026-03-15"); // UTC
+	REQUIRE(days("2026-03-14T23:00:00Z") == "2026-03-15"); // UTC+1 (Berlin)
+	REQUIRE(days("2026-03-14T11:00:00Z") == "2026-03-15"); // UTC+13 (Auckland, summer)
+	REQUIRE(days("2026-03-14T13:30:00Z") == "2026-03-15"); // UTC+10:30
+	REQUIRE(days("2026-03-15T05:00:00Z") == "2026-03-15"); // UTC-5 (New York)
+	REQUIRE(days("2026-03-15T10:00:00Z") == "2026-03-15"); // UTC-10 (Hawaii)
+	REQUIRE(days("1969-12-31T23:00:00Z") == "1970-01-01"); // before the epoch
+}
+
+TEST_CASE("FormatDateOnly: an instant on that date from UTC-10 to UTC+13:30", "[list][date][write]") {
+	REQUIRE(FormatDateOnly(0) == "1970-01-01T10:15:00Z");
+	int64_t us;
+	REQUIRE(ParseIsoTimestamp("2026-03-15T00:00:00Z", us));
+	const auto d = static_cast<int32_t>(us / 86400 / 1000000);
+	REQUIRE(FormatDateOnly(d) == "2026-03-15T10:15:00Z");
+	// Read back as the same date, whatever Graph does with it in between.
+	REQUIRE(ParseIsoTimestamp(FormatDateOnly(d), us));
+	REQUIRE(DateOnlyDays(us) == d);
 }

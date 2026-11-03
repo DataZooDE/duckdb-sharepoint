@@ -188,8 +188,13 @@ std::vector<ListOutputColumn> PlanListColumns(const std::vector<ListColumnDef> &
 		col.name = Claim(used, base);
 		col.field = def.name;
 		col.type = TypeFor(def.facet == ListFacet::CALCULATED ? def.calculated_output : def.facet);
+		if (col.type == ListColumnType::TIMESTAMP && def.date_only) {
+			col.type = ListColumnType::DATE;
+		}
 		col.may_be_multi = def.facet == ListFacet::CHOICE && !def.single_choice;
-		col.filter = def.indexed && !col.may_be_multi ? FilterKindFor(def.facet) : ListFilterKind::NONE;
+		// Date-only values are the site's local midnight: not pushed down.
+		col.filter = def.indexed && !col.may_be_multi && col.type != ListColumnType::DATE ? FilterKindFor(def.facet)
+		                                                                                  : ListFilterKind::NONE;
 		out.push_back(col);
 	}
 	// Created and Modified are read-only, so skipped above; they can be indexed.
@@ -334,6 +339,22 @@ std::string BuildListFilter(const std::vector<ListPredicate> &predicates) {
 	return out;
 }
 
+int32_t DateOnlyDays(int64_t micros) {
+	constexpr int64_t kDay = int64_t(86400) * 1000000;
+	constexpr int64_t kCutoff = int64_t(10 * 3600 + 30 * 60) * 1000000; // 10:30 UTC
+	int64_t days = micros / kDay;
+	int64_t time_of_day = micros % kDay;
+	if (time_of_day < 0) {
+		time_of_day += kDay;
+		days--;
+	}
+	return static_cast<int32_t>(time_of_day < kCutoff ? days : days + 1);
+}
+
+std::string FormatDateOnly(int32_t days) {
+	return FormatIsoTimestamp((int64_t(days) * 86400 + 10 * 3600 + 15 * 60) * 1000000);
+}
+
 bool PlanListWrite(const std::vector<std::string> &copy_names, const std::vector<ListOutputColumn> &plan,
                    std::vector<ListWriteColumn> &out, std::string &error) {
 	out.clear();
@@ -370,6 +391,7 @@ bool PlanListWrite(const std::vector<std::string> &copy_names, const std::vector
 		} else {
 			w.target = ListWriteTarget::FIELD;
 			w.field = match->field;
+			w.date_only = match->type == ListColumnType::DATE;
 		}
 		out.push_back(w);
 	}
