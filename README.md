@@ -307,6 +307,30 @@ CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,
     DRIVE_ID 'b!AbCdEf...');
 ```
 
+**Least privilege.** `Sites.ReadWrite.All` reaches every site in the
+tenant. To limit an app to chosen sites, grant it the `Sites.Selected`
+application permission instead (admin consent as usual), then give it each
+site it may use. An admin does this once per site, e.g. with PnP PowerShell:
+
+```powershell
+Grant-PnPAzureADAppSitePermission -AppId '<CLIENT_ID>' -DisplayName 'duckdb' `
+    -Site 'https://contoso.sharepoint.com/sites/Sales' -Permissions Write
+```
+
+or with Graph, as an app that holds `Sites.FullControl.All`:
+
+```http
+POST https://graph.microsoft.com/v1.0/sites/{site-id}/permissions
+{ "roles": ["write"],
+  "grantedToIdentities": [{ "application": { "id": "<CLIENT_ID>", "displayName": "duckdb" } }] }
+```
+
+`write` covers files, Excel workbooks and reading and writing list items.
+Creating or deleting lists themselves needs `manage` or `fullcontrol`; the
+extension never does either. Every call stays inside the drive and the sites
+you name, so nothing needs tenant-wide rights. A site the app was not granted
+is refused with HTTP 403 `accessDenied`.
+
 **As a user.** `device_code` and `authorization_code` act as the signed-in
 user: files are authored by them, and they see only what they may. Both are
 public clients, with no client secret. Register an Entra app with these
@@ -358,7 +382,7 @@ and `SITE_ID` are SharePoint's, not Entra's.
 | `AADSTS700016` | no app with this client ID in this tenant | copy both IDs from the same app's *Overview* page; use the *Application (client) ID*, not the *Object ID* |
 | `AADSTS7000218` | the app is not a public client | *Authentication → Allow public client flows* → **Enabled**, then **Save** |
 | `AADSTS50173` / `invalid_grant` | the refresh token expired or was revoked | sign in again (recreate the secret without `REFRESH_TOKEN`) |
-| HTTP 403 `accessDenied` | the app lacks a permission | add it under *API permissions* and click **Grant admin consent** (it shows *Not granted* until then) |
+| HTTP 403 `accessDenied` | the app lacks a permission, or (with `Sites.Selected`) this site | add it under *API permissions* and click **Grant admin consent** (it shows *Not granted* until then); or grant the site (see *Least privilege*) |
 
 > The option is `GRAPH_SCOPE`, **not** `SCOPE`: DuckDB's `CREATE SECRET`
 > grammar reserves `SCOPE` for the secret's path-prefix list. An OAuth scope

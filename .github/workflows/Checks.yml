@@ -311,6 +311,12 @@ jobs:
           SHAREPOINT_DELEGATED_CLIENT_ID: ${{ secrets.SHAREPOINT_DELEGATED_CLIENT_ID }}
           SHAREPOINT_USER_REFRESH_TOKEN: ${{ secrets.SHAREPOINT_USER_REFRESH_TOKEN }}
           SHAREPOINT_REQUIRE_DELEGATED: '1'
+          # Least privilege (#70): a second app with only Sites.Selected,
+          # granted the test site. Skips until these secrets exist; then set
+          # SHAREPOINT_REQUIRE_SELECTED to '1' here.
+          SHAREPOINT_SELECTED_CLIENT_ID: ${{ secrets.SHAREPOINT_SELECTED_CLIENT_ID }}
+          SHAREPOINT_SELECTED_CLIENT_SECRET: ${{ secrets.SHAREPOINT_SELECTED_CLIENT_SECRET }}
+          SHAREPOINT_UNGRANTED_SITE: ${{ secrets.SHAREPOINT_UNGRANTED_SITE }}
           DATAZOO_DISABLE_TELEMETRY: '1'
         run: cd e2e && uv run --locked pytest -v
 

@@ -510,6 +510,16 @@ TEST_CASE("graph error messages carry the code and stay one line", "[errors]") {
 	REQUIRE(long_msg.find('\n') == std::string::npos);
 }
 
+TEST_CASE("a 403 says how to grant access, including Sites.Selected", "[errors]") {
+	const auto msg = FormatGraphError("site 'Other'", 403, "accessDenied", "Access denied");
+	REQUIRE(msg.find("HTTP 403 (forbidden, accessDenied): Access denied") != std::string::npos);
+	REQUIRE(msg.find("Sites.Selected") != std::string::npos);
+	REQUIRE(msg.find('\n') == std::string::npos);
+	// Throttling sent as a 403 is not a permission problem: no hint.
+	REQUIRE(FormatGraphError("op", 403, "activityLimitReached", "").find("Sites.Selected") == std::string::npos);
+	REQUIRE(FormatGraphError("op", 404, "itemNotFound", "").find("Sites.Selected") == std::string::npos);
+}
+
 // ---------------------------------------------------------------------------
 // Verbatim HTTP/1.1 for Graph's pre-authenticated URLs. httplib 0.27 (DuckDB
 // 1.5) re-sorts a request's query parameters, and SharePoint's signed
