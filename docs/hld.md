@@ -759,3 +759,18 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   would still be attempted for a name that exists as a local file; the same
   rewrite as the Excel writers (`sharepoint_copy_rewrite.hpp`) rules it out.
 
+## 14. `search_sharepoint` (#67)
+
+- `POST /search/query`, `entityTypes` driveItem + listItem by default
+  (`types :=`), paged with `from`/`size` (200) while
+  `moreResultsAvailable`, up to `max_results`.
+- **Region.** App-only search must name the tenant's data location; delegated
+  search must not. The first search goes without one; on Graph's 400
+  "Region is required" the known codes are tried (NAM, EUR, APC, ...) and the
+  one that works is kept per identity for the process. `region :=` skips that.
+- A driveItem in the secret's drive gets a `sharepoint://` path from
+  `parentReference.path`, or `id:` when the hit has none; list items carry
+  `site_id`/`list_id`, for `read_sharepoint_list('id:<list_id>', site := ...)`.
+- The live test searches for a probe file kept between runs: the index lags
+  by minutes, so the run that creates the probe skips.
+
