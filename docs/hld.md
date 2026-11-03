@@ -827,3 +827,19 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   certificate gets its own token, and two secrets with different keys never
   share one.
 
+## 13. `read_sharepoint_files` (#65)
+
+- The files come from the filesystem's `Glob` (its syntax, the
+  immutable-prefix cache); each file's driveItem, with
+  `$expand=listItem($expand=fields($select=...))`, is fetched by path in
+  `$batch` calls of 20 (throttled parts retried; a 404 part means the file
+  went away after the glob).
+- Fixed columns from the driveItem (people come with names and emails, no
+  User Information List lookup); then the library's columns from
+  `/drives/{d}/list/columns`, planned by `PlanListColumns` without its
+  system columns and `FileLeafRef` (that is `name`). A choice column is a
+  list only when its definition says multi-select (one row per file: no data
+  to decide from). Person columns are resolved through the User Information
+  List of the library's site.
+- Read at bind, like the Excel functions.
+

@@ -27,6 +27,7 @@
 #include <picojson.h>
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <cmath>
 #include <cstdint>
@@ -696,14 +697,13 @@ struct PersonInfo {
 	Value email;
 };
 
-//! Look the people up in the User Information List of the list's site, in
-//! $batch calls of 20. Best effort: a person not found (removed from the
-//! site's list) or a refused call leaves their name and email NULL.
-unordered_map<int64_t, PersonInfo> ResolvePeople(GraphClient &client, const ListBindData &data,
+//! Look the people up in the User Information List of `site` ("/sites/{id}",
+//! as $batch urls are relative to /v1.0), in $batch calls of 20. Best effort:
+//! a person not found (removed from the site's list) or a refused call leaves
+//! their name and email NULL.
+unordered_map<int64_t, PersonInfo> ResolvePeople(GraphClient &client, const string &site, const string &what,
                                                  const vector<int64_t> &ids) {
 	unordered_map<int64_t, PersonInfo> people;
-	// "/v1.0/sites/{site}/lists/{id}" -> "/sites/{site}"; $batch urls are relative to /v1.0.
-	const auto site = data.base.substr(5, data.base.find("/lists/") - 5);
 	for (idx_t start = 0; start < ids.size(); start += kPeoplePerBatch) {
 		picojson::array requests;
 		for (idx_t i = start; i < ids.size() && i < start + kPeoplePerBatch; i++) {
@@ -719,8 +719,8 @@ unordered_map<int64_t, PersonInfo> ResolvePeople(GraphClient &client, const List
 		picojson::value holder;
 		try {
 			const auto &reply = AsObject(
-			    client.GraphSend("POST", "/v1.0/$batch", picojson::value(batch).serialize(), data.what, true),
-			    data.what, holder);
+			    client.GraphSend("POST", "/v1.0/$batch", picojson::value(batch).serialize(), what, true), what,
+			    holder);
 			auto responses = reply.find("responses");
 			if (responses == reply.end() || !responses->second.is<picojson::array>()) {
 				continue;
@@ -817,7 +817,9 @@ unique_ptr<GlobalTableFunctionState> CursorInit(ClientContext &, TableFunctionIn
 				}
 			}
 		}
-		state->people = ResolvePeople(client, data, vector<int64_t>(ids.begin(), ids.end()));
+		// "/v1.0/sites/{site}/lists/{id}" -> "/sites/{site}".
+		const auto site = data.base.substr(5, data.base.find("/lists/") - 5);
+		state->people = ResolvePeople(client, site, data.what, vector<int64_t>(ids.begin(), ids.end()));
 	}
 	return std::move(state);
 }
@@ -1154,6 +1156,355 @@ BoundStatement ListCopyPlan(Binder &binder, CopyStatement &stmt) {
 	return RewriteCopyInPlace(binder, stmt, kListFormatInternal, "list");
 }
 
+
+// ===========================================================================
+// read_sharepoint_files('sharepoint://Finance/**/*.xlsx') (#65): a document
+// library's files and their metadata, one row per file. A library is a list,
+// so its own columns are planned as read_sharepoint_list plans a list's.
+// ===========================================================================
+
+//! Files whose metadata is fetched per $batch call (Graph's limit).
+constexpr idx_t kFilesPerBatch = 20;
+
+//! The fixed columns, before the library's own.
+const vector<std::pair<string, LogicalType>> &FileColumns() {
+	static const vector<std::pair<string, LogicalType>> columns = {
+	    {"path", LogicalType::VARCHAR},          {"name", LogicalType::VARCHAR},
+	    {"size", LogicalType::BIGINT},           {"created", LogicalType::TIMESTAMP},
+	    {"modified", LogicalType::TIMESTAMP},    {"created_by", LogicalType::VARCHAR},
+	    {"created_by_email", LogicalType::VARCHAR}, {"modified_by", LogicalType::VARCHAR},
+	    {"modified_by_email", LogicalType::VARCHAR}, {"content_type", LogicalType::VARCHAR},
+	    {"id", LogicalType::VARCHAR},            {"web_url", LogicalType::VARCHAR}};
+	return columns;
+}
+
+//! A root-relative path for /root:/<here>, each segment percent-encoded.
+string EncodeItemPath(const string &path) {
+	string out;
+	for (auto &segment : StringUtil::Split(path, '/')) {
+		out += (out.empty() ? "" : "/") + EncodeWorkbookName(segment);
+	}
+	return out;
+}
+
+Value TimestampField(const picojson::object &o, const char *key) {
+	int64_t us;
+	const auto text = StringField(o, key);
+	return !text.empty() && ParseIsoTimestamp(text, us) ? Value::TIMESTAMP(timestamp_t(us))
+	                                                      : Value(LogicalType::TIMESTAMP);
+}
+
+//! displayName / email of a driveItem's createdBy / lastModifiedBy.
+std::pair<Value, Value> Who(const picojson::object &item, const char *key) {
+	auto by = item.find(key);
+	if (by == item.end() || !by->second.is<picojson::object>()) {
+		return {Value(LogicalType::VARCHAR), Value(LogicalType::VARCHAR)};
+	}
+	const auto &o = by->second.get<picojson::object>();
+	for (const char *kind : {"user", "application"}) {
+		auto who = o.find(kind);
+		if (who != o.end() && who->second.is<picojson::object>()) {
+			const auto name = StringField(who->second.get<picojson::object>(), "displayName");
+			const auto email = StringField(who->second.get<picojson::object>(), "email");
+			return {name.empty() ? Value(LogicalType::VARCHAR) : Value(name),
+			        email.empty() ? Value(LogicalType::VARCHAR) : Value(email)};
+		}
+	}
+	return {Value(LogicalType::VARCHAR), Value(LogicalType::VARCHAR)};
+}
+
+//! A failed part of a $batch, as the exception its kind maps to (403 ->
+//! PermissionException, with the Sites.Selected hint).
+[[noreturn]] void ThrowBatchPart(const string &what, int status, const string &body) {
+	string code, message;
+	picojson::value err;
+	if (picojson::parse(err, body).empty() && err.is<picojson::object>()) {
+		auto e = err.get<picojson::object>().find("error");
+		if (e != err.get<picojson::object>().end() && e->second.is<picojson::object>()) {
+			code = StringField(e->second.get<picojson::object>(), "code");
+			message = StringField(e->second.get<picojson::object>(), "message");
+		}
+	}
+	const auto text = FormatGraphError("reading " + what, status, code, message);
+	switch (ExceptionTypeFor(ClassifyGraphError(status, code))) {
+	case GraphExceptionType::PERMISSION:
+		throw PermissionException(text);
+	case GraphExceptionType::INVALID_INPUT:
+		throw InvalidInputException(text);
+	default:
+		throw IOException(text);
+	}
+}
+
+struct FilesBindData : public TableFunctionData {
+	vector<vector<Value>> rows;
+};
+
+unique_ptr<FunctionData> FilesBind(ClientContext &context, TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types, duckdb_compat::BindNames &names) {
+	unique_ptr<FunctionData> result;
+	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
+		if (input.inputs[0].IsNull()) {
+			throw InvalidInputException("sharepoint: the path must not be NULL");
+		}
+		const auto arg = StringValue::Get(input.inputs[0]);
+		const string pattern = IsSharepointUri(arg) ? arg : string(SHAREPOINT_SCHEME) + arg;
+		auto opener = ClientData::Get(context).file_opener.get();
+		const auto auth = GetAuthContext(opener, pattern);
+		GraphClient client(auth);
+		const string what = "the files of '" + pattern + "'";
+
+		// The library's own columns, planned as a list's; the system ones
+		// (id, created/modified and their people) are the fixed columns here.
+		vector<ListColumnDef> defs;
+		{
+			picojson::value holder;
+			const auto &cols = AsObject(client.GraphGet("/v1.0/drives/" + auth.drive_id + "/list/columns", what),
+			                            what, holder);
+			auto values = cols.find("value");
+			if (values != cols.end() && values->second.is<picojson::array>()) {
+				for (auto &c : values->second.get<picojson::array>()) {
+					if (c.is<picojson::object>()) {
+						auto def = ParseColumnDef(c.get<picojson::object>());
+						// The file name is `name`; Title stays (a document's title).
+						if (def.name != "FileLeafRef") {
+							defs.push_back(def);
+						}
+					}
+				}
+			}
+		}
+		vector<ListOutputColumn> plan;
+		for (auto &col : PlanListColumns(defs)) {
+			const bool system = col.field == "id" || col.field == "Created" || col.field == "Modified" ||
+			                    col.person_field == "Author" || col.person_field == "Editor";
+			if (!system) {
+				// A multi-valued choice reads as a list; its type cannot wait for
+				// the data here (one row per file), so a choice is VARCHAR[] only
+				// when its definition says several values.
+				col.may_be_multi = false;
+				plan.push_back(col);
+			}
+		}
+
+		// The files: the filesystem's glob (its syntax, its immutable-prefix
+		// cache), then each file's driveItem with its listItem fields.
+		auto &fs = FileSystem::GetFileSystem(context);
+		const auto matches = fs.Glob(pattern, opener);
+		string select;
+		std::set<string> selected;
+		for (auto &col : plan) {
+			for (auto &field : {col.field, col.person != ListPersonPart::NONE && col.type != ListColumnType::BIGINT &&
+			                                        col.type != ListColumnType::VARCHAR
+			                                    ? col.person_field
+			                                    : string()}) {
+				if (!field.empty() && selected.insert(field).second) {
+					select += (select.empty() ? "" : ",") + EncodeWorkbookName(field);
+				}
+			}
+		}
+		const string query = "?$select=id,name,size,createdDateTime,lastModifiedDateTime,createdBy,lastModifiedBy,"
+		                     "file,folder,webUrl&$expand=listItem($select=id;$expand=fields" +
+		                     (select.empty() ? string() : "($select=" + select + ")") + ")";
+		vector<std::pair<string, picojson::object>> items; // path, driveItem
+		for (idx_t start = 0; start < matches.size(); start += kFilesPerBatch) {
+			std::map<string, string> pending; // request id -> path
+			for (idx_t i = start; i < matches.size() && i < start + kFilesPerBatch; i++) {
+				pending[std::to_string(i)] = matches[i].path;
+			}
+			std::map<string, picojson::object> found;
+			for (int attempt = 1; !pending.empty(); attempt++) {
+				picojson::array requests;
+				for (auto &p : pending) {
+					auto parsed = ParseSharepointUri(p.second);
+					if (!parsed.ok || parsed.uri.kind != SharepointUriKind::PATH) {
+						continue;
+					}
+					picojson::object r;
+					r["id"] = picojson::value(p.first);
+					r["method"] = picojson::value("GET");
+					r["url"] = picojson::value("/drives/" + auth.drive_id + "/root:/" +
+					                           EncodeItemPath(parsed.uri.RootRelativePath()) + query);
+					requests.emplace_back(r);
+				}
+				picojson::object batch;
+				batch["requests"] = picojson::value(requests);
+				picojson::value holder;
+				const auto &reply = AsObject(
+				    client.GraphSend("POST", "/v1.0/$batch", picojson::value(batch).serialize(), what, true), what,
+				    holder);
+				auto responses = reply.find("responses");
+				if (responses == reply.end() || !responses->second.is<picojson::array>()) {
+					throw IOException("sharepoint: unexpected $batch reply reading %s", what);
+				}
+				int retry_after = 0;
+				for (auto &resp : responses->second.get<picojson::array>()) {
+					if (!resp.is<picojson::object>()) {
+						continue;
+					}
+					auto &o = resp.get<picojson::object>();
+					const auto id = StringField(o, "id");
+					auto status = o.find("status");
+					const int code = status != o.end() && status->second.is<int64_t>()
+					                     ? static_cast<int>(status->second.get<int64_t>())
+					                     : 0;
+					auto body = o.find("body");
+					if (code >= 200 && code < 300 && body != o.end() && body->second.is<picojson::object>()) {
+						found[id] = body->second.get<picojson::object>();
+						pending.erase(id);
+					} else if (code == 404) {
+						pending.erase(id); // gone since the glob listed it
+					} else if (code == 429 || code == 503 || code >= 500) {
+						retry_after = std::max(retry_after, 1);
+					} else {
+						const auto text = body != o.end() ? body->second.serialize() : string();
+						ThrowBatchPart(what, code, text);
+					}
+				}
+				if (!pending.empty()) {
+					if (attempt >= kMaxBatchAttempts) {
+						throw IOException("sharepoint: reading %s: Graph kept throttling the metadata requests", what);
+					}
+					SleepBeforeRetry(attempt, retry_after);
+				}
+			}
+			for (auto &f : found) {
+				items.emplace_back(matches[std::stoull(f.first)].path, std::move(f.second));
+			}
+		}
+
+		// People in the library's own person columns: names and emails from
+		// the site's User Information List.
+		auto data = make_uniq<FilesBindData>();
+		vector<vector<Value>> custom;
+		std::set<int64_t> person_ids;
+		for (auto &item : items) {
+			picojson::object fields;
+			auto list_item = item.second.find("listItem");
+			if (list_item != item.second.end() && list_item->second.is<picojson::object>()) {
+				auto f = list_item->second.get<picojson::object>().find("fields");
+				if (f != list_item->second.get<picojson::object>().end() && f->second.is<picojson::object>()) {
+					fields = f->second.get<picojson::object>();
+				}
+			}
+			custom.push_back(RowsOf({fields}, plan)[0]);
+			for (idx_t c = 0; c < plan.size(); c++) {
+				if (plan[c].person != ListPersonPart::ID) {
+					continue;
+				}
+				auto &id = custom.back()[c];
+				if (id.IsNull()) {
+					continue;
+				}
+				if (id.type().id() == LogicalTypeId::LIST) {
+					for (auto &e : ListValue::GetChildren(id)) {
+						if (!e.IsNull()) {
+							person_ids.insert(e.GetValue<int64_t>());
+						}
+					}
+				} else {
+					person_ids.insert(id.GetValue<int64_t>());
+				}
+			}
+		}
+		CursorState lookup; // LookedUp reads the people from it
+		auto &people = lookup.people;
+		if (!person_ids.empty()) {
+			picojson::value holder;
+			const auto &library = AsObject(
+			    client.GraphGet("/v1.0/drives/" + auth.drive_id + "/list?$select=parentReference", what), what, holder);
+			auto parent = library.find("parentReference");
+			if (parent != library.end() && parent->second.is<picojson::object>()) {
+				const auto site = StringField(parent->second.get<picojson::object>(), "siteId");
+				people = ResolvePeople(client, "/sites/" + site, what,
+				                       vector<int64_t>(person_ids.begin(), person_ids.end()));
+			}
+		}
+		for (idx_t r = 0; r < items.size(); r++) {
+			auto &item = items[r].second;
+			if (item.find("folder") != item.end()) {
+				continue; // a literal folder path globs to itself
+			}
+			string mime;
+			auto file = item.find("file");
+			if (file != item.end() && file->second.is<picojson::object>()) {
+				mime = StringField(file->second.get<picojson::object>(), "mimeType");
+			}
+			auto size = item.find("size");
+			const auto created_by = Who(item, "createdBy");
+			const auto modified_by = Who(item, "lastModifiedBy");
+			vector<Value> row = {Value(items[r].first),
+			                     Value(StringField(item, "name")),
+			                     size != item.end() && size->second.is<int64_t>()
+			                         ? Value::BIGINT(size->second.get<int64_t>())
+			                         : Value(LogicalType::BIGINT),
+			                     TimestampField(item, "createdDateTime"),
+			                     TimestampField(item, "lastModifiedDateTime"),
+			                     created_by.first,
+			                     created_by.second,
+			                     modified_by.first,
+			                     modified_by.second,
+			                     mime.empty() ? Value(LogicalType::VARCHAR) : Value(mime),
+			                     Value(StringField(item, "id")),
+			                     Value(StringField(item, "webUrl"))};
+			for (idx_t c = 0; c < plan.size(); c++) {
+				auto value = custom[r][c];
+				if (value.IsNull() && (plan[c].person == ListPersonPart::NAME || plan[c].person == ListPersonPart::EMAIL)) {
+					for (idx_t i = 0; i < plan.size(); i++) {
+						if (plan[i].person == ListPersonPart::ID && plan[i].field == plan[c].field) {
+							value = LookedUp(lookup, plan[c], custom[r][i]);
+						}
+					}
+				}
+				row.push_back(std::move(value));
+			}
+			data->rows.push_back(std::move(row));
+		}
+
+		std::set<string> used;
+		for (auto &col : FileColumns()) {
+			names.emplace_back(col.first);
+			return_types.push_back(col.second);
+			used.insert(StringUtil::Lower(col.first));
+		}
+		for (auto &col : plan) {
+			// A library column named like a fixed one ("Name", "Size") gets "_2".
+			string name = col.name;
+			for (int n = 2; used.count(StringUtil::Lower(name)); n++) {
+				name = col.name + "_" + std::to_string(n);
+			}
+			used.insert(StringUtil::Lower(name));
+			names.emplace_back(name);
+			return_types.push_back(ToLogicalType(col.type));
+		}
+		result = std::move(data);
+	});
+	return result;
+}
+
+struct FilesCursor : public GlobalTableFunctionState {
+	idx_t cursor = 0;
+};
+
+unique_ptr<GlobalTableFunctionState> FilesInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<FilesCursor>();
+}
+
+void FilesScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &data = input.bind_data->Cast<FilesBindData>();
+	auto &state = input.global_state->Cast<FilesCursor>();
+	idx_t out = 0;
+	while (state.cursor < data.rows.size() && out < STANDARD_VECTOR_SIZE) {
+		auto &row = data.rows[state.cursor];
+		for (idx_t c = 0; c < row.size(); c++) {
+			output.SetValue(c, out, row[c]);
+		}
+		state.cursor++;
+		out++;
+	}
+	duckdb_compat::SetChildCardinality(output, out);
+}
+
 } // namespace
 
 void RegisterListFunctions(ExtensionLoader &loader) {
@@ -1175,6 +1526,21 @@ void RegisterListFunctions(ExtensionLoader &loader) {
 	desc.categories = {"sharepoint", "list"};
 	info.descriptions.push_back(std::move(desc));
 	loader.RegisterFunction(std::move(info));
+
+	{
+		TableFunction files("read_sharepoint_files", {LogicalType::VARCHAR}, FilesScan, FilesBind, FilesInit);
+		duckdb_compat::NameParameters(files, {"path"});
+		CreateTableFunctionInfo files_info(files);
+		FunctionDescription files_desc;
+		files_desc.description =
+		    "A document library's files and their metadata, one row per file matching a sharepoint:// path or "
+		    "glob: path, name, size, created/modified and by whom, content type, id, web URL, then the library's "
+		    "own columns, typed as read_sharepoint_list types a list's.";
+		files_desc.examples = {"SELECT name, size, modified_by FROM read_sharepoint_files('sharepoint://Finance/**/*.xlsx')"};
+		files_desc.categories = {"sharepoint", "list"};
+		files_info.descriptions.push_back(std::move(files_desc));
+		loader.RegisterFunction(std::move(files_info));
+	}
 
 	CopyFunction front(duckdb_compat::FunctionName(kListFormat));
 	front.plan = ListCopyPlan;
