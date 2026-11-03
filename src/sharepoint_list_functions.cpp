@@ -698,6 +698,36 @@ InsertionOrderPreservingMap<string> ListToString(TableFunctionToStringInput &inp
 	return result;
 }
 
+//! The id of the site's User Information List, or "" if it cannot be read.
+//! Not by its title: it is hidden, Graph answers lists/User Information List
+//! with 404 (live CI, 2026-11-03), and the title is in the site's language.
+//! It is the system list at _catalogs/users; system lists are listed only
+//! when `system` is selected.
+string UserListId(GraphClient &client, const string &site, const string &what) {
+	try {
+		string next = "/v1.0" + site + "/lists?$select=id,webUrl,system&$top=999";
+		for (int pages = 0; !next.empty() && pages < 50; pages++) {
+			picojson::value holder;
+			const auto &page = AsObject(client.GraphGet(next, what), what, holder);
+			auto values = page.find("value");
+			if (values != page.end() && values->second.is<picojson::array>()) {
+				for (auto &v : values->second.get<picojson::array>()) {
+					if (v.is<picojson::object>() &&
+					    StringUtil::EndsWith(StringUtil::Lower(StringField(v.get<picojson::object>(), "webUrl")),
+					                         "/_catalogs/users")) {
+						return StringField(v.get<picojson::object>(), "id");
+					}
+				}
+			}
+			auto link = page.find("@odata.nextLink");
+			next = (link != page.end() && link->second.is<string>()) ? GraphPathOfLink(link->second.get<string>())
+			                                                         : string();
+		}
+	} catch (std::exception &) {
+	}
+	return string();
+}
+
 //! A person's name and email in the site's User Information List.
 struct PersonInfo {
 	Value name;
@@ -712,13 +742,17 @@ unordered_map<int64_t, PersonInfo> ResolvePeople(GraphClient &client, const List
 	unordered_map<int64_t, PersonInfo> people;
 	// "/v1.0/sites/{site}/lists/{id}" -> "/sites/{site}"; $batch urls are relative to /v1.0.
 	const auto site = data.base.substr(5, data.base.find("/lists/") - 5);
+	const auto users = UserListId(client, site, data.what);
+	if (users.empty()) {
+		return people;
+	}
 	for (idx_t start = 0; start < ids.size(); start += kPeoplePerBatch) {
 		picojson::array requests;
 		for (idx_t i = start; i < ids.size() && i < start + kPeoplePerBatch; i++) {
 			picojson::object r;
 			r["id"] = picojson::value(std::to_string(ids[i]));
 			r["method"] = picojson::value("GET");
-			r["url"] = picojson::value(site + "/lists/User%20Information%20List/items/" + std::to_string(ids[i]) +
+			r["url"] = picojson::value(site + "/lists/" + users + "/items/" + std::to_string(ids[i]) +
 			                           "?$select=id&$expand=fields($select=Title,EMail)");
 			requests.emplace_back(r);
 		}
