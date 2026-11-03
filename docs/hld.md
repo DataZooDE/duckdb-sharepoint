@@ -394,7 +394,7 @@ sessions", a Conditional Access change, or 90 days without any redemption.
    (`test/sql/sharepoint_excel.live.template`, `e2e/tests/test_excel_workbook.py`).
    Write side implemented 2026-11-02: `COPY ... (FORMAT excel_table|excel_range)`
    (§9.1); `OVERWRITE` replaces a table's rows / clears a range first
-   (2026-11-02). Open: the 1904 date system.
+   (2026-11-02). 1904 date system detected (2026-11-03, #64).
 9. **SharePoint lists (#49).** Read side implemented 2026-11-02:
    `read_sharepoint_list` (§10). Open: verified live (e2e, which needs the
    app's Sites.Manage.All to create its fixture lists once); multi-choice and
@@ -552,6 +552,11 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
 - **`createSession` answers a transient HTTP 504 (`UnknownError`).** It is
   retried like a read; a duplicate session after a lost reply is harmless
   (it expires unused).
+- **A table or worksheet created in a workbook session is not at once
+  visible outside it** (2026-11-03, both seen in live CI): after
+  `tables/add` (or `worksheets/add`) and `closeSession`, a sessionless read
+  got 404 `ItemNotFound`. A COPY that creates either now polls it until it is
+  visible (bounded; the rows are written either way).
 - **A missing workbook table is a 404 `ItemNotFound`**, with the message in
   the tenant's language ("Die angeforderte Ressource ist nicht vorhanden."),
   so tests match the name we put in the message, never Graph's text.
@@ -615,8 +620,14 @@ step) needs too.
   -> DOUBLE; anything mixed with text -> VARCHAR. Dates are 1900-system
   serials (with Lotus' phantom 1900-02-29), rounded to the millisecond. Error
   cells (`#DIV/0!`) are NULL in a typed column. `all_varchar := true` reads
-  text, dates as ISO text. The 1904 date system (old Mac workbooks) is not
-  detected: their dates read four years early.
+  text, dates as ISO text. A workbook in the 1904 date system (old Mac
+  Excel) has serials 1462 days smaller; the workbook API does not say which
+  system a workbook uses, so `xl/workbook.xml` is read for
+  `<workbookPr date1904="1">` by three ranged reads (the zip's end record,
+  its central directory, the entry), inflated through DuckDB's gzip decoder
+  in a gzip frame (miniz itself is not exported to a loadable extension).
+  Reads add the offset and writes take it off; anything unexpected in the
+  zip means the 1900 system, never an error (#64).
 - **Header.** A table's header row; for a range the first row unless
   `header := false`. Empty names become `column<N>`, duplicates get `_2`
   (case-insensitive, as DuckDB names are).
@@ -706,23 +717,53 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- /sites/Sales o
   pages a 300-item fixture 50 at a time instead of building a 5,000-item list:
   creating that many items is throttled to a crawl, and nextLink paging is the
   same at any size.
-  Paging alone works past the 5,000-item list view threshold; a filter would
-  need indexed columns, so there is no pushdown yet. Counted as `list` in
-  `sharepoint_stats()`. Like the Excel reads, everything is read at bind --
-  here because a choice column is multi-valued only if its data says so.
+  Paging alone works past the 5,000-item list view threshold. Counted as
+  `list` in `sharepoint_stats()`.
+- **When the items are read, and WHERE pushdown (#61).** A choice column
+  shown as check boxes (or with no `displayAs`) may hold several values, and
+  only the data says whether it does; such a list is read at bind, as the
+  Excel reads are, and nothing is pushed down. Every other list is read at
+  init, after `pushdown_complex_filter` has turned the WHERE predicates on
+  **indexed** columns into `$filter` (past 5,000 items Graph refuses a filter
+  on a non-indexed column; the `Prefer: HonorNonIndexedQueriesWarningMayFailRandomly`
+  header is unreliable and not used). DuckDB keeps every predicate, so a
+  pushed clause only has to be never stricter than its SQL
+  (`ODataClause`, pure): text `=`, `IN` and `LIKE 'x%'` (SharePoint compares
+  case-insensitively, a superset); number `=`, `IN`, and ranges made
+  inclusive; timestamp ranges widened to whole seconds. No `<>`, no text
+  ranges, no booleans. A filter Graph refuses falls back to the full read.
+  EXPLAIN shows it as `Graph $filter`. Expressions are walked with
+  `ExpressionIterator` and expression types only: 2.0 made comparisons
+  function expressions.
 - **Columns** (pure, `sharepoint_list.*`): `id` first, `created` / `modified`
   last (UTC); every column neither hidden nor read-only, named by its display
   name, ContentType and Attachments left out. The system names win a clash
   (a user column "Created" becomes `Created_2`).
 - **Types.** text -> VARCHAR, number -> DOUBLE, currency -> DECIMAL(18,4),
-  boolean -> BOOLEAN, dateTime -> TIMESTAMP (Graph returns UTC; a date-only
-  column is midnight in the *site's* time zone, so it can read as the evening
-  before -- not corrected yet), choice -> VARCHAR or VARCHAR[], hyperlink ->
+  boolean -> BOOLEAN, dateTime -> TIMESTAMP (Graph returns UTC), a date-only
+  dateTime (or calculated date) -> DATE (#64), choice -> VARCHAR or VARCHAR[], hyperlink ->
   the URL, calculated -> by its output type, other -> VARCHAR (JSON text).
-  Lookup -> the display value plus `<name>_id` (`<internal>LookupId`); person
-  -> only `<name>_id`, since Graph gives a person's id in the user information
-  list, not a name. A field missing from an item (Graph omits empty ones) is
+  Lookup -> the display value plus `<name>_id` (`<internal>LookupId`). Person
+  (#63) -> `<name>`, `<name>_email`, `<name>_id`, lists for
+  `allowMultipleSelection`; Author/Editor -> `created_by*` / `modified_by*`
+  after `modified`. Graph gives a person's id in the site's User Information
+  List; for several people it may instead send `<internal>` as
+  `[{LookupId, LookupValue, Email}]`, which is selected and used when
+  present. Otherwise names and emails are looked up in that list
+  (`lists/User Information List/items/{id}`, `$batch` of 20), at init and
+  only for the columns read (projection pushdown). Best effort: a person
+  missing from the list, or a refused call, leaves the name NULL. A field missing from an item (Graph omits empty ones) is
   NULL.
+
+- **Date-only columns (#64).** Graph returns a date-only value as midnight
+  in the *site's* time zone, in UTC (2026-03-15 on a UTC+1 site is
+  `2026-03-14T23:00:00Z`), and v1.0 has no call for the site's time zone.
+  For every offset from UTC-10:00 to UTC+13:30, local midnight is before
+  10:30 UTC on that date or from 10:30 UTC the day before, so that cut-off
+  gives the date without one (`DateOnlyDays`); UTC-11, UTC-12, UTC+13:45 and
+  UTC+14 are wrong by a day. A DATE is written as 10:15 UTC on that date
+  (`FormatDateOnly`), which is on that date in the same range of zones. Date
+  -only columns are not pushed down (#61).
 
 ### 10.1 Writing: `COPY ... TO '<list>' (FORMAT sharepoint_list)`
 
@@ -772,4 +813,35 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   names the current file, which a delete of `x?version=1.0` must not hit.
 - **`sharepoint_versions(path)`.** `GET /items/{id}/versions`, paged; Graph
   lists the current version first, and its `path` is the plain one.
+
+## 13. `read_sharepoint_files` (#65)
+
+- The files come from the filesystem's `Glob` (its syntax, the
+  immutable-prefix cache); each file's driveItem, with
+  `$expand=listItem($expand=fields($select=...))`, is fetched by path in
+  `$batch` calls of 20 (throttled parts retried; a 404 part means the file
+  went away after the glob).
+- Fixed columns from the driveItem (people come with names and emails, no
+  User Information List lookup); then the library's columns from
+  `/drives/{d}/list/columns`, planned by `PlanListColumns` without its
+  system columns and `FileLeafRef` (that is `name`). A choice column is a
+  list only when its definition says multi-select (one row per file: no data
+  to decide from). Person columns are resolved through the User Information
+  List of the library's site.
+- Read at bind, like the Excel functions.
+
+## 14. `search_sharepoint` (#67)
+
+- `POST /search/query`, `entityTypes` driveItem + listItem by default
+  (`types :=`), paged with `from`/`size` (200) while
+  `moreResultsAvailable`, up to `max_results`.
+- **Region.** App-only search must name the tenant's data location; delegated
+  search must not. The first search goes without one; on Graph's 400
+  "Region is required" the known codes are tried (NAM, EUR, APC, ...) and the
+  one that works is kept per identity for the process. `region :=` skips that.
+- A driveItem in the secret's drive gets a `sharepoint://` path from
+  `parentReference.path`, or `id:` when the hit has none; list items carry
+  `site_id`/`list_id`, for `read_sharepoint_list('id:<list_id>', site := ...)`.
+- The live test searches for a probe file kept between runs: the index lags
+  by minutes, so the run that creates the probe skips.
 
