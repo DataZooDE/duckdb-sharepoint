@@ -207,6 +207,24 @@ TO 'Orders' (FORMAT sharepoint_list);
 set through `<name>_id`), so a list read with `read_sharepoint_list` can be
 changed and written back as it is.
 
+## Search
+
+`search_sharepoint` runs Microsoft Search across the tenant's files, list
+items and sites, with what the signed-in user (or the app) may see:
+
+```sql
+SELECT name, path, modified, modified_by, summary
+FROM search_sharepoint('quarterly forecast');                       -- files and list items
+SELECT name, web_url FROM search_sharepoint('Sales', types := ['site']);
+SELECT * FROM read_excel_table((SELECT path FROM search_sharepoint('plan 2026') LIMIT 1), 'Sales');
+```
+
+A file in the secret's drive comes with a `sharepoint://` path, so a result
+reads straight back. App-only search must name the tenant's region; the
+extension finds it on the first search, or takes `region := 'EUR'`.
+`max_results` (default 500) caps the rows. Search indexes new content with a
+delay of minutes.
+
 ## Installation
 
 ```sql
