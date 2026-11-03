@@ -863,3 +863,17 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - The live test searches for a probe file kept between runs: the index lags
   by minutes, so the run that creates the probe skips.
 
+## 15. `sharepoint_changes` (#62, files)
+
+- `GET /drives/{d}/root/delta` (SharePoint has delta on the drive root
+  only), paged to the `@odata.deltaLink`; its `token` parameter is returned
+  in a final `checkpoint` row, so a sync never loses its place even when
+  nothing changed. Stateless: the caller stores the token.
+- Filtered to the folder asked about client-side, by `parentReference.path`
+  (whole segments). A deleted item often has no path, so deletes are always
+  reported (by id). An item seen twice in one delta keeps its last state; the
+  root folder itself is skipped.
+- `token := 'latest'` gives a token without enumerating the drive. An expired
+  token (410 `resyncRequired`) is an error telling to start over.
+- Lists (`/sites/{s}/lists/{l}/items/delta`) are not done yet: they build on
+  the list column plan of #79–#82.
