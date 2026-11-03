@@ -1290,7 +1290,7 @@ unique_ptr<FunctionData> FilesBind(ClientContext &context, TableFunctionBindInpu
 		// The files: the filesystem's glob (its syntax, its immutable-prefix
 		// cache), then each file's driveItem with its listItem fields.
 		auto &fs = FileSystem::GetFileSystem(context);
-		const auto matches = fs.Glob(pattern, opener);
+		const auto matches = fs.Glob(pattern); // the opener is pushed by DuckDB (passing one throws)
 		string select;
 		std::set<string> selected;
 		for (auto &col : plan) {
