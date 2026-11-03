@@ -1,6 +1,8 @@
 // The client assertion's shape (#71). Pure: see sharepoint_assertion.hpp.
 #include "sharepoint_assertion.hpp"
 
+#include <cstdint>
+
 namespace duckdb {
 namespace sharepoint {
 
