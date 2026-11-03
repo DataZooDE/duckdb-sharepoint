@@ -241,5 +241,33 @@ def test_people_by_name_email_and_id(graph, fixture_lists, sql, secret_sql):
         assert out[-4] == f"{n0}|{e0}|{i0}|[{n0}, {n1}]|[{e0}, {e1}]|[{i0}, {i1}]|true|true"
         # No name or email read: no lookup (drive -> site, list, columns, one page).
         assert out[-1] == "4", f"{out[-1]} list calls"
+def test_date_only_column_reads_and_writes_dates(graph, fixture_lists, sql, secret_sql):
+    """A date-only column (#64) is a DATE: Graph stores and returns the site's
+    local midnight in UTC (on the test site, UTC+1/+2, the evening before),
+    which used to read as the wrong day. Dates on both sides of the 2026 EU
+    daylight-saving switches round-trip through COPY unchanged."""
+    site, _, _ = fixture_lists
+    import uuid
+    name = f"_duckdb_sharepoint_e2e_dates_{uuid.uuid4().hex[:8]}"
+    created = _ok(graph._req("POST", f"{GRAPH}/sites/{site}/lists", json={
+        "displayName": name, "list": {"template": "genericList"},
+        "columns": [{"name": "Day", "dateTime": {"format": "dateOnly"}}]}), "create dates list")["id"]
+    days = ["2026-01-15", "2026-03-28", "2026-03-30", "2026-07-01", "2026-10-24", "2026-10-26", "2026-12-31"]
+    try:
+        values = ", ".join(f"('{d}', DATE '{d}')" for d in days)
+        out = sql(f"""{secret_sql}
+            COPY (SELECT * FROM (VALUES {values}) t(Title, Day)) TO '{name}' (FORMAT sharepoint_list);
+            SELECT column_type FROM (DESCRIBE SELECT Day FROM read_sharepoint_list('{name}'));
+            SELECT string_agg(Title || '=' || Day, ',' ORDER BY Title) FROM read_sharepoint_list('{name}');
+        """).splitlines()
+        assert out[-2] == "DATE"
+        assert out[-1] == ",".join(f"{d}={d}" for d in days)
+
+        # What Graph itself returns: the site's local midnight, in UTC.
+        items = _ok(graph._req("GET", f"{GRAPH}/sites/{site}/lists/{created}/items?$expand=fields($select=Title,Day)"),
+                    "raw items")["value"]
+        raw = {i["fields"]["Title"]: i["fields"]["Day"] for i in items}
+        print("raw date-only values:", raw)  # for hld notes: the site's offset shows here
+        assert all(v.endswith("Z") for v in raw.values()), raw
     finally:
         graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}")

@@ -197,8 +197,8 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- another site o
 ```
 
 - **Columns** are named by their display names and typed: text, number,
-  currency (DECIMAL), yes/no, date and time (TIMESTAMP, UTC), and choice
-  (VARCHAR, or VARCHAR[] for several choices).
+  currency (DECIMAL), yes/no, date and time (TIMESTAMP, UTC), date only
+  (DATE), and choice (VARCHAR, or VARCHAR[] for several choices).
 - **Lookups and people:** a lookup column gives its value plus `<name>_id`; a
   person column gives `<name>`, `<name>_email` and `<name>_id` (lists when
   it allows several people). Created By and Modified By come as
@@ -424,8 +424,9 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
 - **Lists.**
   - Only predicates on indexed columns are sent to SharePoint, and none for
     a list with a multi-select choice column.
-  - A date-only column comes back as midnight in the site's time zone,
-    converted to UTC.
+  - A date-only column is read as a DATE on sites from UTC-10:00 to
+    UTC+13:30. Graph doesn't say a site's time zone, so sites at UTC-11,
+    UTC-12, UTC+13:45 and UTC+14 read such dates a day off.
 
 ## Network and privacy
 
