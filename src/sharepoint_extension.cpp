@@ -5,6 +5,7 @@
 #include "sharepoint_excel_functions.hpp"
 #include "sharepoint_filesystem.hpp"
 #include "sharepoint_list_functions.hpp"
+#include "sharepoint_changes.hpp"
 #include "sharepoint_stats.hpp"
 #include "sharepoint_version.hpp"
 #include "sharepoint_vfs_functions.hpp"
@@ -180,6 +181,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	sharepoint::RegisterExcelFunctions(loader);
 	// read_sharepoint_list(): a SharePoint list as a table, same secret.
 	sharepoint::RegisterListFunctions(loader);
+	sharepoint::RegisterChangeFunctions(loader);
 
 	datazoo::RegisterBannerOption(loader);
 	// Last, so a load that fails earlier never advertises itself. Silent unless

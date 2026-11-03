@@ -121,6 +121,22 @@ SELECT write_blob('sharepoint://notes/readme.md', '# Title'::BLOB);
 SELECT remove_file('sharepoint://notes/readme.md');   -- true, then false
 ```
 
+**What changed since last time.** `sharepoint_changes` reads Graph's delta
+for a folder: one row per file or folder added or changed (`_change =
+'upsert'`) or deleted (`'delete'`, by `id`; a delete may come without its
+path), then one `'checkpoint'` row whose `token` is what to pass next time.
+The token is yours to keep, e.g. in a table:
+
+```sql
+CREATE TABLE sync AS SELECT token FROM sharepoint_changes('sharepoint://Finance/', token := 'latest')
+                     WHERE _change = 'checkpoint';                      -- start from now
+-- later:
+SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := (SELECT token FROM sync));
+```
+
+Without a token it lists everything under the folder once. An expired token
+says so; start over without one.
+
 `write_blob`, `remove_file`, `move_file` and `file_size` don't depend on the
 scheme, so they work for any filesystem DuckDB can reach (`s3://`, `gs://`,
 local paths). They are shared with duckdb-gdrive, so both extensions can be
