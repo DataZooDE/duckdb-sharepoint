@@ -863,3 +863,21 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - The live test searches for a probe file kept between runs: the index lags
   by minutes, so the run that creates the probe skips.
 
+## 16. `PROVIDER credential_chain` (#72)
+
+- Order as `DefaultAzureCredential`: workload identity (the federated token
+  file as a client assertion, the same grant as `client_certificate`), then a
+  managed identity -- App Service (`IDENTITY_ENDPOINT` + `X-IDENTITY-HEADER`,
+  api 2019-08-01) *or* IMDS (`169.254.169.254`, `Metadata: true`, api
+  2018-02-01; 1 s connect timeout) -- then `az account get-access-token`.
+  The first token wins; with none, every source's reason is in the error.
+  Pure parts (order, query strings, reply parsing) are
+  `sharepoint_credential_chain.*`.
+- Tokens are cached like the others, keyed by the environment that picks the
+  identity (`AZURE_*`, `IDENTITY_ENDPOINT`, `AZURE_CONFIG_DIR`) and the
+  user-assigned `CLIENT_ID`.
+- Live: CI has no managed identity but has `az`; the e2e test signs the CLI
+  in as the CI app in a throwaway `AZURE_CONFIG_DIR` and reads and writes
+  through the chain. The managed identity paths were checked against a local
+  stand-in endpoint; an Azure VM test needs Azure.
+
