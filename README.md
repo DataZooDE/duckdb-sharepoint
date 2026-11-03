@@ -187,12 +187,22 @@ SELECT * FROM read_sharepoint_list('Orders', site := 'Sales'); -- another site o
 ```
 
 - **Columns** are named by their display names and typed: text, number,
-  currency (DECIMAL), yes/no, date and time (TIMESTAMP, UTC), and choice
-  (VARCHAR, or VARCHAR[] for several choices).
+  currency (DECIMAL), yes/no, date and time (TIMESTAMP, UTC), date only
+  (DATE), and choice (VARCHAR, or VARCHAR[] for several choices).
 - **Lookups and people:** a lookup column gives its value plus `<name>_id`; a
-  person column gives `<name>_id`.
+  person column gives `<name>`, `<name>_email` and `<name>_id` (lists when
+  it allows several people). Created By and Modified By come as
+  `created_by`, `created_by_email`, `created_by_id` and the same for
+  `modified_by`. Names and emails are looked up in the site's user list, only
+  when the query reads them.
 - Every row also has **`id`, `created` and `modified`**. Lists of any size
   are read page by page, including past the 5,000-item list view threshold.
+- **Filters on indexed columns run in SharePoint.** `WHERE` with `=`, `IN`,
+  a range or `LIKE 'abc%'` on an indexed column is sent to Graph as a
+  `$filter`, so a large list returns only the matching items (`EXPLAIN` shows
+  it). Other predicates are applied by DuckDB after the read. Index a column
+  under *List settings → Indexed columns*. A list with a multi-select choice
+  column is always read whole.
 
 Write items back with `COPY`. A row with an `id` updates that item, a row
 without one creates a new item, and columns are matched by name:
@@ -206,6 +216,38 @@ TO 'Orders' (FORMAT sharepoint_list);
 `created`, `modified` and a lookup's display value are skipped (a lookup is
 set through `<name>_id`), so a list read with `read_sharepoint_list` can be
 changed and written back as it is.
+
+### What's in a library: `read_sharepoint_files`
+
+```sql
+SELECT name, path, size, modified, modified_by, "Department", "Status"
+FROM read_sharepoint_files('sharepoint://Finance/**/*.xlsx');
+```
+
+One row per file the path or glob matches (the same glob syntax as
+`sharepoint://`): `path`, `name`, `size`, `created`, `modified`, `created_by`,
+`modified_by` (and their `_email`), `content_type`, `id` and `web_url`, then
+the library's own metadata columns, typed as `read_sharepoint_list` types a
+list's.
+
+## Search
+
+`search_sharepoint` runs Microsoft Search across the tenant's files, list
+items and sites, with what the signed-in user (or the app) may see:
+
+```sql
+SELECT name, path, modified, modified_by, summary
+FROM search_sharepoint('quarterly forecast');                       -- files and list items
+SELECT name, web_url FROM search_sharepoint('Sales', types := ['site']);
+SET VARIABLE plan = (SELECT path FROM search_sharepoint('plan 2026') LIMIT 1);
+SELECT * FROM read_excel_table(getvariable('plan'), 'Sales');   -- a table function takes no subquery
+```
+
+A file in the secret's drive comes with a `sharepoint://` path, so a result
+reads straight back. App-only search must name the tenant's region; the
+extension finds it on the first search, or takes `region := 'EUR'`.
+`max_results` (default 500) caps the rows. Search indexes new content with a
+delay of minutes.
 
 ## Installation
 
@@ -356,10 +398,11 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
   - Workbooks are read whole when the query is planned, which suits Excel's
     sizes; a sheet of millions of cells belongs in Parquet.
 - **Lists.**
-  - No filter pushdown yet.
-  - A person column gives the person's id, not their name.
-  - A date-only column comes back as midnight in the site's time zone,
-    converted to UTC.
+  - Only predicates on indexed columns are sent to SharePoint, and none for
+    a list with a multi-select choice column.
+  - A date-only column is read as a DATE on sites from UTC-10:00 to
+    UTC+13:30. Graph doesn't say a site's time zone, so sites at UTC-11,
+    UTC-12, UTC+13:45 and UTC+14 read such dates a day off.
 
 ## Network and privacy
 

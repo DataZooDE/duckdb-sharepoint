@@ -67,3 +67,14 @@ SET sharepoint_list_page_size = 0;
 ----
 between 1 and 999
 
+
+# read_sharepoint_files (#65): registered; bad input fails before any Graph call.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'read_sharepoint_files' AND function_type = 'table';
+----
+1
+
+statement error
+SELECT * FROM read_sharepoint_files(NULL);
+----
+must not be NULL
