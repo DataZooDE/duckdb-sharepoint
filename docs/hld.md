@@ -875,5 +875,7 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   root folder itself is skipped.
 - `token := 'latest'` gives a token without enumerating the drive. An expired
   token (410 `resyncRequired`) is an error telling to start over.
-- Lists (`/sites/{s}/lists/{l}/items/delta`) are not done yet: they build on
-  the list column plan of #79–#82.
+- Lists: `sharepoint_list_changes` over `/sites/{s}/lists/{l}/items/delta`
+  with the list column plan, people lookup and choice typing of
+  `read_sharepoint_list`; a deleted item (`deleted` / `@removed`) has only
+  `id`. Same checkpoint row and token rules.
