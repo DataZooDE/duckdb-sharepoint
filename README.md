@@ -363,7 +363,8 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
     sizes; a sheet of millions of cells belongs in Parquet.
   - Workbooks in the 1904 date system (old Mac files) read four years early.
 - **Lists.**
-  - No filter pushdown yet.
+  - Only predicates on indexed columns are sent to SharePoint, and none for
+    a list with a multi-select choice column.
   - A person column gives the person's id, not their name.
   - A date-only column comes back as midnight in the site's time zone,
     converted to UTC.
