@@ -343,3 +343,98 @@ TEST_CASE("ExcelClearRegion: from the anchor down and right, within the used ran
 	REQUIRE_FALSE(
 	    ExcelClearRegion(ParseExcelAddress("Out!A41").address, ParseExcelAddress("Out!A1:F40").address, region));
 }
+
+// ---------------------------------------------------------------------------
+// The 1904 date system (#64). The workbook API does not say which date system
+// a workbook uses; xl/workbook.xml does (<workbookPr date1904="1"/>). It is
+// found with ranged reads: the zip's end record, its central directory, then
+// the one entry.
+// ---------------------------------------------------------------------------
+namespace {
+
+void Put16(std::string &s, uint16_t v) {
+	s += static_cast<char>(v & 0xFF);
+	s += static_cast<char>(v >> 8);
+}
+void Put32(std::string &s, uint32_t v) {
+	Put16(s, static_cast<uint16_t>(v & 0xFFFF));
+	Put16(s, static_cast<uint16_t>(v >> 16));
+}
+
+//! A zip with stored (method 0) entries, as a writer lays one out.
+std::string MakeZip(const std::vector<std::pair<std::string, std::string>> &entries, const std::string &comment = "") {
+	std::string zip, central;
+	for (auto &e : entries) {
+		const auto offset = static_cast<uint32_t>(zip.size());
+		Put32(zip, 0x04034b50);
+		Put16(zip, 20), Put16(zip, 0), Put16(zip, 0), Put16(zip, 0), Put16(zip, 0);
+		Put32(zip, 0xDEADBEEF), Put32(zip, e.second.size()), Put32(zip, e.second.size());
+		Put16(zip, e.first.size()), Put16(zip, 3);
+		zip += e.first + "xyz" + e.second;
+		Put32(central, 0x02014b50);
+		Put16(central, 20), Put16(central, 20), Put16(central, 0), Put16(central, 0), Put16(central, 0),
+		    Put16(central, 0);
+		Put32(central, 0xDEADBEEF), Put32(central, e.second.size()), Put32(central, e.second.size());
+		Put16(central, e.first.size()), Put16(central, 0), Put16(central, 0), Put16(central, 0), Put16(central, 0);
+		Put32(central, 0), Put32(central, offset);
+		central += e.first;
+	}
+	const auto cd_offset = static_cast<uint32_t>(zip.size());
+	zip += central;
+	Put32(zip, 0x06054b50);
+	Put16(zip, 0), Put16(zip, 0), Put16(zip, entries.size()), Put16(zip, entries.size());
+	Put32(zip, central.size()), Put32(zip, cd_offset), Put16(zip, comment.size());
+	return zip + comment;
+}
+
+} // namespace
+
+TEST_CASE("zip: find one entry from the end record, as ranged reads would", "[excel][1904]") {
+	const std::string workbook = R"(<workbook><workbookPr date1904="1"/></workbook>)";
+	const auto zip = MakeZip({{"[Content_Types].xml", "<Types/>"}, {"xl/workbook.xml", workbook}}, "a comment");
+
+	// Only the last bytes, as a ranged read of the tail.
+	const auto tail = zip.substr(zip.size() - 40);
+	uint64_t cd_offset = 0, cd_size = 0;
+	REQUIRE(ZipCentralDirectory(tail, zip.size(), cd_offset, cd_size));
+	ZipEntry entry;
+	REQUIRE(ZipFindEntry(zip.substr(cd_offset, cd_size), "xl/workbook.xml", entry));
+	REQUIRE(entry.method == 0);
+	REQUIRE(entry.crc32 == 0xDEADBEEF);
+	REQUIRE(entry.compressed_size == workbook.size());
+	uint64_t header = 0;
+	REQUIRE(ZipLocalHeaderSize(zip.substr(entry.local_header_offset, 64), header));
+	REQUIRE(zip.substr(entry.local_header_offset + header, entry.compressed_size) == workbook);
+
+	REQUIRE_FALSE(ZipFindEntry(zip.substr(cd_offset, cd_size), "xl/nope.xml", entry));
+	REQUIRE_FALSE(ZipCentralDirectory("not a zip at all, really not", 1000, cd_offset, cd_size));
+	REQUIRE_FALSE(ZipLocalHeaderSize("PK\x01\x02 not a local header.............", header));
+}
+
+TEST_CASE("WorkbookUses1904", "[excel][1904]") {
+	REQUIRE(WorkbookUses1904(R"(<workbook xmlns="x"><workbookPr date1904="1" defaultThemeVersion="1"/></workbook>)"));
+	REQUIRE(WorkbookUses1904(R"(<workbookPr date1904="true"/>)"));
+	REQUIRE(WorkbookUses1904(R"(<x:workbookPr x:date1904='1'/>)"));
+	REQUIRE_FALSE(WorkbookUses1904(R"(<workbookPr date1904="0"/>)"));
+	REQUIRE_FALSE(WorkbookUses1904(R"(<workbookPr date1904="false"/>)"));
+	REQUIRE_FALSE(WorkbookUses1904(R"(<workbookPr defaultThemeVersion="164011"/>)"));
+	REQUIRE_FALSE(WorkbookUses1904(""));
+}
+
+TEST_CASE("GzipFrame wraps raw deflate as a gzip member", "[excel][1904]") {
+	const auto gz = GzipFrame("DATA", 0x01020304, 77);
+	REQUIRE(gz.size() == 10 + 4 + 8);
+	REQUIRE(static_cast<unsigned char>(gz[0]) == 0x1f);
+	REQUIRE(static_cast<unsigned char>(gz[1]) == 0x8b);
+	REQUIRE(gz[2] == 8); // deflate
+	REQUIRE(gz.substr(10, 4) == "DATA");
+	REQUIRE(gz.substr(14) == std::string("\x04\x03\x02\x01\x4d\x00\x00\x00", 8));
+}
+
+TEST_CASE("1904 serials are 1462 days after 1900 ones", "[excel][1904]") {
+	int64_t days, micros;
+	// 1904 serial 0 is 1904-01-01; the 1900 serial of that day is 1462.
+	ExcelSerialToEpoch(0 + kExcel1904Offset, days, micros);
+	REQUIRE(days == -24107); // 1904-01-01
+	REQUIRE(ExcelSerialFromEpoch(-24107, 0) - kExcel1904Offset == 0);
+}

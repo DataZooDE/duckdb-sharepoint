@@ -389,7 +389,6 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
 - **Excel.**
   - Workbooks are read whole when the query is planned, which suits Excel's
     sizes; a sheet of millions of cells belongs in Parquet.
-  - Workbooks in the 1904 date system (old Mac files) read four years early.
 - **Lists.**
   - Only predicates on indexed columns are sent to SharePoint, and none for
     a list with a multi-select choice column.
