@@ -311,11 +311,13 @@ jobs:
           SHAREPOINT_DELEGATED_CLIENT_ID: ${{ secrets.SHAREPOINT_DELEGATED_CLIENT_ID }}
           SHAREPOINT_USER_REFRESH_TOKEN: ${{ secrets.SHAREPOINT_USER_REFRESH_TOKEN }}
           SHAREPOINT_REQUIRE_DELEGATED: '1'
-          # Certificate auth (#71): skips until these secrets exist; then set
-          # SHAREPOINT_REQUIRE_CERTIFICATE to '1' here.
+          # Certificate auth (#71): the CI app ("duckdb-sharepoint ci") also
+          # has a certificate (CN=duckdb-sharepoint-ci, until 2027-11-03);
+          # its PEM (cert + key) is the secret. REQUIRE: missing fails the job.
           SHAREPOINT_CERT_CLIENT_ID: ${{ secrets.SHAREPOINT_CERT_CLIENT_ID }}
           SHAREPOINT_CERTIFICATE_PEM: ${{ secrets.SHAREPOINT_CERTIFICATE_PEM }}
           SHAREPOINT_CERTIFICATE_PASSWORD: ${{ secrets.SHAREPOINT_CERTIFICATE_PASSWORD }}
+          SHAREPOINT_REQUIRE_CERTIFICATE: '1'
           # Least privilege (#70): a second app ("duckdb-sharepoint selected")
           # with only Sites.Selected, granted write on the test site and
           # nothing else; SHAREPOINT_UNGRANTED_SITE is a site it must be refused
