@@ -66,8 +66,8 @@ def test_ungranted_site_is_refused_with_a_hint(sql, secret_sql, selected_sql):
     out = sql(f"{secret_sql} SELECT * FROM read_sharepoint_list('no_such_list_e2e', site := '{site}');",
               expect_error=True)
     assert "list 'no_such_list_e2e'" in out, out
-    # Graph hides a site the app was not granted: 404 itemNotFound, not 403
-    # (docs/hld.md §7a). Either way the error must say how to grant it.
+    # 403 accessDenied, or 404 if Graph hides the site (docs/hld.md §7a).
+    # Either way the error must say how to grant it.
     out = sql(f"{selected_sql} SELECT * FROM read_sharepoint_list('Documents', site := '{site}');",
               expect_error=True)
-    assert "not found" in out and "Sites.Selected" in out, out
+    assert ("HTTP 403" in out or "not found" in out) and "Sites.Selected" in out, out
