@@ -98,6 +98,7 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_assertion.cpp
     src/sharepoint_certificate.cpp
     src/sharepoint_search.cpp
+    src/sharepoint_permissions.cpp
     src/sharepoint_weburl.cpp
 )
 
@@ -118,6 +119,7 @@ file(GLOB DUCKDB_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_excel_functions.cpp
     src/sharepoint_list_functions.cpp
     src/sharepoint_tasks.cpp
+    src/sharepoint_permissions_functions.cpp
     src/sharepoint_discovery.cpp
     src/sharepoint_onenote.cpp
     src/sharepoint_catalog.cpp

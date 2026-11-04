@@ -25,7 +25,7 @@ COPY results TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERW
 |---|---|---|
 | **Files** in document libraries and OneDrive | `read_parquet`, `read_csv`, `read_json`, `glob`, `ATTACH`, DuckLake: anything on a `sharepoint://` path | `COPY … TO 'sharepoint://…'`, streamed |
 | **Excel workbooks**, through the workbook API | `read_excel_table`, `read_excel_range` | `COPY … (FORMAT excel_table \| excel_range)`, in place |
-| **SharePoint lists** | `read_sharepoint_list` | `COPY … (FORMAT sharepoint_list)`: create, or update by `id` |
+| **SharePoint lists** | `read_sharepoint_list` | `COPY … (FORMAT sharepoint_list)`: create, update by `id`, or upsert by `KEY` |
 
 One install, one secret, and app-only or user sign-in. Built for DuckDB
 **v1.5.6** and **2.0**, by [DataZoo](https://data-zoo.de), and the sibling of
@@ -200,7 +200,35 @@ SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := (SELECT token
 ```
 
 Without a token it lists everything under the folder once. An expired token
-says so; start over without one.
+says so; start over without one. Each row also says who made the change
+(`modified_by`, `modified_by_email`: a user, or an app by name).
+
+**Keeping a mirror.** A table of a folder's files, kept current from the
+change feed, with the token stored beside it. Here in DuckLake, so earlier
+states stay queryable:
+
+```sql
+-- Once:
+ATTACH 'ducklake:mirror.ducklake' AS lake (DATA_PATH 'mirror/');
+-- The token first, then the listing: a change in between shows up twice, not never.
+CREATE TABLE lake.sync AS
+    SELECT token FROM sharepoint_changes('sharepoint://Finance/', token := 'latest') WHERE _change = 'checkpoint';
+CREATE TABLE lake.files AS
+    SELECT id, path, name, size, modified, modified_by FROM read_sharepoint_files('sharepoint://Finance/**');
+
+-- Each run (e.g. from cron):
+SET VARIABLE t = (SELECT token FROM lake.sync);           -- table functions take no subqueries
+CREATE TEMP TABLE c AS SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := getvariable('t'));
+DELETE FROM lake.files WHERE id IN (SELECT id FROM c WHERE _change <> 'checkpoint');
+INSERT INTO lake.files
+    SELECT id, path, name, size, modified, modified_by FROM c WHERE _change = 'upsert' AND NOT is_folder;
+UPDATE lake.sync SET token = (SELECT token FROM c WHERE _change = 'checkpoint');
+```
+
+Running it again is harmless: each run applies what changed since the last.
+For a list, `sharepoint_list_changes` works the same way; or pull what
+changed since a time with `WHERE modified > TIMESTAMP '…'`, which goes to
+SharePoint as a filter when the list's *Modified* column is indexed.
 
 
 **Earlier versions.** SharePoint keeps a file's version history, and
@@ -212,6 +240,23 @@ SELECT version, current, modified, modified_by, size, path
 FROM sharepoint_versions('sharepoint://Finance/actuals.parquet');
 SELECT * FROM read_parquet('sharepoint://Finance/actuals.parquet?version=3.0');
 ```
+
+**Who can see it.** `sharepoint_permissions` lists, for a file or folder or
+the files a glob matches, one row per grantee: the `roles`, how it was
+granted (`direct`, `inherited`, or a sharing `link`), the user, group or app,
+and for a link its type and scope (`anonymous`, `organization`, `users`). For
+audits such as "what is shared with anyone":
+
+```sql
+SELECT path, link_scope, link_url, expires
+FROM sharepoint_permissions('sharepoint://Finance/**')
+WHERE granted_by = 'link' AND link_scope = 'anonymous';
+```
+
+As Graph reports them: the site's own groups appear as `direct` grants on
+each item that inherits them (Graph's listing has no `inheritedFrom` for
+them), and a link's `link_url` can be NULL (Graph's listing may leave out
+the address).
 
 `write_blob`, `remove_file`, `move_file` and `file_size` don't depend on the
 scheme, so they work for any filesystem DuckDB can reach (`s3://`, `gs://`,
@@ -331,6 +376,20 @@ COPY (SELECT id, Amount * 1.1 AS Amount FROM read_sharepoint_list('Orders') WHER
 TO 'Orders' (FORMAT sharepoint_list);
 ```
 
+**Upsert by a key.** With `KEY '<column>'`, a row updates the item whose key
+column has its value and creates an item only when none has, so a sync needs
+no `id`:
+
+```sql
+COPY (SELECT order_no AS OrderNo, status AS Status, total AS Amount FROM erp_orders)
+TO 'Orders' (FORMAT sharepoint_list, KEY 'OrderNo');
+```
+
+The list's keys are read once per `COPY`. Text keys match exactly and numbers
+by value (`17` = `17.0`). A row without a key, a key two items share, and a
+key that occurs twice in the rows written are errors; rows sent before the
+error stay written. A row that also has an `id` is updated by its `id`.
+
 **Only what changed.** `sharepoint_list_changes` gives the items created,
 changed or deleted since a token, with the list's columns plus `_change`
 (`'upsert'`, `'delete'` with only `id` set, or `'checkpoint'`) and, on the one
@@ -355,7 +414,7 @@ FROM read_sharepoint_files('sharepoint://Finance/**/*.xlsx');
 
 One row per file the path or glob matches (the same glob syntax as
 `sharepoint://`): `path`, `name`, `size`, `created`, `modified`, `created_by`,
-`modified_by` (and their `_email`), `content_type`, `id` and `web_url`, then
+`modified_by` (and their `_email`), `content_type`, `id`, `web_url` and `checked_out_by` (and its `_email`; NULL unless checked out), then
 the library's own metadata columns, typed as `read_sharepoint_list` types a
 list's.
 
@@ -414,6 +473,7 @@ SELECT * FROM sales.Orders WHERE Status = 'open';                 -- read_sharep
 INSERT INTO sales.Orders (Title, Amount) VALUES ('A-18', 99);
 UPDATE sales.Orders SET Status = 'closed' WHERE id = 17;
 DELETE FROM sales.Orders WHERE Status = 'cancelled';
+CREATE TABLE sales.Forecast AS SELECT month AS Title, units AS Units FROM fc;   -- a new list
 ```
 
 The site's visible lists are the tables of schema `main`, typed from their
@@ -421,8 +481,13 @@ column definitions (a multi-select choice column is `VARCHAR[]`). Reads go
 through `read_sharepoint_list`, filter pushdown included. `INSERT` creates
 items (columns left out keep SharePoint's defaults); `UPDATE` and `DELETE`
 address items by `id`. Lists are read once per `ATTACH`: after changing a
-list's columns in SharePoint, `DETACH` and `ATTACH` again. Creating or
-altering lists, and `RETURNING`, are not supported.
+list's columns in SharePoint, `DETACH` and `ATTACH` again.
+
+`CREATE TABLE` (with or without `AS`) creates a list, one column per column:
+text, number, yes/no, date (from `DATE`) or date-time (from `TIMESTAMP`); a
+column named `Title` is the list's own. Other types are refused. It needs the
+`Sites.Manage.All` permission. `IF NOT EXISTS` keeps a list that is there.
+Dropping or altering lists, and `RETURNING`, are not supported.
 
 ## Installation
 

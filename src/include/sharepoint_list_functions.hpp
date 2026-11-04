@@ -47,6 +47,16 @@ unique_ptr<FunctionData> BindListForCatalog(ClientContext &context, const string
                                             TableCatalogEntry &table, vector<string> &names,
                                             vector<LogicalType> &types);
 
+//! One list as ListCatalogLists shows it, by id (for a list just created).
+CatalogList CatalogListOf(ClientContext &context, const string &site_id, const string &list_id);
+
+//! CREATE TABLE on an ATTACHed site (#97): a new generic list named `name`,
+//! one column per name (text, number, boolean, date-only or date-time from
+//! the DuckDB type; "Title" is the list's own). Its id. Needs
+//! Sites.Manage.All.
+string CreateListForCatalog(ClientContext &context, const string &site_id, const string &name,
+                            const vector<string> &column_names, const vector<LogicalType> &column_types);
+
 //! Writes items of one list in $batch calls of 20: an ATTACHed table's
 //! INSERT, UPDATE and DELETE. Columns are matched by name as COPY ... (FORMAT
 //! sharepoint_list) matches them (read-only ones skipped).

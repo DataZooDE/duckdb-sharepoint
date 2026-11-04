@@ -73,7 +73,8 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context, TableFunctionBindIn
 		const string what = "the changes under '" + path + "'";
 
 		string next = "/v1.0/drives/" + auth.drive_id +
-		              "/root/delta?$select=id,name,size,file,folder,deleted,root,parentReference,lastModifiedDateTime" +
+		              "/root/delta?$select=id,name,size,file,folder,deleted,root,parentReference,lastModifiedDateTime,"
+		              "lastModifiedBy" +
 		              (token.empty() ? string() : "&token=" + token);
 		string next_token;
 		auto data = make_uniq<ChangesBindData>();
@@ -124,6 +125,25 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context, TableFunctionBindIn
 					}
 					int64_t micros;
 					auto size = item.find("size");
+					// Who (#99): the user -- or, for an app's write, the application.
+					Value by(LogicalType::VARCHAR), by_email(LogicalType::VARCHAR);
+					auto modified_by = item.find("lastModifiedBy");
+					if (!deleted && modified_by != item.end() && modified_by->second.is<picojson::object>()) {
+						const auto &who_of = modified_by->second.get<picojson::object>();
+						const picojson::object *who = nullptr;
+						for (const char *kind : {"user", "application"}) {
+							auto it = who_of.find(kind);
+							if (!who && it != who_of.end() && it->second.is<picojson::object>()) {
+								who = &it->second.get<picojson::object>();
+							}
+						}
+						if (who && !Str(*who, "displayName").empty()) {
+							by = Value(Str(*who, "displayName"));
+						}
+						if (who && !Str(*who, "email").empty()) {
+							by_email = Value(Str(*who, "email"));
+						}
+					}
 					vector<Value> row = {
 					    Value(deleted ? "delete" : "upsert"),
 					    rel.empty() ? Value(LogicalType::VARCHAR) : Value(string(SHAREPOINT_SCHEME) + rel),
@@ -135,6 +155,8 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context, TableFunctionBindIn
 					        : Value(LogicalType::BIGINT),
 					    ParseIsoTimestamp(Str(item, "lastModifiedDateTime"), micros) ? Value::TIMESTAMP(timestamp_t(micros))
 					                                                                 : Value(LogicalType::TIMESTAMP),
+					    by,
+					    by_email,
 					    Value(LogicalType::VARCHAR)};
 					const auto id = Str(item, "id");
 					auto seen = row_of.find(id);
@@ -162,10 +184,13 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context, TableFunctionBindIn
 		}
 		data->rows.push_back({Value("checkpoint"), Value(LogicalType::VARCHAR), Value(LogicalType::VARCHAR),
 		                      Value(LogicalType::VARCHAR), Value(LogicalType::BOOLEAN), Value(LogicalType::BIGINT),
-		                      Value(LogicalType::TIMESTAMP), Value(next_token)});
-		names = {"_change", "path", "id", "name", "is_folder", "size", "modified", "token"};
-		return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::VARCHAR,
-		                LogicalType::BOOLEAN, LogicalType::BIGINT,  LogicalType::TIMESTAMP, LogicalType::VARCHAR};
+		                      Value(LogicalType::TIMESTAMP), Value(LogicalType::VARCHAR), Value(LogicalType::VARCHAR),
+		                      Value(next_token)});
+		names = {"_change", "path",     "id",          "name",
+		         "is_folder", "size", "modified", "modified_by", "modified_by_email", "token"};
+		return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                LogicalType::BOOLEAN, LogicalType::BIGINT,    LogicalType::TIMESTAMP, LogicalType::VARCHAR,
+		                LogicalType::VARCHAR, LogicalType::VARCHAR};
 		result = std::move(data);
 	});
 	return result;

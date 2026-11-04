@@ -437,5 +437,39 @@ bool ParseIsoTimestamp(const std::string &s, int64_t &micros) {
 	return true;
 }
 
+std::string ListKeyOfNumber(double value) {
+	char buf[64];
+	if (std::isfinite(value) && value == std::floor(value) && std::fabs(value) < 1e15) {
+		std::snprintf(buf, sizeof(buf), "%.0f", value);
+	} else {
+		std::snprintf(buf, sizeof(buf), "%.17g", value);
+	}
+	return buf;
+}
+
+void ListKeyIndex::AddItem(const std::string &key, const std::string &item_id) {
+	if (key.empty()) {
+		return;
+	}
+	if (!items_.emplace(key, item_id).second) {
+		ambiguous_.insert(key);
+	}
+}
+
+ListKeyIndex::Match ListKeyIndex::Lookup(const std::string &key, std::string &item_id) {
+	if (!seen_.insert(key).second) {
+		return Match::REPEATED;
+	}
+	if (ambiguous_.count(key)) {
+		return Match::AMBIGUOUS;
+	}
+	auto it = items_.find(key);
+	if (it == items_.end()) {
+		return Match::CREATE;
+	}
+	item_id = it->second;
+	return Match::UPDATE;
+}
+
 } // namespace sharepoint
 } // namespace duckdb

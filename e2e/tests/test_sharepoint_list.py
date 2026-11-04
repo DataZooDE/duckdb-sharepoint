@@ -204,6 +204,58 @@ def test_copy_creates_and_updates_items(graph, fixture_lists, sql, secret_sql):
         graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}")
 
 
+def test_copy_upserts_by_key(graph, fixture_lists, sql, secret_sql):
+    """COPY ... (FORMAT sharepoint_list, KEY 'OrderNo') (#97): a row whose key
+    an item has updates that item, any other creates one; a key two items
+    share, or one written twice, is refused."""
+    site, _, _ = fixture_lists
+    import uuid
+    name = f"_duckdb_sharepoint_e2e_upsert_{uuid.uuid4().hex[:8]}"
+    created = _ok(graph._req("POST", f"{GRAPH}/sites/{site}/lists", json={
+        "displayName": name, "list": {"template": "genericList"},
+        "columns": [{"name": "OrderNo", "text": {}, "indexed": True}, {"name": "Seq", "number": {}},
+                    {"name": "Amount", "number": {}}]}), "create upsert list")["id"]
+    try:
+        # 30 orders, then an upsert of 10 known (21..30, new amounts) and 10 new
+        # (31..40): 40 items, the known ones changed in place.
+        out = sql(f"""{secret_sql}
+            COPY (SELECT 'A-' || i AS OrderNo, i AS Seq, i AS Amount, 'o' || i AS Title FROM range(1, 31) t(i))
+            TO '{name}' (FORMAT sharepoint_list);
+            SELECT list(id ORDER BY Seq) FILTER (WHERE Seq > 20) FROM read_sharepoint_list('{name}');
+            COPY (SELECT 'A-' || i AS OrderNo, i AS Seq, i * 100 AS Amount FROM range(21, 41) t(i))
+            TO '{name}' (FORMAT sharepoint_list, KEY 'OrderNo');
+            SELECT count(*), count(DISTINCT OrderNo), sum(Amount) FROM read_sharepoint_list('{name}');
+            SELECT list(id ORDER BY Seq) FILTER (WHERE Seq BETWEEN 21 AND 30) FROM read_sharepoint_list('{name}');
+            SELECT count(*) FROM read_sharepoint_list('{name}') WHERE Seq <= 30 AND Title IS NULL;
+        """).splitlines()
+        before, counts, after, titles_lost = out[-4], out[-3], out[-2], out[-1]
+        assert counts == f"40|40|{float(sum(range(1, 21)) + sum(i * 100 for i in range(21, 41)))}"
+        assert after == before   # the same items, updated -- not new ones
+        assert titles_lost == "0"  # columns not written are left as they were
+
+        # A numeric key matches however the number is spelled.
+        out = sql(f"""{secret_sql}
+            COPY (SELECT 25.0 AS Seq, 1 AS Amount) TO '{name}' (FORMAT sharepoint_list, KEY 'Seq');
+            SELECT count(*), max(Amount) FILTER (WHERE Seq = 25) FROM read_sharepoint_list('{name}');
+        """).splitlines()
+        assert out[-1] == "40|1.0"
+
+        out = sql(f"""{secret_sql}
+            COPY (SELECT 'B-1' AS OrderNo UNION ALL SELECT 'B-1') TO '{name}' (FORMAT sharepoint_list, KEY 'OrderNo');
+        """, expect_error=True)
+        assert "occurs more than once" in out, out
+        out = sql(f"""{secret_sql}
+            COPY (SELECT 'A-1' AS OrderNo, 2 AS Seq) TO '{name}' (FORMAT sharepoint_list);
+            COPY (SELECT 'A-1' AS OrderNo, 3 AS Amount) TO '{name}' (FORMAT sharepoint_list, KEY 'OrderNo');
+        """, expect_error=True)
+        assert "several items have OrderNo 'A-1'" in out, out
+        out = sql(f"{secret_sql} COPY (SELECT 1 AS Seq) TO '{name}' (FORMAT sharepoint_list, KEY 'OrderNo');",
+                  expect_error=True)
+        assert "KEY 'OrderNo' is not one of the columns written" in out, out
+    finally:
+        graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}")
+
+
 def test_people_by_name_email_and_id(graph, fixture_lists, sql, secret_sql):
     """Person columns (#63): one person and several, each as name, email and
     id, looked up in the site's User Information List; Created By / Modified

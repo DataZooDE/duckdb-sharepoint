@@ -1,6 +1,6 @@
 """ATTACH a SharePoint site (#60) against the REAL tenant: its lists are
-tables -- listed, described and read (with filter pushdown), and written with
-INSERT, UPDATE and DELETE."""
+tables -- listed, described and read (with filter pushdown), written with
+INSERT, UPDATE and DELETE, and created with CREATE TABLE (AS) (#97)."""
 
 from __future__ import annotations
 
@@ -49,8 +49,55 @@ def test_insert_update_delete(graph, fixture_lists, sql, secret_sql):
         """, expect_error=True)
         assert "RETURNING" in out, out
         out = sql(f"""{secret_sql} {ATTACH}
-            CREATE TABLE site.nope (a INT);
+            DROP TABLE site."{name}";
         """, expect_error=True)
         assert "not supported on an attached SharePoint site" in out
     finally:
         graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}")
+
+
+def _drop_list(graph, site, name):
+    lists = _ok(graph._req("GET", f"{GRAPH}/sites/{site}/lists?$select=id,displayName&$top=999"), "lists")["value"]
+    for entry in lists:
+        if entry.get("displayName") == name:
+            graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{entry['id']}")
+
+
+def test_create_table_as_makes_a_list(graph, fixture_lists, sql, secret_sql):
+    """CREATE TABLE site.x AS SELECT ...: a new list, its columns typed from
+    the query (Title is the list's own), the rows its items; CREATE TABLE
+    (no AS) an empty one; IF NOT EXISTS keeps an existing list."""
+    site, _, _ = fixture_lists
+    name = f"_duckdb_sharepoint_e2e_ctas_{uuid.uuid4().hex[:8]}"
+    empty = f"_duckdb_sharepoint_e2e_ctas_empty_{uuid.uuid4().hex[:8]}"
+    try:
+        out = sql(f"""{secret_sql} {ATTACH}
+            CREATE TABLE site."{name}" AS
+            SELECT 'p' || i AS Title, i * 1.5 AS "Unit Price", i AS Qty, i % 2 = 0 AS Even,
+                   DATE '2026-01-01' + i::INTEGER AS Due, TIMESTAMP '2026-01-01 12:00:00' + INTERVAL (i) HOUR AS Stamp
+            FROM range(25) t(i);
+            SELECT count(*), sum(Qty), sum("Unit Price"), count(*) FILTER (WHERE Even), min(Due), max(Stamp)
+            FROM read_sharepoint_list('{name}');
+            SELECT string_agg(column_name || ' ' || column_type, ', ' ORDER BY column_name)
+            FROM (DESCRIBE SELECT Title, "Unit Price", Qty, Even, Due, Stamp FROM read_sharepoint_list('{name}'));
+        """).splitlines()
+        assert out[-2] == f"25|{float(sum(range(25)))}|{sum(i * 1.5 for i in range(25))}|13|2026-01-01|2026-01-02 12:00:00"
+        assert out[-1] == "Due DATE, Even BOOLEAN, Qty DOUBLE, Stamp TIMESTAMP, Title VARCHAR, Unit Price DOUBLE"
+
+        # The new table is usable at once in the same session, and a fresh
+        # ATTACH lists it like any other list.
+        out = sql(f"""{secret_sql} {ATTACH}
+            CREATE TABLE site."{empty}" (Title VARCHAR, Amount DOUBLE);
+            INSERT INTO site."{empty}" (Title, Amount) VALUES ('a', 1), ('b', 2);
+            CREATE TABLE IF NOT EXISTS site."{empty}" (Other INT);
+            SELECT count(*), sum(Amount) FROM site."{empty}";
+        """).splitlines()
+        assert out[-1] == "2|3.0", out
+
+        out = sql(f"{secret_sql} {ATTACH} CREATE TABLE site.\"{empty}\" (x INT);", expect_error=True)
+        assert "already has a list" in out, out
+        out = sql(f"{secret_sql} {ATTACH} CREATE TABLE site.bad AS SELECT [1, 2] AS xs;", expect_error=True)
+        assert "a list column is text, a number, a boolean, a date or a timestamp" in out, out
+    finally:
+        _drop_list(graph, site, name)
+        _drop_list(graph, site, empty)

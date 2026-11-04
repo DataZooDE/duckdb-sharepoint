@@ -20,6 +20,8 @@
 
 #include <picojson.h>
 
+#include <cstdint>
+
 #include "duckdb_compat.hpp"
 
 namespace duckdb {

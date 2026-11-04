@@ -55,3 +55,22 @@ def test_files_with_metadata_and_custom_columns(graph, library_columns, scratch,
         SELECT count(*) FROM read_sharepoint_files('sharepoint://{scratch}/*.parquet');
     """).splitlines()
     assert out[-2:] == ["2", "0"]
+
+
+def test_checked_out_by(graph, scratch, sql, secret_sql):
+    """A checked-out file says by whom (#98); a file nobody checked out, NULL."""
+    from helpers.graph import GRAPH
+
+    graph.upload(f"{scratch}/locked.csv", b"n\n1\n")
+    graph.upload(f"{scratch}/free.csv", b"n\n2\n")
+    item = graph.stat(f"{scratch}/locked.csv")["id"]
+    r = graph._req("POST", f"{GRAPH}/drives/{graph.drive_id}/items/{item}/checkout")
+    assert r.status_code in (200, 204), (r.status_code, r.text)
+    try:
+        out = sql(f"""{secret_sql}
+            SELECT string_agg(name || '=' || (checked_out_by IS NOT NULL), ',' ORDER BY name)
+            FROM read_sharepoint_files('sharepoint://{scratch}/*.csv');
+        """).splitlines()
+        assert out[-1] == "free.csv=false,locked.csv=true", out
+    finally:
+        graph._req("POST", f"{GRAPH}/drives/{graph.drive_id}/items/{item}/discardCheckout")

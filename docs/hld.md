@@ -576,6 +576,12 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   `GET root:/.../tmp_report.xlsx` answered 404 -- a glob moments later listed
   the file. The filesystem now remembers the id the write returned and moves
   such a file by id.
+- **An item's permissions, as listed** (2026-11-04, #98): for a file in a
+  fresh folder, `GET /items/{id}/permissions` (app-only) gave the site's
+  groups (owner / member / visitor, as `group` and `siteGroup`) with **no
+  `inheritedFrom`**, although the file inherits them, and the organization
+  link just created **without `link.webUrl`**. So `granted_by` is `direct`
+  for them and `link_url` NULL -- what Graph says, not what the docs suggest.
 - **An ungranted site under Sites.Selected: 403 or 404?** Not settled yet
   (#70). The first required run got 404 `itemNotFound` for
   `SHAREPOINT_UNGRANTED_SITE`, but the full-permission app got the same 404:
@@ -807,6 +813,17 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - **In place.** The target is a list, not a file, but COPY's temp-file rename
   would still be attempted for a name that exists as a local file; the same
   rewrite as the Excel writers (`sharepoint_copy_rewrite.hpp`) rules it out.
+- **Upsert by KEY (#97).** `KEY '<column>'` (a written column, checked at
+  bind) reads every item's id and key once, at the start of the COPY
+  (`items?$expand=fields($select=id,<key>)`, paged), into a `ListKeyIndex`
+  (pure, Catch2-tested). Each row without an `id` is then a PATCH of the item
+  with its key or a POST. Text keys compare exactly, numbers canonically
+  (`ListKeyOfNumber`: 17 = 17.0). Refused, because which item or row should
+  win is not ours to guess: a NULL key, a key two items share, a key repeated
+  in the rows written. A refusal mid-COPY leaves the batches already sent
+  written (a COPY to a list is not transactional). One read of the whole key
+  column per COPY rather than a `$filter` per batch: a list sync writes many
+  rows, and a filter needs the key indexed.
 
 ## 11. File versions: `sharepoint_versions` and `?version=` (#66)
 
@@ -941,6 +958,16 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - 1.5 / 2.0: the catalog API is the same but for names (`string` vs
   `Identifier`: `FunctionName`, `SetQualifiedName` via SFINAE), a few pure
   virtuals (no `override`), and `Expression::GetReturnType()`.
+- CREATE TABLE (#97): `SharepointSchema::CreateList` POSTs a generic list
+  (`CreateListForCatalog`: VARCHAR text, numbers number, BOOLEAN boolean,
+  DATE dateOnly, TIMESTAMP dateTime; `Title` is the list's own; the internal
+  name keeps letters, digits and `_`, the display name is the column name),
+  then builds the catalog entry from the new list's own column plan
+  (`CatalogListOf`), so the scan's column check sees what a fresh ATTACH
+  would. CREATE TABLE AS is `PlanCreateTableAs` -> the INSERT operator with a
+  `CreateTarget`: the list is created when the operator's sink state is made,
+  as DuckDB's postgres scanner does it, then the rows stream through the
+  item writer. `OR REPLACE` is refused (it would mean deleting a list).
 - Transactions: none -- each statement goes straight to Graph.
 
 ## 18. Planner and To Do (#68)
