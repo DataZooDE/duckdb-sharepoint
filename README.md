@@ -240,6 +240,17 @@ COPY (SELECT id, Amount * 1.1 AS Amount FROM read_sharepoint_list('Orders') WHER
 TO 'Orders' (FORMAT sharepoint_list);
 ```
 
+**Only what changed.** `sharepoint_list_changes` gives the items created,
+changed or deleted since a token, with the list's columns plus `_change`
+(`'upsert'`, `'delete'` with only `id` set, or `'checkpoint'`) and, on the one
+checkpoint row, the `token` for next time -- as `sharepoint_changes` does for
+files:
+
+```sql
+SELECT * FROM sharepoint_list_changes('Orders', token := 'latest');            -- just a token
+SELECT * FROM sharepoint_list_changes('Orders', token := (SELECT token FROM sync));
+```
+
 `created`, `modified` and a lookup's display value are skipped (a lookup is
 set through `<name>_id`), so a list read with `read_sharepoint_list` can be
 changed and written back as it is.
@@ -310,6 +321,7 @@ LOAD sharepoint;
 | provider | use | fields |
 |---|---|---|
 | `client_credentials` *(default)* | unattended jobs, as an app | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` |
+| `credential_chain` | jobs running in Azure, with **no secret at all** | *(optional `CLIENT_ID` of a user-assigned managed identity)* |
 | `client_certificate` | unattended jobs, as an app, with a certificate | `TENANT_ID`, `CLIENT_ID`, `CERTIFICATE_PATH` *(optional `CERTIFICATE_PASSWORD`)* |
 | `device_code` | **as yourself**, any shell | `TENANT_ID`, `CLIENT_ID` *(optional `REFRESH_TOKEN`)* |
 | `authorization_code` | **as yourself**, browser on this machine | `TENANT_ID`, `CLIENT_ID` *(optional `REFRESH_TOKEN`, `REDIRECT_PORT`, default 8020)* |
@@ -381,6 +393,25 @@ Creating or deleting lists themselves needs `manage` or `fullcontrol`; the
 extension never does either. Every call stays inside the drive and the sites
 you name, so nothing needs tenant-wide rights. A site the app was not granted
 is refused with HTTP 403 `accessDenied`.
+
+**In Azure, with no secret.** `credential_chain` uses the identity the job
+already has, trying in turn, as Azure's `DefaultAzureCredential` does:
+
+1. **Workload identity** (AKS, federated credentials): `AZURE_FEDERATED_TOKEN_FILE`,
+   `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`.
+2. **Managed identity**: App Service, Functions and Container Apps through
+   `IDENTITY_ENDPOINT`; a VM or scale set through IMDS (a one-second probe).
+3. **Azure CLI**: `az account get-access-token`, e.g. on a developer machine
+   after `az login`.
+
+```sql
+CREATE SECRET sp (TYPE sharepoint, PROVIDER credential_chain, DRIVE_ID 'b!...');
+CREATE SECRET sp (TYPE sharepoint, PROVIDER credential_chain, CLIENT_ID '<user-assigned identity>', DRIVE_ID 'b!...');
+```
+
+Grant the identity Graph's `Sites.ReadWrite.All` (or `Sites.Selected`, see
+*Least privilege*) as an application permission. When no source has an
+identity, the error names each one and why it failed.
 
 **As a user.** `device_code` and `authorization_code` act as the signed-in
 user: files are authored by them, and they see only what they may. Both are

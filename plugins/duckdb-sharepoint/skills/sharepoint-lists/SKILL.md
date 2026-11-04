@@ -47,6 +47,15 @@ set through `<name>_id`; read-only columns (created, modified, names, emails) ar
 read result can be written back as it is. Sent in `$batch` calls of 20. `SITE 'Sales'` as a
 COPY option for another site.
 
+## Only what changed
+```sql
+SELECT * FROM sharepoint_list_changes('Orders', token := 'latest');               -- just a token
+SELECT * FROM sharepoint_list_changes('Orders', token := (SELECT token FROM sync));
+```
+The list's columns plus `_change`: `'upsert'`, `'delete'` (only `id` set) or `'checkpoint'`;
+the one checkpoint row carries the `token` to store for next time (as `sharepoint_changes`
+does for files).
+
 ## Planner and To Do tasks
 ```sql
 SELECT bucket, title, status, due, assigned_to FROM read_planner_tasks('<plan id>');
