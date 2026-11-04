@@ -110,15 +110,26 @@ public:
 		bind_data = BindListForCatalog(context, list_id, site_id, names, types);
 		// The catalog's columns were read at ATTACH; a list changed since then
 		// would scan into the wrong columns.
-		bool same = names.size() == own_columns.LogicalColumnCount();
-		for (idx_t i = 0; same && i < names.size(); i++) {
-			auto &col = own_columns.GetColumn(LogicalIndex(i));
-			same = StringUtil::CIEquals(duckdb_compat::Str(col.Name()), names[i]) && col.Type() == types[i];
+		// The first difference goes in the message: "was X, now Y".
+		string difference;
+		const idx_t attached = own_columns.LogicalColumnCount();
+		for (idx_t i = 0; difference.empty() && i < MaxValue<idx_t>(attached, names.size()); i++) {
+			string was = "(none)", now = "(none)";
+			if (i < attached) {
+				auto &col = own_columns.GetColumn(LogicalIndex(i));
+				was = duckdb_compat::Str(col.Name()) + " " + col.Type().ToString();
+			}
+			if (i < names.size()) {
+				now = names[i] + " " + types[i].ToString();
+			}
+			if (!StringUtil::CIEquals(was, now)) {
+				difference = StringUtil::Format("column %llu was %s, now %s", i + 1, was, now);
+			}
 		}
-		if (!same) {
-			throw InvalidInputException("sharepoint: the columns of list '%s' changed since the site was attached; "
+		if (!difference.empty()) {
+			throw InvalidInputException("sharepoint: the columns of list '%s' changed since the site was attached (%s); "
 			                            "DETACH and ATTACH it again",
-			                            duckdb_compat::Str(name));
+			                            duckdb_compat::Str(name), difference);
 		}
 		return ListScanFunction();
 	}
