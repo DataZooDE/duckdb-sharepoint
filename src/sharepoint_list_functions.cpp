@@ -33,6 +33,7 @@
 #include <unordered_map>
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 #include "duckdb_compat.hpp"
 
 namespace duckdb {
@@ -343,6 +344,9 @@ vector<vector<Value>> RowsOf(const vector<picojson::object> &items, const vector
 
 struct ListBindData : public TableFunctionData {
 	vector<ListColumnType> types;
+	//! The ATTACHed table this scan reads, if any (#60): UPDATE and DELETE
+	//! need the scan to name its base table (get_bind_info).
+	optional_ptr<TableCatalogEntry> table;
 	//! Read at bind (a choice column may hold several values, which only the
 	//! data shows, and the type must be known at bind) ...
 	vector<vector<Value>> rows;
@@ -1879,8 +1883,33 @@ void ListItemWriter::Flush() {
 	FlushBatch(state->g);
 }
 
+static optional_ptr<TableCatalogEntry> ListBaseTable(optional_ptr<const FunctionData> bind_data) {
+	return bind_data ? bind_data->Cast<ListBindData>().table : nullptr;
+}
+
+//! An ATTACHed table's scan names its base table, which UPDATE and DELETE
+//! bind against (#60). 2.0 asks TableFunction::get_table_entry; 1.5 has no
+//! such member and reads BindInfo::table from get_bind_info instead. The
+//! overloads pick by whether the member exists, and the 1.5 body is
+//! dependent on FN, so neither version's missing names are compiled.
+template <class FN>
+auto SetListBaseTable(FN &fn, int) -> decltype(fn.get_table_entry, void()) {
+	fn.get_table_entry = ListBaseTable;
+}
+template <class FN>
+BindInfo ListBindInfo15(const optional_ptr<FunctionData> bind_data) {
+	using Info = typename std::conditional<sizeof(FN) != 0, BindInfo, void>::type;
+	auto table = ListBaseTable(bind_data.get());
+	return table ? Info(*table) : Info(ScanType::EXTERNAL);
+}
+template <class FN>
+void SetListBaseTable(FN &fn, long) {
+	fn.get_bind_info = ListBindInfo15<FN>;
+}
+
 TableFunction ListScanFunction() {
 	TableFunction fn("read_sharepoint_list", {LogicalType::VARCHAR}, ListScan, ListBind, CursorInit);
+	SetListBaseTable(fn, 0);
 	fn.pushdown_complex_filter = ListPushdownFilter;
 	fn.projection_pushdown = true;
 	fn.to_string = ListToString;
@@ -1888,8 +1917,10 @@ TableFunction ListScanFunction() {
 }
 
 unique_ptr<FunctionData> BindListForCatalog(ClientContext &context, const string &list_id, const string &site_id,
-                                            vector<string> &names, vector<LogicalType> &types) {
+                                            TableCatalogEntry &table, vector<string> &names,
+                                            vector<LogicalType> &types) {
 	auto data = BindListData(context, "id:" + list_id, site_id, true);
+	data->table = &table;
 	for (auto &col : data->plan) {
 		names.push_back(col.name);
 		types.push_back(ToLogicalType(col.type));

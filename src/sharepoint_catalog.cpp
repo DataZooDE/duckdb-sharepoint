@@ -109,7 +109,7 @@ public:
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
 		vector<string> names;
 		vector<LogicalType> types;
-		bind_data = BindListForCatalog(context, list_id, site_id, names, types);
+		bind_data = BindListForCatalog(context, list_id, site_id, *this, names, types);
 		// The catalog's columns were read at ATTACH; a list changed since then
 		// would scan into the wrong columns.
 		// The first difference goes in the message: "was X, now Y".

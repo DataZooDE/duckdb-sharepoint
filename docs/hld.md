@@ -921,6 +921,11 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   take it before the base runs -- here as a delegating constructor's
   argument. Copied in the member initializer, it was empty, and every
   attached list was refused as changed on the first live runs.
+- UPDATE and DELETE bind only when the scan names its base table; without it
+  the binder says "Can only update base table" (seen live). 1.5 reads it from
+  `get_bind_info` (`BindInfo(table)`), 2.0 from a separate
+  `TableFunction::get_table_entry`; `SetListBaseTable` picks by whether that
+  member exists. INSERT does not scan, so it worked without either.
 - Writes: `SharepointModify`, one sink operator for INSERT / UPDATE / DELETE
   over the `$batch` item writer (`ListItemWriter`). INSERT maps
   `column_index_map` so unnamed columns are left out (SharePoint defaults).

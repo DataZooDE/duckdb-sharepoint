@@ -33,9 +33,11 @@ vector<CatalogList> ListCatalogLists(ClientContext &context, const string &site,
 TableFunction ListScanFunction();
 
 //! Bind data for scanning list `list_id` of `site_id` with ListScanFunction,
-//! its columns typed as ListCatalogLists types them.
+//! its columns typed as ListCatalogLists types them. `table` is reported as
+//! the scan's base table, which UPDATE and DELETE bind against.
 unique_ptr<FunctionData> BindListForCatalog(ClientContext &context, const string &list_id, const string &site_id,
-                                            vector<string> &names, vector<LogicalType> &types);
+                                            TableCatalogEntry &table, vector<string> &names,
+                                            vector<LogicalType> &types);
 
 //! Writes items of one list in $batch calls of 20: an ATTACHed table's
 //! INSERT, UPDATE and DELETE. Columns are matched by name as COPY ... (FORMAT
