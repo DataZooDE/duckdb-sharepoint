@@ -7,7 +7,8 @@ description: >
   ATTACH of a .duckdb file, DuckLake DATA_PATH, write_blob / remove_file /
   move_file / file_size, earlier versions (?version=, sharepoint_versions),
   change feeds (sharepoint_changes with a delta token), a library's files with
-  metadata (read_sharepoint_files), and Microsoft Search (search_sharepoint).
+  metadata (read_sharepoint_files), Microsoft Search (search_sharepoint), and
+  who can see a file (sharepoint_permissions: grants, inherited, sharing links).
   Use when reading or writing files in SharePoint/OneDrive from SQL, syncing a
   folder, listing a library, finding a file, or reading an old version.
 version: 2026.11.03
@@ -55,6 +56,14 @@ Rows: `_change` = `upsert` | `delete` (by `id`; path may be NULL) | `checkpoint`
 last; its `token` is for next time). No token = full listing. Expired token → start over.
 Table functions take no subqueries: pass a stored token via `SET VARIABLE t = (...)` and
 `getvariable('t')`.
+
+## Who can see it (permissions)
+```sql
+SELECT path, granted_by, grantee_type, grantee, grantee_email, roles, link_scope, link_url, expires
+FROM sharepoint_permissions('sharepoint://Finance/**');      -- a file, a folder, or a glob of files
+```
+One row per grantee; `granted_by` = `direct` | `inherited` | `link`; `link_scope` =
+`anonymous` | `organization` | `users`. An org link nobody used yet has no grantee (NULL).
 
 ## Search
 ```sql
