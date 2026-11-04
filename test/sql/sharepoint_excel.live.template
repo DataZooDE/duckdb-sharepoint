@@ -159,13 +159,15 @@ COPY (SELECT * FROM (VALUES
       t(name, n, x, d, ts, tm, flag, raw))
 TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_range, RANGE 'Out!B2');
 
-# One stat; session, sheet lookup, sheet add, one PATCH, close, and one
-# check that the new sheet is visible outside the session.
+# One stat; session, sheet lookup, sheet add, one PATCH, close, and the
+# check that the new sheet is visible outside the session -- once, or up to
+# six times while Graph catches up (kMaxCreatedVisibleAttempts; a 7 was seen
+# live on 2026-11-04).
 query II
 SELECT (SELECT value FROM sharepoint_stats() WHERE metric = 'stat'),
-       (SELECT value FROM sharepoint_stats() WHERE metric = 'workbook');
+       (SELECT value FROM sharepoint_stats() WHERE metric = 'workbook') BETWEEN 6 AND 11;
 ----
-1	6
+1	true
 
 query II
 SELECT column_name, column_type
