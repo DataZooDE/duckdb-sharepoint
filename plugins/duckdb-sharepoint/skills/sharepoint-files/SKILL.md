@@ -65,7 +65,12 @@ SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := 'latest');  -
 SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := '<token>');
 ```
 Rows: `_change` = `upsert` | `delete` (by `id`; path may be NULL) | `checkpoint` (exactly one,
-last; its `token` is for next time). No token = full listing. Expired token → start over.
+last; its `token` is for next time), with `modified_by` / `modified_by_email` (who; NULL for
+deletes). No token = full listing. Expired token → start over.
+Mirror pattern (README "Keeping a mirror"): store the token FIRST, then the listing
+(`read_sharepoint_files`); each run: changes since the token → delete their ids, insert the
+upserts, store the new token. Lists: `sharepoint_list_changes`, or `WHERE modified > ts`
+(pushed down when Modified is indexed).
 Table functions take no subqueries: pass a stored token via `SET VARIABLE t = (...)` and
 `getvariable('t')`.
 

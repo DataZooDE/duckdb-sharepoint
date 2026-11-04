@@ -200,7 +200,35 @@ SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := (SELECT token
 ```
 
 Without a token it lists everything under the folder once. An expired token
-says so; start over without one.
+says so; start over without one. Each row also says who made the change
+(`modified_by`, `modified_by_email`: a user, or an app by name).
+
+**Keeping a mirror.** A table of a folder's files, kept current from the
+change feed, with the token stored beside it. Here in DuckLake, so earlier
+states stay queryable:
+
+```sql
+-- Once:
+ATTACH 'ducklake:mirror.ducklake' AS lake (DATA_PATH 'mirror/');
+-- The token first, then the listing: a change in between shows up twice, not never.
+CREATE TABLE lake.sync AS
+    SELECT token FROM sharepoint_changes('sharepoint://Finance/', token := 'latest') WHERE _change = 'checkpoint';
+CREATE TABLE lake.files AS
+    SELECT id, path, name, size, modified, modified_by FROM read_sharepoint_files('sharepoint://Finance/**');
+
+-- Each run (e.g. from cron):
+SET VARIABLE t = (SELECT token FROM lake.sync);           -- table functions take no subqueries
+CREATE TEMP TABLE c AS SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := getvariable('t'));
+DELETE FROM lake.files WHERE id IN (SELECT id FROM c WHERE _change <> 'checkpoint');
+INSERT INTO lake.files
+    SELECT id, path, name, size, modified, modified_by FROM c WHERE _change = 'upsert' AND NOT is_folder;
+UPDATE lake.sync SET token = (SELECT token FROM c WHERE _change = 'checkpoint');
+```
+
+Running it again is harmless: each run applies what changed since the last.
+For a list, `sharepoint_list_changes` works the same way; or pull what
+changed since a time with `WHERE modified > TIMESTAMP '…'`, which goes to
+SharePoint as a filter when the list's *Modified* column is indexed.
 
 
 **Earlier versions.** SharePoint keeps a file's version history, and
