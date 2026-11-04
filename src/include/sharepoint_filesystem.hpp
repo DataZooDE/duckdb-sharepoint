@@ -148,6 +148,12 @@ public:
 	//! Forget cached metadata for "<identity>|<root-relative path>" and everything
 	//! beneath it (a folder). Called after every write, move and delete we make.
 	void InvalidateMeta(const string &key);
+	//! The item id of a file this process just wrote ("<identity>|<path>"),
+	//! from the write's own reply. A path lookup right after a write can still
+	//! 404 (seen live: COPY's tmp_ file "did not exist" for its move), so a
+	//! move of a file we wrote goes by id.
+	void RememberWrite(const string &key, const string &item_id);
+	bool RecentWrite(const string &key, string &item_id);
 	//! Same, for every entry describing item `item_id` (a delete by id: form
 	//! does not know the path it was cached under).
 	void InvalidateMetaById(const string &item_id);
@@ -170,6 +176,7 @@ private:
 	//! done to those files by OTHER clients is the user's promise to keep.
 	mutex meta_cache_lock;
 	unordered_map<string, DriveItemMeta> meta_cache;
+	unordered_map<string, string> recent_writes; // under meta_cache_lock
 	bool MetaCacheGet(const string &key, DriveItemMeta &out);
 	void MetaCachePut(const string &key, const DriveItemMeta &meta);
 };

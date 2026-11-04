@@ -768,10 +768,21 @@ void SplitParent(const string &root_relative, string &parent, string &name) {
 } // namespace
 
 void GraphClient::MoveByPath(const string &source_root_relative, const string &target_root_relative) {
+	// A file written moments ago may not be found by its path yet (hld §7a):
+	// a few looks, with backoff, before calling it missing.
 	auto src = StatByPath(source_root_relative);
+	for (int attempt = 1; !src.found && attempt <= 4; attempt++) {
+		SleepBeforeRetry(attempt, 0);
+		src = StatByPath(source_root_relative);
+	}
 	if (!src.found) {
 		throw IOException("sharepoint: move source '%s' does not exist", source_root_relative.c_str());
 	}
+	MoveById(src.id, source_root_relative, target_root_relative);
+}
+
+void GraphClient::MoveById(const string &item_id, const string &source_root_relative,
+                           const string &target_root_relative) {
 	string parent, name;
 	SplitParent(target_root_relative, parent, name);
 	// Address the new parent by drive + item id rather than by a path string:
@@ -793,7 +804,7 @@ void GraphClient::MoveByPath(const string &source_root_relative, const string &t
 	// Replace an existing target, as a local rename does. DuckDB's COPY writes a
 	// tmp_ file and moves it onto the final name, so without this every re-run
 	// of a COPY fails with 409 nameAlreadyExists.
-	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + src.id + "?@microsoft.graph.conflictBehavior=replace";
+	string path = "/v1.0/drives/" + auth.drive_id + "/items/" + item_id + "?@microsoft.graph.conflictBehavior=replace";
 	IncrementCounter(Counter::MOVE);
 	auto res = SendWithRetry(*auth.tokens, h, [&] { return cli.Patch(path.c_str(), h, picojson::value(body).serialize(), "application/json"); });
 	if (!res || res->status < 200 || res->status >= 300) {

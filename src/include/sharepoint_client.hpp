@@ -114,6 +114,9 @@ public:
 	//! PATCH an item's parent/name to move or rename it. Both paths are
 	//! root-relative and on this same drive.
 	void MoveByPath(const string &source_root_relative, const string &target_root_relative);
+	//! The same move for an item whose id is known (one this process just
+	//! wrote); `source_root_relative` names it in errors.
+	void MoveById(const string &item_id, const string &source_root_relative, const string &target_root_relative);
 
 	//! Create a folder at a root-relative path (idempotent: an existing folder
 	//! is not an error; a file of that name is).

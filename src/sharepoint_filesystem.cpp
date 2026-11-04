@@ -9,6 +9,7 @@
 #include "sharepoint_weburl.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -164,16 +165,19 @@ void SharepointFileHandle::Close() {
 		client.AbortUploadSession(session);
 		return;
 	}
+	string written_id;
 	try {
+		DriveItemMeta written;
 		if (upload->OnClose() == ChunkedUploadBuffer::CloseAction::SINGLE_REQUEST) {
 			// Never outgrew one chunk: one PUT. A zero-length write still
 			// creates an empty file, matching local-fs semantics.
-			client.PutContent(write_root_relative, upload->Pending());
+			written = client.PutContent(write_root_relative, upload->Pending());
 		} else {
 			// The last chunk carries the total; the commit publishes the file.
 			client.SendUploadChunk(session, *upload, /*final=*/true);
-			client.CommitUploadSession(session, upload->Total());
+			written = client.CommitUploadSession(session, upload->Total());
 		}
+		written_id = written.id;
 	} catch (...) {
 		// A failed close is a failed write: discard the session (nothing is
 		// published) and let the error surface.
@@ -183,7 +187,12 @@ void SharepointFileHandle::Close() {
 		throw;
 	}
 	upload.reset();
-	static_cast<SharepointFileSystem &>(file_system).InvalidateMeta(auth.identity + "|" + write_root_relative);
+	auto &fs = static_cast<SharepointFileSystem &>(file_system);
+	fs.InvalidateMeta(auth.identity + "|" + write_root_relative);
+	// After the invalidation, which also forgets earlier writes of this path.
+	if (!written_id.empty()) {
+		fs.RememberWrite(auth.identity + "|" + write_root_relative, written_id);
+	}
 }
 
 bool SharepointFileSystem::MetaCacheGet(const string &key, DriveItemMeta &out) {
@@ -215,9 +224,28 @@ void SharepointFileSystem::InvalidateMetaById(const string &item_id) {
 	}
 }
 
+void SharepointFileSystem::RememberWrite(const string &key, const string &item_id) {
+	lock_guard<mutex> guard(meta_cache_lock);
+	if (recent_writes.size() >= kMaxMetaCacheEntries) {
+		recent_writes.clear();
+	}
+	recent_writes[key] = item_id;
+}
+
+bool SharepointFileSystem::RecentWrite(const string &key, string &item_id) {
+	lock_guard<mutex> guard(meta_cache_lock);
+	auto it = recent_writes.find(key);
+	if (it == recent_writes.end()) {
+		return false;
+	}
+	item_id = it->second;
+	return true;
+}
+
 void SharepointFileSystem::InvalidateMeta(const string &key) {
 	lock_guard<mutex> guard(meta_cache_lock);
 	meta_cache.erase(key);
+	recent_writes.erase(key);
 	const string folder_prefix = key + "/";
 	for (auto it = meta_cache.begin(); it != meta_cache.end();) {
 		if (it->first.compare(0, folder_prefix.size(), folder_prefix) == 0) {
@@ -562,7 +590,18 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 			throw IOException("sharepoint: cannot move '%s' to '%s': they resolve to different secrets or drives",
 			                  source, target);
 		}
-		GraphClient(auth).MoveByPath(src.RootRelativePath(), dst.RootRelativePath());
+		string written_id;
+		if (RecentWrite(auth.identity + "|" + src.RootRelativePath(), written_id)) {
+			GraphClient(auth).MoveById(written_id, src.RootRelativePath(), dst.RootRelativePath());
+		} else {
+			try {
+				GraphClient(auth).MoveByPath(src.RootRelativePath(), dst.RootRelativePath());
+			} catch (IOException &e) {
+				lock_guard<mutex> guard(meta_cache_lock);
+				throw IOException("%s (no write of it recorded in this process; %llu recorded)", ErrorData(e).RawMessage(),
+				                  (unsigned long long)recent_writes.size());
+			}
+		}
 		InvalidateMeta(auth.identity + "|" + src.RootRelativePath());
 		InvalidateMeta(auth.identity + "|" + dst.RootRelativePath());
 	});
