@@ -245,6 +245,32 @@ Dates, timestamps and times are written with a date format, so they read back
 typed. Text stays text: `=1+1` doesn't become a formula, and `00123` doesn't
 become a number.
 
+### Workbooks as files: `read_xlsx` and `FORMAT xlsx`
+
+DuckDB's own [`excel`](https://duckdb.org/docs/stable/core_extensions/excel)
+extension works on `sharepoint://` paths too. It reads and writes the `.xlsx`
+**file**, without the workbook API:
+
+```sql
+INSTALL excel; LOAD excel;
+SELECT * FROM read_xlsx('sharepoint://Finance/archive/2019.xlsx', sheet := 'Sales');
+
+-- A NEW workbook, e.g. a report; a later COPY replaces the whole file.
+COPY (SELECT * FROM summary) TO 'sharepoint://Reports/q4.xlsx' (FORMAT xlsx, HEADER true, SHEET 'Summary');
+```
+
+Which to use:
+
+| | `read_excel_table` / `read_excel_range`, `FORMAT excel_table` / `excel_range` | `read_xlsx`, `FORMAT xlsx` |
+|---|---|---|
+| reads | the values the workbook holds now, as Excel for the web computes them | the saved file, with the formula results stored in it |
+| writes | into an **existing** workbook, in place: other sheets, formulas and formatting stay | a **new** file, or replaces the whole file |
+| needs | a workbook Excel for the web can open | only the file: any `.xlsx` |
+| cost | API calls, no download | reads the file |
+
+A workbook made with `FORMAT xlsx` is a normal workbook: `read_excel_range`
+and `FORMAT excel_table` work on it afterwards.
+
 ## SharePoint lists
 
 `read_sharepoint_list` reads a SharePoint list as a table, one row per item:
