@@ -956,6 +956,14 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   `CreateTarget`: the list is created when the operator's sink state is made,
   as DuckDB's postgres scanner does it, then the rows stream through the
   item writer. `OR REPLACE` is refused (it would mean deleting a list).
+- Workbooks (#100): `ATTACH ... (WORKBOOKS '<folder>')` adds one schema per
+  `.xlsx` under the folder (glob `**/*.xlsx`, listed at the first schema
+  lookup or scan), named by its path. A `WorkbookSchema` lists the workbook's
+  tables (`workbook/tables`) and types each by `read_excel_table`'s bind --
+  reading its values, since an Excel column has no declared type. The scan
+  rebinds and refuses a table whose columns or types moved since; INSERT is
+  `WorkbookInsert`, which drives the `excel_table` COPY writer
+  (`ExcelTableAppender`). UPDATE / DELETE are refused.
 - Transactions: none -- each statement goes straight to Graph.
 
 ## 18. Planner and To Do (#68)
