@@ -831,7 +831,9 @@ private:
 		}
 		auto opener = ClientData::Get(context).file_opener.get();
 		const string folder = string(SHAREPOINT_SCHEME) + workbooks;
-		GraphClient client(GetAuthContext(opener, folder));
+		// GraphClient keeps a reference to its auth context: it must outlive it.
+		const auto auth = GetAuthContext(opener, folder);
+		GraphClient client(auth);
 		auto parsed = ParseSharepointUri(folder);
 		if (!parsed.ok || parsed.uri.kind != SharepointUriKind::PATH) {
 			throw InvalidInputException("sharepoint: WORKBOOKS '%s' is not a folder path", workbooks);
