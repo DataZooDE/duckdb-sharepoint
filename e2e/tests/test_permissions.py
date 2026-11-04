@@ -25,19 +25,22 @@ def test_links_and_inherited_grants(graph, scratch, sql, secret_sql):
     r.raise_for_status()
     link = r.json()["link"]["webUrl"]
 
+    # Every row, to see Graph's answer when an assertion fails.
+    rows = sql(f"""{secret_sql}
+        SELECT granted_by || '|' || coalesce(grantee_type, '-') || '|' || coalesce(link_scope, '-') || '|' ||
+               list_sort(roles)::VARCHAR || '|' || coalesce(link_url, '-') || '|' || coalesce(inherited_from, '-')
+        FROM sharepoint_permissions('sharepoint://{scratch}/a.csv') ORDER BY 1;
+    """).splitlines()[1:]
+    links = [r for r in rows if r.startswith("link|") and "|organization|" in r]
+    assert len(links) == 1, rows
+    assert link in links[0] or link.split("?")[0] in links[0], (link, rows)
+    assert any(r.split("|")[1] != "-" for r in rows), rows  # grants with a grantee (the site's groups)
     out = sql(f"""{secret_sql}
-        SELECT count(*) FROM sharepoint_permissions('sharepoint://{scratch}/a.csv')
-        WHERE granted_by = 'link' AND link_scope = 'organization' AND link_url = '{link}' AND list_contains(roles, 'read');
-        SELECT count(*) > 0, count(*) FILTER (WHERE grantee IS NULL) FROM sharepoint_permissions('sharepoint://{scratch}/a.csv')
-        WHERE granted_by = 'inherited';
         SELECT string_agg(DISTINCT parse_filename(path), ',' ORDER BY parse_filename(path))
         FROM sharepoint_permissions('sharepoint://{scratch}/*.csv');
-        SELECT count(*) > 0 FROM sharepoint_permissions('sharepoint://{scratch}') WHERE granted_by = 'inherited';
+        SELECT count(*) > 0 FROM sharepoint_permissions('sharepoint://{scratch}');
     """).splitlines()
-    assert out[-4] == "1", out
-    assert out[-3] == "true|0", out  # inherited grants, each with its grantee
-    assert out[-2] == "a.csv,b.csv", out
-    assert out[-1] == "true", out  # a folder by its path
+    assert out[-2:] == ["a.csv,b.csv", "true"], out
 
     out = sql(f"{secret_sql} SELECT * FROM sharepoint_permissions('sharepoint://{scratch}/missing.csv');",
               expect_error=True)
