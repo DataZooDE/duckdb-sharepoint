@@ -570,6 +570,12 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   started together made one run's `big.bin` disappear under another
   (404 `itemNotFound` on a read by id). Not a product bug -- stagger re-runs,
   and give new suites run-unique paths (`@RUN_ID@`), as the Excel suite does.
+- **A file just written may not be found by its path yet** (2026-11-04,
+  #96). `COPY ... (FORMAT xlsx)` over an existing file: DuckDB wrote
+  `tmp_report.xlsx` (the PUT succeeded), and the move's
+  `GET root:/.../tmp_report.xlsx` answered 404 -- a glob moments later listed
+  the file. The filesystem now remembers the id the write returned and moves
+  such a file by id.
 - **An ungranted site under Sites.Selected: 403 or 404?** Not settled yet
   (#70). The first required run got 404 `itemNotFound` for
   `SHAREPOINT_UNGRANTED_SITE`, but the full-permission app got the same 404:
