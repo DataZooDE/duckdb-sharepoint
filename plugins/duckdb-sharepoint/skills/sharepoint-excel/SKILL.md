@@ -52,5 +52,5 @@ COPY (SELECT ...) TO 'sharepoint://Reports/q4.xlsx' (FORMAT xlsx, HEADER true, S
 ```
 Choose: the workbook API (`read_excel_*`, `excel_table` / `excel_range`) for live values and
 in-place writes into an existing workbook (other sheets and formulas kept); `read_xlsx` /
-`FORMAT xlsx` for any .xlsx file Excel for the web will not open, and to create a new
+`FORMAT xlsx` (to replace an existing file add `USE_TMP_FILE false`) for any .xlsx file Excel for the web will not open, and to create a new
 workbook or replace one whole. A `FORMAT xlsx` file is a normal workbook for the API after.

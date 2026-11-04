@@ -44,12 +44,12 @@ def test_copy_format_xlsx_creates_and_overwrites_a_workbook(scratch, sql, secret
     """).splitlines()
     assert out[-2:] == ["0|x0", "1|x1"]
 
-    # COPY over an existing file: DuckDB writes a temporary file and moves it
-    # over the target. The smaller result replaces the old one, and no
-    # temporary file is left beside it.
+    # Over an existing file: with USE_TMP_FILE false (DuckDB's xlsx writer
+    # still writes the file after COPY's tmp_ move, so the move would find
+    # nothing published -- hld §7a). The smaller result replaces the old one.
     out = sql(f"""{secret_sql}
         INSTALL excel; LOAD excel;
-        COPY (SELECT 7 AS n) TO '{path}' (FORMAT xlsx, HEADER true, SHEET 'Report');
+        COPY (SELECT 7 AS n) TO '{path}' (FORMAT xlsx, HEADER true, SHEET 'Report', USE_TMP_FILE false);
         SELECT count(*), max(n) FROM read_xlsx('{path}', sheet := 'Report');
         SELECT string_agg(parse_filename(file), ',' ORDER BY file) FROM glob('sharepoint://{scratch}/*');
     """).splitlines()

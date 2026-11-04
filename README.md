@@ -323,9 +323,13 @@ extension works on `sharepoint://` paths too. It reads and writes the `.xlsx`
 INSTALL excel; LOAD excel;
 SELECT * FROM read_xlsx('sharepoint://Finance/archive/2019.xlsx', sheet := 'Sales');
 
--- A NEW workbook, e.g. a report; a later COPY replaces the whole file.
+-- A NEW workbook, e.g. a report. To replace one that exists, add USE_TMP_FILE false.
 COPY (SELECT * FROM summary) TO 'sharepoint://Reports/q4.xlsx' (FORMAT xlsx, HEADER true, SHEET 'Summary');
 ```
+
+Over an existing file, `FORMAT xlsx` needs `USE_TMP_FILE false`: DuckDB's
+xlsx writer finishes the file only after COPY has moved its temporary file
+into place, and a SharePoint file exists only once it is fully written.
 
 Which to use:
 
