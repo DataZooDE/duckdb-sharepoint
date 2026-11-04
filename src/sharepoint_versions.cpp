@@ -7,6 +7,7 @@
 #include "sharepoint_client.hpp"
 #include "sharepoint_list.hpp"
 #include "sharepoint_uri.hpp"
+#include "sharepoint_weburl.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -50,8 +51,10 @@ unique_ptr<FunctionData> VersionsBind(ClientContext &context, TableFunctionBindI
 			throw InvalidInputException("sharepoint: the path must not be NULL");
 		}
 		const auto arg = StringValue::Get(input.inputs[0]);
-		const string path = IsSharepointUri(arg) ? arg : string(SHAREPOINT_SCHEME) + arg;
-		auto parsed = ParseSharepointUri(path);
+		const string path = IsSharepointUri(arg) || IsSharepointWebUrl(arg) ? arg : string(SHAREPOINT_SCHEME) + arg;
+		auto opener = ClientData::Get(context).file_opener.get();
+		const auto target = ResolveSharepointPath(opener, path); // a browser URL names its own drive (#95)
+		auto parsed = ParseSharepointUri(target.path);
 		if (!parsed.ok) {
 			throw InvalidInputException("sharepoint: %s", parsed.error);
 		}
@@ -59,8 +62,7 @@ unique_ptr<FunctionData> VersionsBind(ClientContext &context, TableFunctionBindI
 		if (!uri.version.empty()) {
 			throw InvalidInputException("sharepoint: name the file, not one of its versions: '%s'", path);
 		}
-		auto opener = ClientData::Get(context).file_opener.get();
-		const auto auth = GetAuthContext(opener, path);
+		const auto &auth = target.auth;
 		GraphClient client(auth);
 		const auto meta = uri.kind == SharepointUriKind::FILE_ID ? client.StatById(uri.item_id)
 		                                                         : client.StatByPath(uri.RootRelativePath());
@@ -107,7 +109,7 @@ unique_ptr<FunctionData> VersionsBind(ClientContext &context, TableFunctionBindI
 							modified_by_email = Value(Str(*who, "email"));
 						}
 					}
-					data->rows.push_back({Value(id), Value(version_uri.ToString()), Value::BOOLEAN(current), modified,
+					data->rows.push_back({Value(id), Value(IsSharepointWebUrl(path) ? StripUrlQuery(path) + (current ? string() : "?version=" + id) : version_uri.ToString()), Value::BOOLEAN(current), modified,
 					                      modified_by, modified_by_email,
 					                      size != o.end() && size->second.is<int64_t>()
 					                          ? Value::BIGINT(size->second.get<int64_t>())

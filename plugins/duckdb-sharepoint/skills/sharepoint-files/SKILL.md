@@ -7,9 +7,11 @@ description: >
   ATTACH of a .duckdb file, DuckLake DATA_PATH, write_blob / remove_file /
   move_file / file_size, earlier versions (?version=, sharepoint_versions),
   change feeds (sharepoint_changes with a delta token), a library's files with
-  metadata (read_sharepoint_files), and Microsoft Search (search_sharepoint).
+  metadata (read_sharepoint_files), Microsoft Search (search_sharepoint), and
+  browser addresses / sharing links pasted as paths (https://...sharepoint.com).
   Use when reading or writing files in SharePoint/OneDrive from SQL, syncing a
-  folder, listing a library, finding a file, or reading an old version.
+  folder, listing a library, finding a file, reading an old version, or when
+  the user pastes a SharePoint link.
 version: 2026.11.03
 user-invocable: false
 ---
@@ -31,6 +33,17 @@ SELECT write_blob('sharepoint://notes/a.md', '# Hi'::BLOB);  -- remove_file / mo
   `sharepoint_immutable_prefixes` skip re-stat.
 - Writes replace whole files; no append, no positional writes. A move across drives is refused.
 - Names cannot contain `" * : < > ? \ |`.
+
+## Browser addresses and sharing links
+A file's or folder's address from the browser works as a path, in its own site and library
+(whatever the secret's drive): reads, writes, globs (which return browser addresses), Excel
+(`read_excel_table('https://...xlsx', 'Sales')`), `sharepoint_versions`. A sharing link
+(`/:x:/s/...`, *Copy link*) is one existing file: read-only. Handled by this extension even
+with httpfs loaded. Not for `read_sharepoint_files` / `sharepoint_changes` (sharepoint:// only).
+```sql
+SELECT * FROM read_csv('https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/q4.csv');
+SELECT * FROM read_csv('https://contoso.sharepoint.com/:x:/s/Sales/EabCdEf123?e=XyZ');
+```
 
 ## Library contents with metadata
 ```sql
