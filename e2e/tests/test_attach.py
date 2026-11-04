@@ -101,3 +101,28 @@ def test_create_table_as_makes_a_list(graph, fixture_lists, sql, secret_sql):
     finally:
         _drop_list(graph, site, name)
         _drop_list(graph, site, empty)
+
+
+def test_workbook_tables(graph, scratch, sql, secret_sql):
+    """ATTACH ... (WORKBOOKS '<folder>') (#100): each .xlsx under the folder is
+    a schema named by its path, its Excel tables are tables; SELECT reads them
+    live, INSERT appends rows."""
+    from conftest import REPO_ROOT
+
+    fixture = (REPO_ROOT / "test" / "data" / "excel" / "fixture.xlsx").read_bytes()
+    graph.upload(f"{scratch}/fixture.xlsx", fixture)
+    wb = f"{scratch}/fixture.xlsx"
+    attach = f"ATTACH 'sharepoint://' AS site (TYPE sharepoint, WORKBOOKS '{scratch}');"
+    out = sql(f"""{secret_sql} {attach}
+        SELECT count(*) FROM duckdb_tables() WHERE database_name = 'site' AND schema_name = '{wb}' AND table_name = 'Sales';
+        SELECT count(*), sum(Units) FROM site."{wb}".Sales;
+        INSERT INTO site."{wb}".Sales (Region, Units) VALUES ('West', 5);
+    """).splitlines()
+    assert out[-2:] == ["1", "3|29"], out  # INSERT prints nothing; Units is whole numbers: BIGINT
+    out = sql(f"""{secret_sql}
+        SELECT count(*), sum(Units), count(*) FILTER (WHERE Region = 'West') FROM read_excel_table('{wb}', 'Sales');
+    """).splitlines()
+    assert out[-1] == "4|34|1", out
+    out = sql(f"{secret_sql} {attach} DELETE FROM site.\"{wb}\".Sales WHERE Units = 5;", expect_error=True)
+    # Refused -- by DuckDB's binder (no base table behind the scan), before ours.
+    assert "Can only delete from base table" in out or "not supported on an attached SharePoint site" in out, out

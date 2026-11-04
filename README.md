@@ -463,6 +463,22 @@ column named `Title` is the list's own. Other types are refused. It needs the
 `Sites.Manage.All` permission. `IF NOT EXISTS` keeps a list that is there.
 Dropping or altering lists, and `RETURNING`, are not supported.
 
+**Workbooks too.** With `WORKBOOKS '<folder>'`, every `.xlsx` under that folder
+is a schema named by its path, and its Excel tables are tables. BI tools
+browsing the site then see them. Reads go through `read_excel_table`, and
+`INSERT` appends rows as `COPY … (FORMAT excel_table)` does:
+
+```sql
+ATTACH 'sharepoint://' AS site (TYPE sharepoint, WORKBOOKS 'Finance/');
+SELECT * FROM site."Finance/plan.xlsx".Sales;
+INSERT INTO site."Finance/plan.xlsx".Sales (Region, Units) VALUES ('West', 5);
+```
+
+Each table is read once at the first lookup to type its columns, so keep
+the folder to the workbooks you need. `UPDATE` and `DELETE` on workbook
+tables are not supported; replace a table with `COPY … (FORMAT excel_table,
+OVERWRITE)`.
+
 ## Installation
 
 ```sql

@@ -42,3 +42,9 @@ COPY (SELECT ...) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Out!B2', HE
   write can fail with 423.
 - The workbook must exist (create .xlsx files with plain COPY of a file, e.g. DuckDB's
   excel extension, or upload).
+
+## Workbooks in an attached site
+`ATTACH 'sharepoint://' AS site (TYPE sharepoint, WORKBOOKS 'Finance/')`: each .xlsx under the
+folder is a schema named by its path, its Excel tables are tables (`site."Finance/plan.xlsx".Sales`);
+SELECT reads live, INSERT appends (columns by name). No UPDATE/DELETE. Tables are typed by reading
+each once per ATTACH.
