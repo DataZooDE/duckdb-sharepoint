@@ -118,10 +118,10 @@ def test_workbook_tables(graph, scratch, sql, secret_sql):
         SELECT count(*), sum(Units) FROM site."{wb}".Sales;
         INSERT INTO site."{wb}".Sales (Region, Units) VALUES ('West', 5);
     """).splitlines()
-    assert out[-3:-1] == ["1", "3|29.0"], out
+    assert out[-2:] == ["1", "3|29"], out  # INSERT prints nothing; Units is whole numbers: BIGINT
     out = sql(f"""{secret_sql}
         SELECT count(*), sum(Units), count(*) FILTER (WHERE Region = 'West') FROM read_excel_table('{wb}', 'Sales');
     """).splitlines()
-    assert out[-1] == "4|34.0|1", out
+    assert out[-1] == "4|34|1", out
     out = sql(f"{secret_sql} {attach} DELETE FROM site.\"{wb}\".Sales WHERE Units = 5;", expect_error=True)
     assert "not supported on an attached SharePoint site" in out, out
