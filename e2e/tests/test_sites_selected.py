@@ -57,8 +57,17 @@ def test_granted_site_files_excel_and_lists(fixture_lists, scratch, sql, selecte
     assert out[-2:] == ["3", str(ITEMS)]
 
 
-def test_ungranted_site_is_refused_with_a_hint(sql, selected_sql):
+def test_ungranted_site_is_refused_with_a_hint(sql, secret_sql, selected_sql):
     site = os.environ["SHAREPOINT_UNGRANTED_SITE"]
+    # The site exists: the full-permission app resolves it and gets as far as
+    # the list (one that does not exist, so the library's localized name does
+    # not matter). Without this, a mistyped SHAREPOINT_UNGRANTED_SITE would
+    # pass as "refused".
+    out = sql(f"{secret_sql} SELECT * FROM read_sharepoint_list('no_such_list_e2e', site := '{site}');",
+              expect_error=True)
+    assert "list 'no_such_list_e2e'" in out, out
+    # 403 accessDenied, or 404 if Graph hides the site (docs/hld.md §7a).
+    # Either way the error must say how to grant it.
     out = sql(f"{selected_sql} SELECT * FROM read_sharepoint_list('Documents', site := '{site}');",
               expect_error=True)
-    assert "HTTP 403" in out and "Sites.Selected" in out, out
+    assert ("HTTP 403" in out or "not found" in out) and "Sites.Selected" in out, out
