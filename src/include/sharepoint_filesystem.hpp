@@ -153,13 +153,6 @@ public:
 	//! 404 (seen live: COPY's tmp_ file "did not exist" for its move), so a
 	//! move of a file we wrote goes by id.
 	void RememberWrite(const string &key, const string &item_id);
-	//! Write handles still open ("<identity>|<path>"). DuckDB's xlsx writer
-	//! leaves its file open past finalize, so COPY moves its tmp_ file before
-	//! the upload is published (seen live, #96); MoveFile commits such a handle
-	//! first.
-	void RegisterOpenWrite(const string &key, SharepointFileHandle *handle);
-	void UnregisterOpenWrite(const string &key, SharepointFileHandle *handle);
-	SharepointFileHandle *OpenWrite(const string &key);
 	bool RecentWrite(const string &key, string &item_id);
 	//! Same, for every entry describing item `item_id` (a delete by id: form
 	//! does not know the path it was cached under).
@@ -184,7 +177,6 @@ private:
 	mutex meta_cache_lock;
 	unordered_map<string, DriveItemMeta> meta_cache;
 	unordered_map<string, string> recent_writes; // under meta_cache_lock
-	unordered_map<string, SharepointFileHandle *> open_writes; // under meta_cache_lock
 	bool MetaCacheGet(const string &key, DriveItemMeta &out);
 	void MetaCachePut(const string &key, const DriveItemMeta &meta);
 };

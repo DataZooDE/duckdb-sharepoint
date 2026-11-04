@@ -570,15 +570,12 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   started together made one run's `big.bin` disappear under another
   (404 `itemNotFound` on a read by id). Not a product bug -- stagger re-runs,
   and give new suites run-unique paths (`@RUN_ID@`), as the Excel suite does.
-- **DuckDB's xlsx writer keeps its file open past finalize** (2026-11-04,
-  #96). `COPY ... (FORMAT xlsx)` over an existing file writes `tmp_<name>`
-  and DuckDB moves it onto the target after finalize -- but the writer's
-  handle is still open then, and this filesystem publishes a file only when
-  its handle closes, so the move found no source ("0 writes recorded"; a
-  glob afterwards did list the file). MoveFile now closes (publishes) a
-  write handle of this process that is still open on the source, then moves
-  the item by the id its write returned. (A first guess -- path-lookup lag --
-  was wrong; the path lookup is retried a few times anyway.)
+- **A file just written may not be found by its path yet** (2026-11-04,
+  #96). `COPY ... (FORMAT xlsx)` over an existing file: DuckDB wrote
+  `tmp_report.xlsx` (the PUT succeeded), and the move's
+  `GET root:/.../tmp_report.xlsx` answered 404 -- a glob moments later listed
+  the file. The filesystem now remembers the id the write returned and moves
+  such a file by id.
 - **An item's permissions, as listed** (2026-11-04, #98): for a file in a
   fresh folder, `GET /items/{id}/permissions` (app-only) gave the site's
   groups (owner / member / visitor, as `group` and `siteGroup`) with **no

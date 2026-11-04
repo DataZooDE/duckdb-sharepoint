@@ -126,10 +126,6 @@ SharepointFileHandle::SharepointFileHandle(FileSystem &fs, string path, FileOpen
 }
 
 SharepointFileHandle::~SharepointFileHandle() {
-	if (!write_root_relative.empty()) {
-		static_cast<SharepointFileSystem &>(file_system).UnregisterOpenWrite(auth.identity + "|" + write_root_relative,
-		                                                                    this);
-	}
 	// A handle destroyed with an upload session still open was never
 	// successfully closed (an exception unwound through the writer, e.g. a
 	// COPY whose query failed mid-stream). Discard the session so nothing is
@@ -163,8 +159,6 @@ void SharepointFileHandle::Close() {
 		return;
 	}
 	is_write = false; // a second Close() must not publish twice
-	static_cast<SharepointFileSystem &>(file_system).UnregisterOpenWrite(auth.identity + "|" + write_root_relative,
-	                                                                    this);
 	GraphClient client(auth);
 	if (write_failed || !upload) {
 		// A write already failed: never publish a truncated file.
@@ -238,25 +232,6 @@ void SharepointFileSystem::RememberWrite(const string &key, const string &item_i
 	recent_writes[key] = item_id;
 }
 
-void SharepointFileSystem::RegisterOpenWrite(const string &key, SharepointFileHandle *handle) {
-	lock_guard<mutex> guard(meta_cache_lock);
-	open_writes[key] = handle;
-}
-
-void SharepointFileSystem::UnregisterOpenWrite(const string &key, SharepointFileHandle *handle) {
-	lock_guard<mutex> guard(meta_cache_lock);
-	auto it = open_writes.find(key);
-	if (it != open_writes.end() && it->second == handle) {
-		open_writes.erase(it);
-	}
-}
-
-SharepointFileHandle *SharepointFileSystem::OpenWrite(const string &key) {
-	lock_guard<mutex> guard(meta_cache_lock);
-	auto it = open_writes.find(key);
-	return it == open_writes.end() ? nullptr : it->second;
-}
-
 bool SharepointFileSystem::RecentWrite(const string &key, string &item_id) {
 	lock_guard<mutex> guard(meta_cache_lock);
 	auto it = recent_writes.find(key);
@@ -316,7 +291,6 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 			handle->is_write = true;
 			handle->write_root_relative = uri.RootRelativePath();
 			handle->upload = make_uniq<ChunkedUploadBuffer>(UploadChunkBytes(context));
-			RegisterOpenWrite(handle->auth.identity + "|" + handle->write_root_relative, handle.get());
 			return std::move(handle);
 		}
 
@@ -617,9 +591,6 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 			                  source, target);
 		}
 		string written_id;
-		if (auto open = OpenWrite(auth.identity + "|" + src.RootRelativePath())) {
-			open->Close(); // publish it first: a move needs the file to exist
-		}
 		if (RecentWrite(auth.identity + "|" + src.RootRelativePath(), written_id)) {
 			GraphClient(auth).MoveById(written_id, src.RootRelativePath(), dst.RootRelativePath());
 		} else {
