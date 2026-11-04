@@ -39,7 +39,7 @@ One install, one secret, and app-only or user sign-in. Built for DuckDB
 - [SharePoint lists](#sharepoint-lists)
 - [Installation](#installation) · [Authentication](#authentication) · [Settings](#settings) · [Diagnostics](#diagnostics) · [Limitations](#limitations)
 - [Network and privacy](#network-and-privacy) · [How it works](#how-it-works) · [Building and testing](#building-and-testing)
-- [Support and feedback](#support-and-feedback) · [License](#license) · [Citation](#citation)
+- [Claude Code plugin](#claude-code-plugin) · [Support and feedback](#support-and-feedback) · [License](#license) · [Citation](#citation)
 
 ## Quick start
 
@@ -120,6 +120,23 @@ ATTACH 'sharepoint://warehouse/sales.duckdb' AS sales (READ_ONLY);
 SELECT write_blob('sharepoint://notes/readme.md', '# Title'::BLOB);
 SELECT remove_file('sharepoint://notes/readme.md');   -- true, then false
 ```
+
+**What changed since last time.** `sharepoint_changes` reads Graph's delta
+for a folder: one row per file or folder added or changed (`_change =
+'upsert'`) or deleted (`'delete'`, by `id`; a delete may come without its
+path), then one `'checkpoint'` row whose `token` is what to pass next time.
+The token is yours to keep, e.g. in a table:
+
+```sql
+CREATE TABLE sync AS SELECT token FROM sharepoint_changes('sharepoint://Finance/', token := 'latest')
+                     WHERE _change = 'checkpoint';                      -- start from now
+-- later:
+SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := (SELECT token FROM sync));
+```
+
+Without a token it lists everything under the folder once. An expired token
+says so; start over without one.
+
 
 **Earlier versions.** SharePoint keeps a file's version history, and
 `?version=<label>` reads one of them with any reader; earlier versions are
@@ -425,6 +442,7 @@ and `SITE_ID` are SharePoint's, not Entra's.
 | `AADSTS7000218` | the app is not a public client | *Authentication → Allow public client flows* → **Enabled**, then **Save** |
 | `AADSTS50173` / `invalid_grant` | the refresh token expired or was revoked | sign in again (recreate the secret without `REFRESH_TOKEN`) |
 | HTTP 403 `accessDenied` | the app lacks a permission, or (with `Sites.Selected`) this site | add it under *API permissions* and click **Grant admin consent** (it shows *Not granted* until then); or grant the site (see *Least privilege*) |
+| `site '…' not found` (`itemNotFound`) | no such site at that path, or (with `Sites.Selected`, if Graph hides it) the app was not granted it | check the name; or grant the site (see *Least privilege*) |
 
 > The option is `GRAPH_SCOPE`, **not** `SCOPE`: DuckDB's `CREATE SECRET`
 > grammar reserves `SCOPE` for the secret's path-prefix list. An OAuth scope
@@ -557,6 +575,29 @@ root. The subshell keeps the token out of your shell:
 It prints only SHA-256 fingerprints of the old and rotated tokens. If it
 reports `invalid_grant`, sign in again with `make delegated_login` and update
 the secret. Details: [docs/hld.md §5.2](docs/hld.md).
+
+## Claude Code plugin
+
+The repository ships a [Claude Code](https://claude.com/claude-code) plugin with four skills
+that document this extension's SQL API, so Claude Code can write queries against SharePoint
+from a plain request such as *"read the Orders list, open orders only, and write a forecast
+back into the Sales workbook"*.
+
+```
+/plugin marketplace add DataZooDE/duckdb-sharepoint
+/plugin install duckdb-sharepoint@duckdb-sharepoint
+```
+
+| Skill | Covers |
+|---|---|
+| `sharepoint-setup` | INSTALL/LOAD, `CREATE SECRET` for every provider (client secret, certificate, device code, browser sign-in, token), Graph permissions incl. Sites.Selected, settings, sign-in and permission errors |
+| `sharepoint-files` | the `sharepoint://` filesystem and globs, COPY/ATTACH/DuckLake, `write_blob` and friends, `read_sharepoint_files`, `?version=` and `sharepoint_versions`, `sharepoint_changes`, `search_sharepoint` |
+| `sharepoint-excel` | `read_excel_table`, `read_excel_range`, type inference, writing back with `COPY … (FORMAT excel_table / excel_range)` and `OVERWRITE` |
+| `sharepoint-lists` | `read_sharepoint_list`, column types (lookups, people, dates), filter pushdown on indexed columns, `COPY … (FORMAT sharepoint_list)` |
+
+The skills live in [`plugins/duckdb-sharepoint/`](plugins/duckdb-sharepoint/). To use a local
+checkout instead of the marketplace, start Claude Code with
+`claude --plugin-dir ./plugins/duckdb-sharepoint`.
 
 ## Support and feedback
 

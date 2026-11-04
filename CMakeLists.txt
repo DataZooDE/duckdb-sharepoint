@@ -94,6 +94,7 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_excel.cpp
     src/sharepoint_list.cpp
     src/sharepoint_credential_chain.cpp
+    src/sharepoint_delta.cpp
     src/sharepoint_assertion.cpp
     src/sharepoint_certificate.cpp
     src/sharepoint_search.cpp
@@ -115,6 +116,7 @@ file(GLOB DUCKDB_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_vfs_functions.cpp
     src/sharepoint_excel_functions.cpp
     src/sharepoint_list_functions.cpp
+    src/sharepoint_changes.cpp
     src/sharepoint_versions.cpp
     src/sharepoint_search_functions.cpp
 )

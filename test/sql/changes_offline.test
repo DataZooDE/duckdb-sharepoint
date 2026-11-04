@@ -1,0 +1,27 @@
+# name: test/sql/changes_offline.test
+# description: sharepoint_changes (#62) without a tenant: registered, and bad
+#              input fails before any Graph call. The delta itself is
+#              e2e/tests/test_changes.py.
+# group: [sharepoint]
+
+require sharepoint
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'sharepoint_changes' AND function_type = 'table';
+----
+1
+
+statement error
+SELECT * FROM sharepoint_changes(NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM sharepoint_changes('sharepoint://id:01ABC');
+----
+takes a folder path
+
+statement error
+SELECT * FROM sharepoint_changes('sharepoint://x', token := 'a/b?c');
+----
+not a token sharepoint_changes returned

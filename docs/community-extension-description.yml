@@ -8,8 +8,8 @@
 
 extension:
   name: sharepoint
-  version: 2026.10.18
-  description: Query files in SharePoint / OneDrive directly with a sharepoint:// filesystem
+  version: 2026.11.03
+  description: SharePoint and OneDrive in SQL -- files (sharepoint://), Excel workbooks, SharePoint lists, search and change feeds
   language: C++
   build: cmake
   license: MIT
@@ -69,8 +69,16 @@ docs:
     and served from a block cache. Writes stream through a Graph upload session
     in bounded memory and the file appears when it is closed (Graph cannot
     write at a byte offset, so positional writes raise rather than corrupt).
-    Besides app-only client credentials, a user can sign in with
-    `device_code` or `authorization_code`. Also registers the
+    Beyond files: `read_excel_table` / `read_excel_range` read live Excel
+    workbooks and `COPY ... (FORMAT excel_table | excel_range)` writes them
+    back; `read_sharepoint_list` reads SharePoint lists as typed tables (WHERE
+    pushed down to Graph on indexed columns) and `COPY ... (FORMAT
+    sharepoint_list)` creates or updates items; `read_sharepoint_files` lists a
+    library with its metadata; `search_sharepoint` runs Microsoft Search;
+    `sharepoint_changes` / `sharepoint_list_changes` return what changed
+    since a token; `?version=` reads an earlier version of a file.
+    Besides app-only client credentials or a certificate, a user can sign in
+    with `device_code` or `authorization_code`. Also registers the
     scheme-generic `write_blob`, `remove_file`, `move_file` and `file_size` SQL
     functions, which work for any filesystem DuckDB can reach.
 

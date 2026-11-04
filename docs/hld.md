@@ -570,6 +570,13 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   started together made one run's `big.bin` disappear under another
   (404 `itemNotFound` on a read by id). Not a product bug -- stagger re-runs,
   and give new suites run-unique paths (`@RUN_ID@`), as the Excel suite does.
+- **An ungranted site under Sites.Selected: 403 or 404?** Not settled yet
+  (#70). The first required run got 404 `itemNotFound` for
+  `SHAREPOINT_UNGRANTED_SITE`, but the full-permission app got the same 404:
+  the site did not exist at that path. `ResolveSite` puts the grant hint on
+  a site 404 as well as on the 403, and the e2e test first resolves the site
+  with the full-permission app, so a missing site fails as such. Record the
+  real answer here once the test passes.
 - **Delegated-app setup failures**, met recreating the public-client app for
   #47: `AADSTS700016` (client ID and tenant from different places -- take both
   from the app's Overview page), `AADSTS7000218` (*Allow public client flows*
@@ -863,6 +870,20 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - The live test searches for a probe file kept between runs: the index lags
   by minutes, so the run that creates the probe skips.
 
+## 15. `sharepoint_changes` (#62, files)
+
+- `GET /drives/{d}/root/delta` (SharePoint has delta on the drive root
+  only), paged to the `@odata.deltaLink`; its `token` parameter is returned
+  in a final `checkpoint` row, so a sync never loses its place even when
+  nothing changed. Stateless: the caller stores the token.
+- Filtered to the folder asked about client-side, by `parentReference.path`
+  (whole segments). A deleted item often has no path, so deletes are always
+  reported (by id). An item seen twice in one delta keeps its last state; the
+  root folder itself is skipped.
+- `token := 'latest'` gives a token without enumerating the drive. An expired
+  token (410 `resyncRequired`) is an error telling to start over.
+- Lists (`/sites/{s}/lists/{l}/items/delta`) are not done yet: they build on
+  the list column plan of #79–#82.
 ## 16. `PROVIDER credential_chain` (#72)
 
 - Order as `DefaultAzureCredential`: workload identity (the federated token
