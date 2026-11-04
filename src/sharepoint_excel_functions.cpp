@@ -11,6 +11,7 @@
 #include "sharepoint_copy_rewrite.hpp"
 #include "sharepoint_excel.hpp"
 #include "sharepoint_uri.hpp"
+#include "sharepoint_weburl.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/gzip_file_system.hpp"
@@ -107,9 +108,22 @@ bool UsesDate1904(GraphClient &client, const string &item_id, int64_t size) {
 Workbook OpenWorkbook(ClientContext &context, const string &arg) {
 	Workbook wb;
 	// The scheme is optional: read_excel_table('Finance/plan.xlsx', ...) means
-	// the secret's drive, as sharepoint://Finance/plan.xlsx would.
-	wb.path = IsSharepointUri(arg) ? arg : string(SHAREPOINT_SCHEME) + arg;
-	auto parsed = ParseSharepointUri(wb.path);
+	// the secret's drive, as sharepoint://Finance/plan.xlsx would. A browser
+	// URL or sharing link names its own drive (#95).
+	wb.path = IsSharepointUri(arg) || IsSharepointWebUrl(arg) ? arg : string(SHAREPOINT_SCHEME) + arg;
+	if (!IsSharepointWebUrl(wb.path)) {
+		// A malformed path or the drive root fails before any secret or network.
+		auto early = ParseSharepointUri(wb.path);
+		if (!early.ok) {
+			throw InvalidInputException("sharepoint: %s", early.error);
+		}
+		if (early.uri.kind == SharepointUriKind::PATH && early.uri.segments.empty()) {
+			throw InvalidInputException("sharepoint: '%s' is the drive root, not a workbook", wb.path);
+		}
+	}
+	auto opener = ClientData::Get(context).file_opener.get();
+	auto target = ResolveSharepointPath(opener, wb.path);
+	auto parsed = ParseSharepointUri(target.path);
 	if (!parsed.ok) {
 		throw InvalidInputException("sharepoint: %s", parsed.error);
 	}
@@ -117,8 +131,7 @@ Workbook OpenWorkbook(ClientContext &context, const string &arg) {
 	if (uri.kind == SharepointUriKind::PATH && uri.segments.empty()) {
 		throw InvalidInputException("sharepoint: '%s' is the drive root, not a workbook", wb.path);
 	}
-	auto opener = ClientData::Get(context).file_opener.get();
-	wb.auth = GetAuthContext(opener, wb.path);
+	wb.auth = target.auth;
 	GraphClient client(wb.auth);
 	const auto meta =
 	    uri.kind == SharepointUriKind::PATH ? client.StatByPath(uri.RootRelativePath()) : client.StatById(uri.item_id);

@@ -948,3 +948,38 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   default) and are read as UTC.
 - Not verified live: needs `Tasks.Read.All` for the CI app and a test plan
   (`SHAREPOINT_PLANNER_PLAN_ID`, `SHAREPOINT_TODO_USER`).
+
+## 19. Browser addresses, `SITE_URL`, `sharepoint_sites` / `sharepoint_drives` (#95)
+
+- **Which filesystem.** DuckDB gives a path to the *last* registered
+  filesystem whose `CanHandleFile` accepts it, unless one returns
+  `IsManuallySet()`. httpfs claims every `https://`, so a SharePoint URL would
+  go to whichever loaded last -- httpfs autoloads on the first other https
+  path. `SharepointFileSystem::IsManuallySet()` returns true, and
+  `CanHandleFile` claims only `https://*.sharepoint.com` (and the US Gov /
+  China hosts); every other https URL stays with httpfs (checked locally,
+  httpfs loaded after sharepoint).
+- **Where it resolves.** Every filesystem entry point (and `OpenWorkbook`,
+  `sharepoint_versions`) calls `ResolveSharepointPath` instead of
+  `GetAuthContext`: a `sharepoint://` path is itself; a direct URL becomes
+  (the library's drive, `sharepoint://<path in it>`) by matching the site's
+  libraries' `webUrl` (one `/sites/{host}:/{path}` and one `/drives` call per
+  site, cached per credentials); a sharing link becomes
+  `sharepoint://id:<item>` on the item's drive via
+  `GET /shares/u!{base64url}/driveItem` (cached). The auth context gets that
+  drive and the identity `Fingerprint(credential_fp, graph, drive)` --
+  the same formula as for `sharepoint://`, so the block cache and the
+  same-drive check on moves see one file whichever way it is named.
+- **Back to URLs.** A glob under a browser URL returns browser URLs (the
+  library's webUrl + percent-encoded path), and `sharepoint_versions(url)`
+  returns `url?version=<label>`; a `sharepoint://` result there would bind to
+  the *secret's* drive. `version=` is the one query parameter kept; the
+  browser's own (`web=1`, `d=`, `e=`) are dropped. `/:x:/r/<path>` (a redirect
+  link) carries its path and is direct; `/:x:/s/...` and `_layouts/...Doc.aspx`
+  go to `/shares`.
+- **Secrets without a drive.** `GetAuthContext(..., require_drive=false)`
+  for the discovery functions, browser URLs and `site :=`: a secret may name
+  no drive at all. `SITE_URL` (+ `DRIVE` by name, or a library's own address)
+  resolves like `SITE_ID`, once per credentials + site + library.
+- **Scope.** `read_sharepoint_files` and `sharepoint_changes` keep
+  `sharepoint://` only: their output paths are relative to the secret's drive.

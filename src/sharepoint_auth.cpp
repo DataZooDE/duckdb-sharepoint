@@ -19,8 +19,11 @@
 #include "sharepoint_errors.hpp"
 #include "sharepoint_identity.hpp"
 #include "sharepoint_secret.hpp"
+#include "sharepoint_weburl.hpp"
+#include "sharepoint_uri.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/file_opener.hpp"
@@ -64,6 +67,10 @@ struct CachedToken {
 mutex g_token_lock;
 unordered_map<string, CachedToken> g_tokens;  // credential fingerprint -> token
 unordered_map<string, string> g_site_drives; // fingerprint of (credentials, site) -> drive id
+//! Browser URLs (#95): a site's document libraries (drive id, webUrl), and
+//! what a sharing link points at ("drive id|item id"), per credentials.
+unordered_map<string, vector<pair<string, string>>> g_site_libraries;
+unordered_map<string, string> g_shared_items;
 //! Credential fingerprint -> the newest refresh token Entra ID issued for it.
 //! Entra rotates the refresh token on every refresh grant; every later mint
 //! for that credential presents the newest one (never a superseded token), and
@@ -416,40 +423,18 @@ SecretMatch LookupSecret(optional_ptr<FileOpener> opener, const string &path) {
 		throw InvalidInputException(
 		    "sharepoint: no `sharepoint` secret configured for '%s'. Create one, e.g.\n"
 		    "  CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,\n"
-		    "                    TENANT_ID '...', CLIENT_ID '...', CLIENT_SECRET '...', DRIVE_ID 'b!...');",
+		    "                    TENANT_ID '...', CLIENT_ID '...', CLIENT_SECRET '...', SITE_URL 'https://contoso.sharepoint.com/sites/Sales');",
 		    path);
 	}
 	return match;
 }
 
-// Resolve the drive the paths hang off. Prefer an explicit DRIVE_ID; else
-// derive it from SITE_ID via GET /sites/{site-id}/drive (the site's default
-// document library), cached per credentials + site.
-string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint, const string &token,
-                      const string &credential_fp) {
-	string drive_id = SecretField(secret, "drive_id");
-	if (!drive_id.empty()) {
-		return drive_id;
-	}
-	string site_id = SecretField(secret, "site_id");
-	if (site_id.empty()) {
-		throw InvalidInputException(
-		    "sharepoint: the secret gives neither DRIVE_ID nor SITE_ID, so there is no drive to address. "
-		    "Pass one of them to CREATE SECRET.");
-	}
-	// A site's default library does not move; resolve it once per (credentials,
-	// cloud, site) instead of one extra Graph call per file operation.
-	const string cache_key = Fingerprint({credential_fp, graph_endpoint, site_id});
-	{
-		lock_guard<mutex> guard(g_token_lock);
-		auto it = g_site_drives.find(cache_key);
-		if (it != g_site_drives.end()) {
-			return it->second;
-		}
-	}
+// GET `path` on Graph with the usual retries; the reply's JSON object, or
+// throw naming `what`. A 404 says `not_found` instead.
+picojson::object GraphGetObject(const string &graph_endpoint, const string &token, const string &path,
+                                const string &what, const string &not_found) {
 	auto cli = MakeClient(graph_endpoint);
 	duckdb_httplib_openssl::Headers headers = {{"Authorization", "Bearer " + token}};
-	string path = "/v1.0/sites/" + site_id + "/drive?$select=id";
 	duckdb_httplib_openssl::Result res;
 	for (int attempt = 1;; attempt++) {
 		res = cli.Get(path.c_str(), headers);
@@ -459,22 +444,127 @@ string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint
 		}
 		SleepBeforeRetry(attempt, res ? ParseRetryAfterSeconds(res->get_header_value("Retry-After")) : 0);
 	}
+	if (res && res->status == 404 && !not_found.empty()) {
+		throw InvalidInputException("sharepoint: %s", not_found);
+	}
 	if (!res || res->status < 200 || res->status >= 300) {
-		throw IOException("sharepoint: could not resolve the default document library for SITE_ID '%s' (HTTP "
-		                  "%d)",
-		                  site_id.c_str(), res ? res->status : 0);
+		throw IOException("sharepoint: could not resolve %s (HTTP %d)", what, res ? res->status : 0);
 	}
 	picojson::value v;
 	if (!picojson::parse(v, res->body).empty() || !v.is<picojson::object>()) {
-		throw IOException("sharepoint: unexpected response resolving the site drive");
+		throw IOException("sharepoint: unexpected response resolving %s", what);
 	}
-	auto id = v.get<picojson::object>()["id"];
-	if (!id.is<string>()) {
-		throw IOException("sharepoint: site drive response carried no id");
+	return v.get<picojson::object>();
+}
+
+string JsonString(const picojson::object &o, const char *key) {
+	auto it = o.find(key);
+	return it != o.end() && it->second.is<string>() ? it->second.get<string>() : string();
+}
+
+// The Graph site id of a SITE_URL ("https://contoso.sharepoint.com/sites/Sales").
+string SiteIdOfUrl(const SharepointWebUrl &url, const string &site_url, const string &graph_endpoint,
+                   const string &token) {
+	string address = url.host;
+	if (!url.site_path.empty()) {
+		address += ":";
+		for (auto &segment : StringUtil::Split(url.site_path, '/')) {
+			address += "/" + PercentEncodeSegment(segment);
+		}
+	}
+	const string what = "site '" + site_url + "'";
+	auto site = GraphGetObject(graph_endpoint, token, "/v1.0/sites/" + address + "?$select=id", what,
+	                           what + " not found -- check the address, or, for an app with Sites.Selected, grant "
+	                                  "it this site (README: Least privilege)");
+	auto id = JsonString(site, "id");
+	if (id.empty()) {
+		throw IOException("sharepoint: %s has no id", what);
+	}
+	return id;
+}
+
+// Resolve the drive the paths hang off. Prefer an explicit DRIVE_ID; else the
+// site's (SITE_ID, or SITE_URL from the browser) default document library, or
+// the one named DRIVE, or -- for a SITE_URL that goes on into a library --
+// that library. Cached per credentials + site + library. Without any of them,
+// "" when `require_drive` is false (sharepoint_sites() needs no drive).
+string ResolveDriveId(const KeyValueSecret &secret, const string &graph_endpoint, const string &token,
+                      const string &credential_fp, bool require_drive) {
+	string drive_id = SecretField(secret, "drive_id");
+	if (!drive_id.empty()) {
+		return drive_id;
+	}
+	string site_id = SecretField(secret, "site_id");
+	const string site_url = SecretField(secret, "site_url");
+	const string drive_name = SecretField(secret, "drive");
+	if (site_id.empty() && site_url.empty()) {
+		if (!require_drive) {
+			return string();
+		}
+		throw InvalidInputException(
+		    "sharepoint: the secret gives no SITE_URL, DRIVE_ID or SITE_ID, so there is no drive to address. "
+		    "Add the site's address from the browser, e.g. SITE_URL 'https://contoso.sharepoint.com/sites/Sales' "
+		    "(SELECT * FROM sharepoint_sites() lists the sites you can reach).");
+	}
+	// A site's libraries do not move; resolve once per (credentials, cloud,
+	// site, library) instead of extra Graph calls per file operation.
+	const string cache_key = Fingerprint({credential_fp, graph_endpoint, site_id, site_url, drive_name});
+	{
+		lock_guard<mutex> guard(g_token_lock);
+		auto it = g_site_drives.find(cache_key);
+		if (it != g_site_drives.end()) {
+			return it->second;
+		}
+	}
+	SharepointWebUrl url;
+	if (site_id.empty()) {
+		url = ParseSharepointWebUrl(site_url).url; // validated by CREATE SECRET
+		site_id = SiteIdOfUrl(url, site_url, graph_endpoint, token);
+	}
+	const string site_what = site_url.empty() ? "SITE_ID '" + site_id + "'" : "SITE_URL '" + site_url + "'";
+	if (!drive_name.empty() || !url.rest.empty()) {
+		auto drives = GraphGetObject(graph_endpoint, token, "/v1.0/sites/" + site_id + "/drives?$select=id,name,webUrl",
+		                             "the document libraries of " + site_what, string());
+		string names;
+		int best = -1;
+		auto values = drives.find("value");
+		if (values != drives.end() && values->second.is<picojson::array>()) {
+			for (auto &d : values->second.get<picojson::array>()) {
+				if (!d.is<picojson::object>()) {
+					continue;
+				}
+				const auto &o = d.get<picojson::object>();
+				const auto name = JsonString(o, "name");
+				names += (names.empty() ? "" : ", ") + string("'") + name + "'";
+				if (!drive_name.empty()) {
+					if (StringUtil::CIEquals(name, drive_name)) {
+						drive_id = JsonString(o, "id");
+					}
+				} else {
+					const int covered = MatchDriveWebUrl(url, JsonString(o, "webUrl"));
+					if (covered > best) {
+						best = covered;
+						drive_id = JsonString(o, "id");
+					}
+				}
+			}
+		}
+		if (drive_id.empty()) {
+			throw InvalidInputException("sharepoint: %s has no document library %s; it has %s", site_what,
+			                            drive_name.empty() ? string("at that address") : "named '" + drive_name + "'",
+			                            names.empty() ? string("none") : names);
+		}
+	} else {
+		auto drive = GraphGetObject(graph_endpoint, token, "/v1.0/sites/" + site_id + "/drive?$select=id",
+		                            "the default document library of " + site_what, string());
+		drive_id = JsonString(drive, "id");
+		if (drive_id.empty()) {
+			throw IOException("sharepoint: the default document library of %s has no id", site_what);
+		}
 	}
 	lock_guard<mutex> guard(g_token_lock);
-	g_site_drives[cache_key] = id.get<string>();
-	return id.get<string>();
+	g_site_drives[cache_key] = drive_id;
+	return drive_id;
 }
 
 struct SignInResult {
@@ -806,7 +896,7 @@ private:
 	shared_ptr<mutex> mint_lock;
 };
 
-AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) {
+AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path, bool require_drive) {
 	const auto match = LookupSecret(opener, path);
 	const auto &secret = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
 
@@ -854,7 +944,8 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 		AuthContext auth;
 		auth.tokens = make_shared_ptr<ChainTokenSource>(credential_fp, login_endpoint, resource, mi_client_id);
 		auth.graph_endpoint = graph_endpoint;
-		auth.drive_id = ResolveDriveId(secret, graph_endpoint, auth.tokens->Token(), credential_fp);
+		auth.drive_id = ResolveDriveId(secret, graph_endpoint, auth.tokens->Token(), credential_fp, require_drive);
+		auth.credential_fp = credential_fp;
 		auth.identity = Fingerprint({credential_fp, graph_endpoint, auth.drive_id});
 		return auth;
 	}
@@ -964,11 +1055,134 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 	AuthContext auth;
 	auth.tokens = tokens;
 	auth.graph_endpoint = graph_endpoint;
-	auth.drive_id = ResolveDriveId(secret, graph_endpoint, token, credential_fp);
+	auth.drive_id = ResolveDriveId(secret, graph_endpoint, token, credential_fp, require_drive);
+	auth.credential_fp = credential_fp;
 	// Keys every per-identity cache downstream (block cache) and the
 	// same-drive check on moves: credentials + cloud + drive.
 	auth.identity = Fingerprint({credential_fp, graph_endpoint, auth.drive_id});
 	return auth;
+}
+
+ResolvedPath ResolveSharepointPath(optional_ptr<FileOpener> opener, const string &path) {
+	ResolvedPath out;
+	if (!IsSharepointWebUrl(path)) {
+		out.auth = GetAuthContext(opener, path);
+		out.path = path;
+		return out;
+	}
+	const auto parsed = ParseSharepointWebUrl(path);
+	if (!parsed.ok) {
+		throw InvalidInputException("sharepoint: '%s': %s", path, parsed.error);
+	}
+	const auto &url = parsed.url;
+	// The secret applies as for any path (its SCOPE may name the site's URL);
+	// its own drive is not needed -- the URL names one.
+	out.auth = GetAuthContext(opener, path, false);
+	const auto &auth = out.auth;
+	const string token = auth.tokens->Token();
+	string drive_id;
+	if (url.kind == WebUrlKind::SHARING) {
+		const string key = Fingerprint({auth.credential_fp, auth.graph_endpoint, url.share_url});
+		string found;
+		{
+			lock_guard<mutex> guard(g_token_lock);
+			auto it = g_shared_items.find(key);
+			if (it != g_shared_items.end()) {
+				found = it->second;
+			}
+		}
+		if (found.empty()) {
+			const string what = "the sharing link '" + path + "'";
+			auto item = GraphGetObject(auth.graph_endpoint, token,
+			                           "/v1.0/shares/" + SharesId(url.share_url) + "/driveItem?$select=id,parentReference",
+			                           what, what + " leads to nothing these credentials can open");
+			string parent_drive;
+			auto parent = item.find("parentReference");
+			if (parent != item.end() && parent->second.is<picojson::object>()) {
+				parent_drive = JsonString(parent->second.get<picojson::object>(), "driveId");
+			}
+			const auto item_id = JsonString(item, "id");
+			if (parent_drive.empty() || item_id.empty()) {
+				throw IOException("sharepoint: %s did not say which file it is", what);
+			}
+			found = parent_drive + "|" + item_id;
+			lock_guard<mutex> guard(g_token_lock);
+			g_shared_items[key] = found;
+		}
+		const auto bar = found.find('|');
+		drive_id = found.substr(0, bar);
+		out.path = string(SHAREPOINT_SCHEME) + "id:" + found.substr(bar + 1);
+	} else {
+		const string key = Fingerprint({auth.credential_fp, auth.graph_endpoint, url.host, StringUtil::Lower(url.site_path)});
+		vector<pair<string, string>> libraries;
+		bool cached = false;
+		{
+			lock_guard<mutex> guard(g_token_lock);
+			auto it = g_site_libraries.find(key);
+			if (it != g_site_libraries.end()) {
+				libraries = it->second;
+				cached = true;
+			}
+		}
+		const string site_url = "https://" + url.host + (url.site_path.empty() ? "" : "/" + url.site_path);
+		if (!cached) {
+			const auto site_id = SiteIdOfUrl(url, site_url, auth.graph_endpoint, token);
+			auto drives = GraphGetObject(auth.graph_endpoint, token,
+			                             "/v1.0/sites/" + site_id + "/drives?$select=id,webUrl",
+			                             "the document libraries of '" + site_url + "'", string());
+			auto values = drives.find("value");
+			if (values != drives.end() && values->second.is<picojson::array>()) {
+				for (auto &d : values->second.get<picojson::array>()) {
+					if (d.is<picojson::object>()) {
+						const auto &o = d.get<picojson::object>();
+						libraries.emplace_back(JsonString(o, "id"), JsonString(o, "webUrl"));
+					}
+				}
+			}
+			lock_guard<mutex> guard(g_token_lock);
+			g_site_libraries[key] = libraries;
+		}
+		int covered = -1;
+		for (auto &library : libraries) {
+			const int n = MatchDriveWebUrl(url, library.second);
+			if (n > covered) {
+				covered = n;
+				drive_id = library.first;
+				out.web_prefix = library.second;
+			}
+		}
+		if (covered < 0) {
+			throw InvalidInputException("sharepoint: '%s' is in no document library of '%s' -- copy the address of a "
+			                            "file or folder in a library (SELECT * FROM sharepoint_drives('%s') lists them)",
+			                            path, site_url, site_url);
+		}
+		while (!out.web_prefix.empty() && out.web_prefix.back() == '/') {
+			out.web_prefix.pop_back();
+		}
+		out.path = SHAREPOINT_SCHEME;
+		for (std::size_t i = static_cast<std::size_t>(covered); i < url.rest.size(); i++) {
+			out.path += (i > static_cast<std::size_t>(covered) ? "/" : "") + url.rest[i];
+		}
+		if (!url.version.empty()) {
+			out.path += "?version=" + url.version;
+		}
+	}
+	out.auth.drive_id = drive_id;
+	// The same formula as GetAuthContext's: the file has one identity whether
+	// it is reached by sharepoint:// or by its browser address.
+	out.auth.identity = Fingerprint({auth.credential_fp, auth.graph_endpoint, drive_id});
+	return out;
+}
+
+string WebPathOf(const ResolvedPath &target, const string &root_relative) {
+	if (target.web_prefix.empty()) {
+		return string(SHAREPOINT_SCHEME) + root_relative;
+	}
+	string out = target.web_prefix;
+	for (auto &segment : StringUtil::Split(root_relative, '/')) {
+		out += "/" + PercentEncodeSegment(segment);
+	}
+	return out;
 }
 
 bool HasAnySharepointSecret(optional_ptr<FileOpener> opener) {

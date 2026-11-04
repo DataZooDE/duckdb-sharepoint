@@ -80,6 +80,12 @@ public:
 	~SharepointFileSystem() override = default;
 
 	bool CanHandleFile(const string &fpath) override;
+	//! True: DuckDB then gives this filesystem the paths it claims even when
+	//! httpfs (which also claims https://) was loaded later -- a SharePoint
+	//! browser URL needs our credentials, not an anonymous GET (#95).
+	bool IsManuallySet() override {
+		return true;
+	}
 	//! sharepoint:// paths are already canonical. The base implementation
 	//! collapses "//" for any scheme missing from DuckDB's hard-coded list of
 	//! remote prefixes, which turned `ATTACH 'sharepoint://a/db.duckdb'` into
