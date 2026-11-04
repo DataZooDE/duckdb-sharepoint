@@ -1,0 +1,12 @@
+{
+  "name": "duckdb-sharepoint",
+  "description": "Skills for the sharepoint DuckDB extension: SharePoint / OneDrive in SQL -- secrets and sign-in, the sharepoint:// filesystem (globs, versions, change feeds, search, library metadata), live Excel workbooks (read and write), and SharePoint lists (typed reads with filter pushdown, writes).",
+  "version": "2026.11.03",
+  "author": {
+    "name": "DataZoo GmbH",
+    "url": "https://github.com/DataZooDE"
+  },
+  "homepage": "https://github.com/DataZooDE/duckdb-sharepoint",
+  "repository": "https://github.com/DataZooDE/duckdb-sharepoint",
+  "license": "MIT"
+}
