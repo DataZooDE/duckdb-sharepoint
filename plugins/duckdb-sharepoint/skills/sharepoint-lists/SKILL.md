@@ -84,5 +84,7 @@ UPDATE sales.Orders SET Status = 'closed' WHERE id = 17;
 DELETE FROM sales.Orders WHERE Status = 'cancelled';
 ```
 Visible lists are tables of schema `main`, typed from their column definitions. Lists are read
-once per ATTACH: after changing columns in SharePoint, DETACH and ATTACH again. No CREATE/ALTER
-of lists, no RETURNING.
+once per ATTACH: after changing columns in SharePoint, DETACH and ATTACH again.
+`CREATE TABLE site.X AS SELECT ...` (or with columns) creates a list: text/number/boolean/DATE
+(date-only)/TIMESTAMP columns, `Title` = the list's own; needs Sites.Manage.All. No DROP/ALTER,
+no RETURNING.

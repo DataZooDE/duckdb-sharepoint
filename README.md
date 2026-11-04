@@ -364,6 +364,7 @@ SELECT * FROM sales.Orders WHERE Status = 'open';                 -- read_sharep
 INSERT INTO sales.Orders (Title, Amount) VALUES ('A-18', 99);
 UPDATE sales.Orders SET Status = 'closed' WHERE id = 17;
 DELETE FROM sales.Orders WHERE Status = 'cancelled';
+CREATE TABLE sales.Forecast AS SELECT month AS Title, units AS Units FROM fc;   -- a new list
 ```
 
 The site's visible lists are the tables of schema `main`, typed from their
@@ -371,8 +372,13 @@ column definitions (a multi-select choice column is `VARCHAR[]`). Reads go
 through `read_sharepoint_list`, filter pushdown included. `INSERT` creates
 items (columns left out keep SharePoint's defaults); `UPDATE` and `DELETE`
 address items by `id`. Lists are read once per `ATTACH`: after changing a
-list's columns in SharePoint, `DETACH` and `ATTACH` again. Creating or
-altering lists, and `RETURNING`, are not supported.
+list's columns in SharePoint, `DETACH` and `ATTACH` again.
+
+`CREATE TABLE` (with or without `AS`) creates a list, one column per column:
+text, number, yes/no, date (from `DATE`) or date-time (from `TIMESTAMP`); a
+column named `Title` is the list's own. Other types are refused. It needs the
+`Sites.Manage.All` permission. `IF NOT EXISTS` keeps a list that is there.
+Dropping or altering lists, and `RETURNING`, are not supported.
 
 ## Installation
 

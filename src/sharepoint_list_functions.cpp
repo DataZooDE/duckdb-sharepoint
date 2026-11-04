@@ -2025,6 +2025,106 @@ unique_ptr<FunctionData> BindListForCatalog(ClientContext &context, const string
 	return std::move(data);
 }
 
+CatalogList CatalogListOf(ClientContext &context, const string &site_id, const string &list_id) {
+	auto target = ResolveList(context, "id:" + list_id, site_id);
+	CatalogList entry;
+	entry.id = list_id;
+	for (auto &col : target.plan) {
+		entry.column_names.push_back(col.name);
+		entry.column_types.push_back(ToLogicalType(col.may_be_multi ? ListColumnType::VARCHAR_LIST : col.type));
+	}
+	return entry;
+}
+
+string CreateListForCatalog(ClientContext &context, const string &site_id, const string &name,
+                            const vector<string> &column_names, const vector<LogicalType> &column_types) {
+	auto opener = ClientData::Get(context).file_opener.get();
+	const auto auth = GetAuthContext(opener, SHAREPOINT_SCHEME);
+	const string what = "a new list '" + name + "'";
+	picojson::array columns;
+	case_insensitive_set_t internal_names;
+	for (idx_t i = 0; i < column_names.size(); i++) {
+		const auto &display = column_names[i];
+		if (StringUtil::CIEquals(display, "Title")) {
+			continue; // every list has Title: the column is that one
+		}
+		for (const char *system : {"id", "created", "modified"}) {
+			if (StringUtil::CIEquals(display, system)) {
+				throw InvalidInputException("sharepoint: %s: a column cannot be named '%s', SharePoint sets it", what,
+				                            display);
+			}
+		}
+		picojson::object col;
+		const auto &type = column_types[i];
+		switch (type.id()) {
+		case LogicalTypeId::VARCHAR:
+			col["text"] = picojson::value(picojson::object());
+			break;
+		case LogicalTypeId::BOOLEAN:
+			col["boolean"] = picojson::value(picojson::object());
+			break;
+		case LogicalTypeId::DATE: {
+			picojson::object dt;
+			dt["format"] = picojson::value("dateOnly");
+			col["dateTime"] = picojson::value(dt);
+			break;
+		}
+		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_TZ:
+		case LogicalTypeId::TIMESTAMP_MS:
+		case LogicalTypeId::TIMESTAMP_SEC:
+		case LogicalTypeId::TIMESTAMP_NS: {
+			picojson::object dt;
+			dt["format"] = picojson::value("dateTime");
+			col["dateTime"] = picojson::value(dt);
+			break;
+		}
+		default:
+			if (!type.IsNumeric()) {
+				throw InvalidInputException("sharepoint: %s: column '%s' is %s; a list column is text, a number, a "
+				                            "boolean, a date or a timestamp",
+				                            what, display, type.ToString());
+			}
+			col["number"] = picojson::value(picojson::object());
+		}
+		// The internal name: letters, digits and '_' (SharePoint's own rule is
+		// stricter than display names); the display name is the column's name.
+		string internal;
+		for (char c : display) {
+			if (isalnum(static_cast<unsigned char>(c)) || c == '_') {
+				internal += c;
+			}
+		}
+		if (internal.empty() || isdigit(static_cast<unsigned char>(internal[0]))) {
+			internal = "c_" + internal;
+		}
+		if (!internal_names.insert(internal).second) {
+			throw InvalidInputException("sharepoint: %s: columns '%s' and another both become '%s' in SharePoint",
+			                            what, display, internal);
+		}
+		col["name"] = picojson::value(internal);
+		col["displayName"] = picojson::value(display);
+		columns.emplace_back(col);
+	}
+	picojson::object list;
+	list["template"] = picojson::value("genericList");
+	picojson::object body;
+	body["displayName"] = picojson::value(name);
+	body["list"] = picojson::value(list);
+	body["columns"] = picojson::value(columns);
+	GraphClient client(auth);
+	picojson::value holder;
+	const auto &created =
+	    AsObject(client.GraphSend("POST", "/v1.0/sites/" + site_id + "/lists", picojson::value(body).serialize(), what,
+	                              false),
+	             what, holder);
+	auto id = StringField(created, "id");
+	if (id.empty()) {
+		throw IOException("sharepoint: creating %s gave no list id", what);
+	}
+	return id;
+}
+
 vector<CatalogList> ListCatalogLists(ClientContext &context, const string &site, string &site_id) {
 	auto opener = ClientData::Get(context).file_opener.get();
 	const auto auth = GetAuthContext(opener, SHAREPOINT_SCHEME);

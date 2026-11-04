@@ -946,6 +946,16 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - 1.5 / 2.0: the catalog API is the same but for names (`string` vs
   `Identifier`: `FunctionName`, `SetQualifiedName` via SFINAE), a few pure
   virtuals (no `override`), and `Expression::GetReturnType()`.
+- CREATE TABLE (#97): `SharepointSchema::CreateList` POSTs a generic list
+  (`CreateListForCatalog`: VARCHAR text, numbers number, BOOLEAN boolean,
+  DATE dateOnly, TIMESTAMP dateTime; `Title` is the list's own; the internal
+  name keeps letters, digits and `_`, the display name is the column name),
+  then builds the catalog entry from the new list's own column plan
+  (`CatalogListOf`), so the scan's column check sees what a fresh ATTACH
+  would. CREATE TABLE AS is `PlanCreateTableAs` -> the INSERT operator with a
+  `CreateTarget`: the list is created when the operator's sink state is made,
+  as DuckDB's postgres scanner does it, then the rows stream through the
+  item writer. `OR REPLACE` is refused (it would mean deleting a list).
 - Transactions: none -- each statement goes straight to Graph.
 
 ## 18. Planner and To Do (#68)
