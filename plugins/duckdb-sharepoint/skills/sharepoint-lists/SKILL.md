@@ -65,6 +65,13 @@ The list's columns plus `_change`: `'upsert'`, `'delete'` (only `id` set) or `'c
 the one checkpoint row carries the `token` to store for next time (as `sharepoint_changes`
 does for files).
 
+## OneNote pages
+```sql
+SELECT notebook, section, title, created, modified, web_url FROM read_onenote_pages(notebook := 'Projects');
+```
+`site :=` (default the secret's site), `notebook :=`, `section :=`. No delta: `WHERE modified > ts`.
+Delegated sign-in with Notes.Read in GRAPH_SCOPE (app-only OneNote access is restricted).
+
 ## Planner and To Do tasks
 ```sql
 SELECT bucket, title, status, due, assigned_to FROM read_planner_tasks('<plan id>');

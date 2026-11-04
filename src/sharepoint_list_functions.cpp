@@ -13,6 +13,7 @@
 #include "sharepoint_delta.hpp"
 #include "sharepoint_list.hpp"
 #include "sharepoint_uri.hpp"
+#include "sharepoint_weburl.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
@@ -363,30 +364,51 @@ struct ListBindData : public TableFunctionData {
 };
 
 //! The Graph site id ("host,siteGuid,webGuid") for `site`: the secret's own
-//! site (that of its drive) when empty; else an id as given, a server-relative
+//! site (that of its drive) when empty; else an id as given, a browser URL
+//! ("https://contoso.sharepoint.com/sites/Sales", #95), a server-relative
 //! path on the same host ("Sales", "sites/Sales", "teams/Ops"), or
 //! "host:/sites/Sales".
 string ResolveSite(GraphClient &client, const AuthContext &auth, const string &site) {
 	if (site.find(',') != string::npos) {
 		return site;
 	}
-	picojson::value holder;
-	const auto &library = AsObject(
-	    client.GraphGet("/v1.0/drives/" + auth.drive_id + "/list?$select=parentReference", "the secret's site"),
-	    "the secret's site", holder);
-	string own_site;
-	auto parent = library.find("parentReference");
-	if (parent != library.end() && parent->second.is<picojson::object>()) {
-		own_site = StringField(parent->second.get<picojson::object>(), "siteId");
-	}
-	if (own_site.empty()) {
-		throw IOException("sharepoint: could not tell which site the secret's drive belongs to");
-	}
+	auto own_site = [&]() {
+		if (auth.drive_id.empty()) {
+			throw InvalidInputException("sharepoint: name the site (its address from the browser, e.g. "
+			                            "'https://contoso.sharepoint.com/sites/Sales'): the secret names no drive "
+			                            "to take it from");
+		}
+		picojson::value holder;
+		const auto &library = AsObject(
+		    client.GraphGet("/v1.0/drives/" + auth.drive_id + "/list?$select=parentReference", "the secret's site"),
+		    "the secret's site", holder);
+		string id;
+		auto parent = library.find("parentReference");
+		if (parent != library.end() && parent->second.is<picojson::object>()) {
+			id = StringField(parent->second.get<picojson::object>(), "siteId");
+		}
+		if (id.empty()) {
+			throw IOException("sharepoint: could not tell which site the secret's drive belongs to");
+		}
+		return id;
+	};
 	if (site.empty()) {
-		return own_site;
+		return own_site();
 	}
 	string address = site;
-	if (site.find(':') == string::npos) {
+	if (IsSharepointWebUrl(site)) {
+		const auto parsed = ParseSharepointWebUrl(site);
+		if (!parsed.ok || parsed.url.kind != WebUrlKind::DIRECT) {
+			throw InvalidInputException("sharepoint: '%s' is not a site address", site);
+		}
+		address = parsed.url.host;
+		if (!parsed.url.site_path.empty()) {
+			address += ":";
+			for (auto &segment : StringUtil::Split(parsed.url.site_path, '/')) {
+				address += "/" + PercentEncodeSegment(segment);
+			}
+		}
+	} else if (site.find(':') == string::npos) {
 		// Same host as the secret's site; a bare name means /sites/<name>.
 		string relative = site;
 		while (!relative.empty() && relative[0] == '/') {
@@ -395,7 +417,8 @@ string ResolveSite(GraphClient &client, const AuthContext &auth, const string &s
 		if (relative.find('/') == string::npos) {
 			relative = "sites/" + relative;
 		}
-		address = own_site.substr(0, own_site.find(',')) + ":/" + relative;
+		const auto own = own_site();
+		address = own.substr(0, own.find(',')) + ":/" + relative;
 	}
 	const string what = "site '" + site + "'";
 	picojson::value site_holder;
@@ -434,7 +457,8 @@ ListTarget ResolveList(ClientContext &context, const string &list, const string 
 	// Lists hang off a site, not a path: the secret in scope for the drive
 	// root is the one used.
 	auto opener = ClientData::Get(context).file_opener.get();
-	t.auth = GetAuthContext(opener, SHAREPOINT_SCHEME);
+	// A named site needs no drive in the secret (#95); the secret's own site does.
+	t.auth = GetAuthContext(opener, SHAREPOINT_SCHEME, site.empty());
 	GraphClient client(t.auth);
 	t.site_id = ResolveSite(client, t.auth, site);
 
@@ -1386,7 +1410,8 @@ const vector<std::pair<string, LogicalType>> &FileColumns() {
 	    {"modified", LogicalType::TIMESTAMP},    {"created_by", LogicalType::VARCHAR},
 	    {"created_by_email", LogicalType::VARCHAR}, {"modified_by", LogicalType::VARCHAR},
 	    {"modified_by_email", LogicalType::VARCHAR}, {"content_type", LogicalType::VARCHAR},
-	    {"id", LogicalType::VARCHAR},            {"web_url", LogicalType::VARCHAR}};
+	    {"id", LogicalType::VARCHAR},            {"web_url", LogicalType::VARCHAR},
+	    {"checked_out_by", LogicalType::VARCHAR}, {"checked_out_by_email", LogicalType::VARCHAR}};
 	return columns;
 }
 
@@ -1516,7 +1541,7 @@ unique_ptr<FunctionData> FilesBind(ClientContext &context, TableFunctionBindInpu
 			}
 		}
 		const string query = "?$select=id,name,size,createdDateTime,lastModifiedDateTime,createdBy,lastModifiedBy,"
-		                     "file,folder,webUrl&$expand=listItem($select=id;$expand=fields" +
+		                     "file,folder,webUrl,publication&$expand=listItem($select=id;$expand=fields" +
 		                     (select.empty() ? string() : "($select=" + select + ")") + ")";
 		vector<std::pair<string, picojson::object>> items; // path, driveItem
 		for (idx_t start = 0; start < matches.size(); start += kFilesPerBatch) {
@@ -1645,6 +1670,14 @@ unique_ptr<FunctionData> FilesBind(ClientContext &context, TableFunctionBindInpu
 			auto size = item.find("size");
 			const auto created_by = Who(item, "createdBy");
 			const auto modified_by = Who(item, "lastModifiedBy");
+			// Checked out (#98): the publication facet, returned only when
+			// selected; its checkedOutBy only while level is "checkout".
+			std::pair<Value, Value> checked_out_by {Value(LogicalType::VARCHAR), Value(LogicalType::VARCHAR)};
+			auto publication = item.find("publication");
+			if (publication != item.end() && publication->second.is<picojson::object>() &&
+			    StringField(publication->second.get<picojson::object>(), "level") == "checkout") {
+				checked_out_by = Who(publication->second.get<picojson::object>(), "checkedOutBy");
+			}
 			vector<Value> row = {Value(items[r].first),
 			                     Value(StringField(item, "name")),
 			                     size != item.end() && size->second.is<int64_t>()
@@ -1658,7 +1691,9 @@ unique_ptr<FunctionData> FilesBind(ClientContext &context, TableFunctionBindInpu
 			                     modified_by.second,
 			                     mime.empty() ? Value(LogicalType::VARCHAR) : Value(mime),
 			                     Value(StringField(item, "id")),
-			                     Value(StringField(item, "webUrl"))};
+			                     Value(StringField(item, "webUrl")),
+			                     checked_out_by.first,
+			                     checked_out_by.second};
 			for (idx_t c = 0; c < plan.size(); c++) {
 				auto value = custom[r][c];
 				if (value.IsNull() && (plan[c].person == ListPersonPart::NAME || plan[c].person == ListPersonPart::EMAIL)) {
@@ -1937,6 +1972,10 @@ void ListChangesScan(ClientContext &, TableFunctionInput &input, DataChunk &outp
 }
 
 } // namespace
+
+string ResolveSiteId(GraphClient &client, const AuthContext &auth, const string &site) {
+	return ResolveSite(client, auth, site);
+}
 
 struct ListItemWriter::State {
 	ListWriteGlobalState g;

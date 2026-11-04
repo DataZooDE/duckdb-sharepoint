@@ -25,3 +25,19 @@ statement error
 SELECT * FROM sharepoint_changes('sharepoint://x', token := 'a/b?c');
 ----
 not a token sharepoint_changes returned
+
+# sharepoint_permissions (#98): registered; a path is checked before any secret.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'sharepoint_permissions';
+----
+1
+
+statement error
+SELECT * FROM sharepoint_permissions(NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM sharepoint_permissions('sharepoint://Finance/x.csv');
+----
+no `sharepoint` secret configured

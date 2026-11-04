@@ -8,6 +8,9 @@ class ExtensionLoader;
 
 namespace sharepoint {
 
+class GraphClient;
+struct AuthContext;
+
 //! Registers read_sharepoint_list(list, site := ...): a SharePoint list as a
 //! table through Microsoft Graph, over the same secret as sharepoint://. See
 //! docs/hld.md §10.
@@ -27,6 +30,11 @@ struct CatalogList {
 //! The site's visible lists ("" = the secret's own site), with their columns:
 //! one Graph call per page of lists ($expand=columns). Also the site's id.
 vector<CatalogList> ListCatalogLists(ClientContext &context, const string &site, string &site_id);
+
+//! The Graph site id for `site` as read_sharepoint_list's site := takes it:
+//! empty (the secret's own site), a browser URL, "Sales", "sites/Sales",
+//! "host:/sites/Sales", or a site id.
+string ResolveSiteId(GraphClient &client, const AuthContext &auth, const string &site);
 
 //! read_sharepoint_list's table function (scan, filter and projection
 //! pushdown), for a catalog table's GetScanFunction.

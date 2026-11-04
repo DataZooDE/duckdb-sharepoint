@@ -60,11 +60,14 @@ CREATE SECRET sp (
     PROVIDER device_code,
     TENANT_ID 'contoso.onmicrosoft.com',
     CLIENT_ID '11111111-1111-1111-1111-111111111111',   -- an Entra app, see Authentication
-    DRIVE_ID  'b!AbCdEf...'                             -- or SITE_ID 'contoso.sharepoint.com,<siteId>,<webId>'
+    SITE_URL  'https://contoso.sharepoint.com/sites/Sales'   -- the site's address from the browser
 );
 
--- A Parquet file in the document library
+-- A Parquet file in the site's document library
 SELECT count(*) FROM 'sharepoint://Finance/2026/actuals.parquet';
+
+-- Or paste an address straight from the browser, or a sharing link
+SELECT * FROM read_csv('https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/Finance/q4.csv');
 
 -- The "Sales" table of an Excel workbook, as it is right now
 SELECT region, sum(revenue) FROM read_excel_table('Finance/plan.xlsx', 'Sales') GROUP BY ALL;
@@ -74,7 +77,10 @@ SELECT Status, count(*) FROM read_sharepoint_list('Orders') GROUP BY ALL;
 ```
 
 For unattended jobs, use `PROVIDER client_credentials` with an app secret.
-[Authentication](#authentication) covers both.
+[Authentication](#authentication) covers both. Not sure of the site's address,
+or want another library than the default? `SELECT * FROM sharepoint_sites()`
+lists the sites you can reach and `sharepoint_drives('<site address>')` their
+libraries ([Finding sites and libraries](#finding-sites-and-libraries)).
 
 ## Claude Code plugin
 
@@ -163,6 +169,23 @@ SELECT write_blob('sharepoint://notes/readme.md', '# Title'::BLOB);
 SELECT remove_file('sharepoint://notes/readme.md');   -- true, then false
 ```
 
+**Browser addresses and sharing links.** A file's or folder's address as the
+browser shows it works wherever a path does. It names its own site and
+library, whatever the secret's: reads, writes and globs go there, and a glob
+returns browser addresses again. A sharing link (*Copy link*, `/:x:/s/...`)
+names one existing file: it can be read, not written.
+
+```sql
+SELECT * FROM read_parquet('https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/2026/*.parquet');
+COPY t TO 'https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/out/t.csv';
+SELECT * FROM read_csv('https://contoso.sharepoint.com/:x:/s/Sales/EabCdEf123?e=XyZ');
+SELECT * FROM read_excel_table('https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/plan.xlsx', 'Sales');
+```
+
+These addresses are handled by this extension even when `httpfs` is loaded,
+which would otherwise try them without credentials. `read_sharepoint_files`
+and `sharepoint_changes` take `sharepoint://` paths only.
+
 **What changed since last time.** `sharepoint_changes` reads Graph's delta
 for a folder: one row per file or folder added or changed (`_change =
 'upsert'`) or deleted (`'delete'`, by `id`; a delete may come without its
@@ -177,7 +200,35 @@ SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := (SELECT token
 ```
 
 Without a token it lists everything under the folder once. An expired token
-says so; start over without one.
+says so; start over without one. Each row also says who made the change
+(`modified_by`, `modified_by_email`: a user, or an app by name).
+
+**Keeping a mirror.** A table of a folder's files, kept current from the
+change feed, with the token stored beside it. Here in DuckLake, so earlier
+states stay queryable:
+
+```sql
+-- Once:
+ATTACH 'ducklake:mirror.ducklake' AS lake (DATA_PATH 'mirror/');
+-- The token first, then the listing: a change in between shows up twice, not never.
+CREATE TABLE lake.sync AS
+    SELECT token FROM sharepoint_changes('sharepoint://Finance/', token := 'latest') WHERE _change = 'checkpoint';
+CREATE TABLE lake.files AS
+    SELECT id, path, name, size, modified, modified_by FROM read_sharepoint_files('sharepoint://Finance/**');
+
+-- Each run (e.g. from cron):
+SET VARIABLE t = (SELECT token FROM lake.sync);           -- table functions take no subqueries
+CREATE TEMP TABLE c AS SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := getvariable('t'));
+DELETE FROM lake.files WHERE id IN (SELECT id FROM c WHERE _change <> 'checkpoint');
+INSERT INTO lake.files
+    SELECT id, path, name, size, modified, modified_by FROM c WHERE _change = 'upsert' AND NOT is_folder;
+UPDATE lake.sync SET token = (SELECT token FROM c WHERE _change = 'checkpoint');
+```
+
+Running it again is harmless: each run applies what changed since the last.
+For a list, `sharepoint_list_changes` works the same way; or pull what
+changed since a time with `WHERE modified > TIMESTAMP '…'`, which goes to
+SharePoint as a filter when the list's *Modified* column is indexed.
 
 
 **Earlier versions.** SharePoint keeps a file's version history, and
@@ -189,6 +240,23 @@ SELECT version, current, modified, modified_by, size, path
 FROM sharepoint_versions('sharepoint://Finance/actuals.parquet');
 SELECT * FROM read_parquet('sharepoint://Finance/actuals.parquet?version=3.0');
 ```
+
+**Who can see it.** `sharepoint_permissions` lists, for a file or folder or
+the files a glob matches, one row per grantee: the `roles`, how it was
+granted (`direct`, `inherited`, or a sharing `link`), the user, group or app,
+and for a link its type and scope (`anonymous`, `organization`, `users`). For
+audits such as "what is shared with anyone":
+
+```sql
+SELECT path, link_scope, link_url, expires
+FROM sharepoint_permissions('sharepoint://Finance/**')
+WHERE granted_by = 'link' AND link_scope = 'anonymous';
+```
+
+As Graph reports them: the site's own groups appear as `direct` grants on
+each item that inherits them (Graph's listing has no `inheritedFrom` for
+them), and a link's `link_url` can be NULL (Graph's listing may leave out
+the address).
 
 `write_blob`, `remove_file`, `move_file` and `file_size` don't depend on the
 scheme, so they work for any filesystem DuckDB can reach (`s3://`, `gs://`,
@@ -320,7 +388,7 @@ FROM read_sharepoint_files('sharepoint://Finance/**/*.xlsx');
 
 One row per file the path or glob matches (the same glob syntax as
 `sharepoint://`): `path`, `name`, `size`, `created`, `modified`, `created_by`,
-`modified_by` (and their `_email`), `content_type`, `id` and `web_url`, then
+`modified_by` (and their `_email`), `content_type`, `id`, `web_url` and `checked_out_by` (and its `_email`; NULL unless checked out), then
 the library's own metadata columns, typed as `read_sharepoint_list` types a
 list's.
 
@@ -342,6 +410,21 @@ reads straight back. App-only search must name the tenant's region; the
 extension finds it on the first search, or takes `region := 'EUR'`.
 `max_results` (default 500) caps the rows. Search indexes new content with a
 delay of minutes.
+
+## OneNote pages
+
+```sql
+SELECT notebook, section, title, created, modified, web_url
+FROM read_onenote_pages(site := 'https://contoso.sharepoint.com/sites/Sales', notebook := 'Projects');
+SELECT title FROM read_onenote_pages(notebook := 'Projects', section := 'Q4') WHERE modified > TIMESTAMP '2026-11-01';
+```
+
+The filesystem sees a notebook as a folder and each section as one `.one`
+file, so it can tell which section changed but not which page; this lists
+pages. OneNote has no delta: track with `WHERE modified > <last run>`.
+Microsoft restricts app-only access to the OneNote API, so sign in as a user
+(`device_code` / `authorization_code`) and add `Notes.Read` to `GRAPH_SCOPE`;
+an app-only refusal says so.
 
 ## Planner and To Do tasks
 
@@ -425,8 +508,16 @@ LOAD sharepoint;
 | `config` | a token you already have | `ACCESS_TOKEN` *(or `REFRESH_TOKEN` + `TENANT_ID`/`CLIENT_ID`, + `CLIENT_SECRET` for a confidential client)* |
 
 **Common to all providers:**
-- `DRIVE_ID` **or** `SITE_ID`: the document library paths hang off. A
-  `SITE_ID` resolves to the site's default library, once.
+- Where `sharepoint://` paths hang off, one of:
+  - `SITE_URL`: the site's address from the browser
+    (`'https://contoso.sharepoint.com/sites/Sales'`); its default document
+    library, or the one named `DRIVE` (`DRIVE 'Reports'`). A library's own
+    address (`.../sites/Sales/Shared%20Documents`) picks that library.
+  - `DRIVE_ID` (`b!...`) or `SITE_ID` (Graph ids), as returned by
+    `sharepoint_drives()` / `sharepoint_sites()`.
+
+  Each is resolved once and cached. A secret may name none of them: browser
+  addresses, `site :=` and the discovery functions don't need one.
 - Optional `GRAPH_SCOPE`, which defaults to `<graph endpoint>/.default`, i.e.
   the right cloud.
 
@@ -443,7 +534,7 @@ lists need `Sites.ReadWrite.All`:
 ```sql
 CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,
     TENANT_ID '00000000-0000-0000-0000-000000000000', CLIENT_ID '...', CLIENT_SECRET '...',
-    DRIVE_ID 'b!AbCdEf...');
+    SITE_URL 'https://contoso.sharepoint.com/sites/Sales');
 ```
 
 **With a certificate.** Microsoft recommends certificates over client
@@ -552,7 +643,20 @@ authenticates afresh.
 applications → your app*): **Application (client) ID** is `CLIENT_ID`, and
 **Directory (tenant) ID** is `TENANT_ID` (a verified domain such as
 `contoso.onmicrosoft.com` works too). The *Object ID* is not used. `DRIVE_ID`
-and `SITE_ID` are SharePoint's, not Entra's.
+and `SITE_ID` are SharePoint's, not Entra's; `SITE_URL` avoids both.
+
+### Finding sites and libraries
+
+```sql
+SELECT name, web_url FROM sharepoint_sites();                       -- every site you can reach
+SELECT name, web_url FROM sharepoint_sites(search := 'Sales');
+SELECT name, web_url, id FROM sharepoint_drives('https://contoso.sharepoint.com/sites/Sales');
+SELECT * FROM sharepoint_drives();                                  -- the secret's site
+```
+
+`web_url` is what `SITE_URL` and browser paths take, `name` is `DRIVE`, `id`
+is `DRIVE_ID`. Both functions work with a secret that names no site yet.
+App-only, `sharepoint_sites()` needs `Sites.Read.All` (or `Sites.ReadWrite.All`).
 
 **When a sign-in fails**, Entra's error code says what to fix:
 
