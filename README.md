@@ -5,6 +5,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="https://duckdb.org"><img src="https://img.shields.io/badge/DuckDB-1.5.6%20%7C%202.0-green.svg" alt="DuckDB 1.5.6 | 2.0"></a>
   <a href="https://duckdb.org/community_extensions/extensions/sharepoint"><img src="https://img.shields.io/badge/DuckDB-community%20extension-yellow.svg" alt="DuckDB community extension"></a>
+  <a href="#claude-code-plugin"><img src="https://img.shields.io/badge/Claude_Code-AI_skills_plugin-8A2BE2.svg" alt="Claude Code AI skills plugin"></a>
   <a href="https://github.com/DataZooDE/duckdb-sharepoint/actions/workflows/MainDistributionPipeline.yml"><img src="https://github.com/DataZooDE/duckdb-sharepoint/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=main" alt="Build"></a>
 </p>
 
@@ -30,16 +31,22 @@ One install, one secret, and app-only or user sign-in. Built for DuckDB
 **v1.5.6** and **2.0**, by [DataZoo](https://data-zoo.de), and the sibling of
 [duckdb-gdrive](https://github.com/DataZooDE/duckdb-gdrive) for Google Drive.
 
+> **🤖 Built for AI pair-programming.** The repository ships a
+> **[Claude Code plugin](#claude-code-plugin)**: four skills that teach Claude
+> Code this extension's SQL API, from `CREATE SECRET` to Excel and list
+> write-back. Install with `/plugin marketplace add DataZooDE/duckdb-sharepoint`
+> → `/plugin install duckdb-sharepoint@duckdb-sharepoint`.
+
 ## Contents
 
-- [Quick start](#quick-start)
+- [Quick start](#quick-start) · [Claude Code plugin](#claude-code-plugin)
 - [Examples](#examples): forecasting, regression, data quality, lead scoring
 - [Files: `sharepoint://`](#files-sharepoint)
 - [Excel workbooks](#excel-workbooks)
 - [SharePoint lists](#sharepoint-lists)
 - [Installation](#installation) · [Authentication](#authentication) · [Settings](#settings) · [Diagnostics](#diagnostics) · [Limitations](#limitations)
 - [Network and privacy](#network-and-privacy) · [How it works](#how-it-works) · [Building and testing](#building-and-testing)
-- [Claude Code plugin](#claude-code-plugin) · [Support and feedback](#support-and-feedback) · [License](#license) · [Citation](#citation)
+- [Support and feedback](#support-and-feedback) · [License](#license) · [Citation](#citation)
 
 ## Quick start
 
@@ -68,6 +75,41 @@ SELECT Status, count(*) FROM read_sharepoint_list('Orders') GROUP BY ALL;
 
 For unattended jobs, use `PROVIDER client_credentials` with an app secret.
 [Authentication](#authentication) covers both.
+
+## Claude Code plugin
+
+The repository ships a [Claude Code](https://claude.com/claude-code) plugin with four skills
+that document this extension's SQL API, so Claude Code can write queries against SharePoint
+from a plain request such as *"read the Orders list, open orders only, and write a forecast
+back into the Sales workbook"*.
+
+### Install
+
+In any Claude Code session (the plugin is documentation only; DuckDB still
+needs `INSTALL sharepoint FROM community`):
+
+```
+/plugin marketplace add DataZooDE/duckdb-sharepoint
+/plugin install duckdb-sharepoint@duckdb-sharepoint
+```
+
+Restart Claude Code and the skills are active. You don't call
+them yourself: Claude loads the matching skill when a request is about SharePoint, OneDrive,
+Excel workbooks or SharePoint lists in DuckDB. `/plugin` lists what is installed. To get the
+skills of a newer release, run `/plugin marketplace update duckdb-sharepoint`.
+
+### Skills
+
+| Skill | Covers |
+|---|---|
+| `sharepoint-setup` | INSTALL/LOAD, `CREATE SECRET` for every provider (client secret, certificate, device code, browser sign-in, token), Graph permissions incl. Sites.Selected, settings, sign-in and permission errors |
+| `sharepoint-files` | the `sharepoint://` filesystem and globs, COPY/ATTACH/DuckLake, `write_blob` and friends, `read_sharepoint_files`, `?version=` and `sharepoint_versions`, `sharepoint_changes`, `search_sharepoint` |
+| `sharepoint-excel` | `read_excel_table`, `read_excel_range`, type inference, writing back with `COPY … (FORMAT excel_table / excel_range)` and `OVERWRITE` |
+| `sharepoint-lists` | `read_sharepoint_list`, column types (lookups, people, dates), filter pushdown on indexed columns, `COPY … (FORMAT sharepoint_list)` |
+
+The skills live in [`plugins/duckdb-sharepoint/`](plugins/duckdb-sharepoint/). To use a local
+checkout instead of the marketplace, start Claude Code with
+`claude --plugin-dir ./plugins/duckdb-sharepoint`.
 
 ## Examples
 
@@ -555,29 +597,6 @@ root. The subshell keeps the token out of your shell:
 It prints only SHA-256 fingerprints of the old and rotated tokens. If it
 reports `invalid_grant`, sign in again with `make delegated_login` and update
 the secret. Details: [docs/hld.md §5.2](docs/hld.md).
-
-## Claude Code plugin
-
-The repository ships a [Claude Code](https://claude.com/claude-code) plugin with four skills
-that document this extension's SQL API, so Claude Code can write queries against SharePoint
-from a plain request such as *"read the Orders list, open orders only, and write a forecast
-back into the Sales workbook"*.
-
-```
-/plugin marketplace add DataZooDE/duckdb-sharepoint
-/plugin install duckdb-sharepoint@duckdb-sharepoint
-```
-
-| Skill | Covers |
-|---|---|
-| `sharepoint-setup` | INSTALL/LOAD, `CREATE SECRET` for every provider (client secret, certificate, device code, browser sign-in, token), Graph permissions incl. Sites.Selected, settings, sign-in and permission errors |
-| `sharepoint-files` | the `sharepoint://` filesystem and globs, COPY/ATTACH/DuckLake, `write_blob` and friends, `read_sharepoint_files`, `?version=` and `sharepoint_versions`, `sharepoint_changes`, `search_sharepoint` |
-| `sharepoint-excel` | `read_excel_table`, `read_excel_range`, type inference, writing back with `COPY … (FORMAT excel_table / excel_range)` and `OVERWRITE` |
-| `sharepoint-lists` | `read_sharepoint_list`, column types (lookups, people, dates), filter pushdown on indexed columns, `COPY … (FORMAT sharepoint_list)` |
-
-The skills live in [`plugins/duckdb-sharepoint/`](plugins/duckdb-sharepoint/). To use a local
-checkout instead of the marketplace, start Claude Code with
-`claude --plugin-dir ./plugins/duckdb-sharepoint`.
 
 ## Support and feedback
 
