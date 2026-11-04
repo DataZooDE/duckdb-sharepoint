@@ -884,6 +884,7 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   token (410 `resyncRequired`) is an error telling to start over.
 - Lists (`/sites/{s}/lists/{l}/items/delta`) are not done yet: they build on
   the list column plan of #79–#82.
+
 ## 16. `PROVIDER credential_chain` (#72)
 
 - Order as `DefaultAzureCredential`: workload identity (the federated token
