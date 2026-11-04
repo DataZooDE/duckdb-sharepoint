@@ -6,6 +6,7 @@
 #include "sharepoint_uri.hpp"
 #include "sharepoint_counters.hpp"
 #include "sharepoint_glob.hpp"
+#include "sharepoint_weburl.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/error_data.hpp"
@@ -256,15 +257,16 @@ void SharepointFileSystem::InvalidateMeta(const string &key) {
 }
 
 bool SharepointFileSystem::CanHandleFile(const string &fpath) {
-	return IsSharepointUri(fpath);
+	return IsSharepointUri(fpath) || IsSharepointWebUrl(fpath);
 }
 
 unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOpenFlags flags,
                                                       optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
-		auto uri = ParseOrThrow(path);
 		auto context = RequireOpener(opener, "open");
-		auto auth = GetAuthContext(context, path);
+		auto target = ResolveSharepointPath(context, path);
+		auto uri = ParseOrThrow(target.path);
+		auto &auth = target.auth;
 
 		if (flags.OpenForAppending()) {
 			// Graph replaces whole files; "append" would silently drop the existing
@@ -277,6 +279,11 @@ unique_ptr<FileHandle> SharepointFileSystem::OpenFile(const string &path, FileOp
 				throw IOException("sharepoint: '%s' is an earlier version, which is read-only", path);
 			}
 			if (uri.kind != SharepointUriKind::PATH) {
+				if (IsSharepointWebUrl(path)) {
+					throw IOException("sharepoint: '%s' is a sharing link, which names one existing file; to write, "
+					                  "use the folder's address from the browser or a sharepoint:// path",
+					                  path);
+				}
 				throw IOException("sharepoint: writing addresses a path, not an id: form ('%s')", path);
 			}
 			CheckCreatableNames(uri, path);
@@ -478,12 +485,15 @@ bool SharepointFileSystem::FileExists(const string &filename, optional_ptr<FileO
 	if (!HasAnySharepointSecret(opener)) {
 		return false;
 	}
-	auto parsed = ParseSharepointUri(filename);
+	if (!IsSharepointWebUrl(filename) && !ParseSharepointUri(filename).ok) {
+		return false;
+	}
+	auto target = ResolveSharepointPath(opener, filename);
+	auto parsed = ParseSharepointUri(target.path);
 	if (!parsed.ok) {
 		return false;
 	}
-	auto auth = GetAuthContext(opener, filename);
-	GraphClient client(auth);
+	GraphClient client(target.auth);
 	auto meta = StatUri(client, parsed.uri);
 	return meta.found && !meta.is_folder;
 }
@@ -492,26 +502,29 @@ bool SharepointFileSystem::DirectoryExists(const string &directory, optional_ptr
 	if (!HasAnySharepointSecret(opener)) {
 		return false;
 	}
-	auto parsed = ParseSharepointUri(directory);
+	if (!IsSharepointWebUrl(directory) && !ParseSharepointUri(directory).ok) {
+		return false;
+	}
+	auto target = ResolveSharepointPath(opener, directory);
+	auto parsed = ParseSharepointUri(target.path);
 	if (!parsed.ok || parsed.uri.kind == SharepointUriKind::FILE_ID) {
 		return false;
 	}
 	if (parsed.uri.RootRelativePath().empty()) {
 		return true; // the drive root always exists
 	}
-	auto auth = GetAuthContext(opener, directory);
-	GraphClient client(auth);
+	GraphClient client(target.auth);
 	auto meta = client.StatByPath(parsed.uri.RootRelativePath());
 	return meta.found && meta.is_folder;
 }
 
 void SharepointFileSystem::CreateDirectory(const string &directory, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
-		auto uri = ParseForChange(directory);
-		CheckCreatableNames(uri, directory);
 		auto context = RequireOpener(opener, "create directory");
-		auto auth = GetAuthContext(context, directory);
-		GraphClient(auth).CreateFolder(uri.RootRelativePath());
+		auto target = ResolveSharepointPath(context, directory);
+		auto uri = ParseForChange(target.path);
+		CheckCreatableNames(uri, directory);
+		GraphClient(target.auth).CreateFolder(uri.RootRelativePath());
 	});
 }
 
@@ -519,14 +532,15 @@ void SharepointFileSystem::RemoveDirectory(const string &directory, optional_ptr
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		// A directory is a driveItem too; resolve and delete it (recursively, as
 		// Graph deletes a folder and its contents).
-		auto uri = ParseForChange(directory);
 		auto context = RequireOpener(opener, "remove directory");
+		auto target = ResolveSharepointPath(context, directory);
+		auto uri = ParseForChange(target.path);
 		if (uri.kind != SharepointUriKind::PATH || IsDriveRoot(uri)) {
 			// The empty path is the drive root: a recursive delete of the whole
 			// library is never what `remove directory` on a URI typo should do.
 			throw IOException("sharepoint: refusing to remove '%s' (the drive root, or not a folder path)", directory);
 		}
-		auto auth = GetAuthContext(context, directory);
+		auto &auth = target.auth;
 		GraphClient client(auth);
 		auto meta = client.StatByPath(uri.RootRelativePath());
 		if (!meta.found) {
@@ -544,11 +558,11 @@ bool SharepointFileSystem::ListFiles(const string &directory,
                                      const std::function<void(const string &, bool)> &callback,
                                      FileOpener *opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
-		auto uri = ParseOrThrow(directory);
 		auto context = RequireOpener(opener, "list files");
-		auto auth = GetAuthContext(context, directory);
+		auto target = ResolveSharepointPath(context, directory);
+		auto uri = ParseOrThrow(target.path);
 		bool found = false;
-		auto children = GraphClient(auth).ListChildren(uri.RootRelativePath(), &found);
+		auto children = GraphClient(target.auth).ListChildren(uri.RootRelativePath(), &found);
 		for (auto &c : children) {
 			callback(c.name, c.is_folder);
 		}
@@ -559,19 +573,20 @@ bool SharepointFileSystem::ListFiles(const string &directory,
 
 void SharepointFileSystem::MoveFile(const string &source, const string &target, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
-		auto src = ParseForChange(source);
-		auto dst = ParseForChange(target);
+		auto context = RequireOpener(opener, "move");
+		auto source_target = ResolveSharepointPath(context, source);
+		auto target_target = ResolveSharepointPath(context, target);
+		auto src = ParseForChange(source_target.path);
+		auto dst = ParseForChange(target_target.path);
 		if (src.kind != SharepointUriKind::PATH || dst.kind != SharepointUriKind::PATH) {
 			throw IOException("sharepoint: move addresses paths on both sides, not id: forms");
 		}
 		CheckCreatableNames(dst, target);
-		auto context = RequireOpener(opener, "move");
-		auto auth = GetAuthContext(context, source);
+		auto &auth = source_target.auth;
 		// The target may fall under a different secret (scoped secrets) and hence a
 		// different drive. Graph moves within one drive here; silently moving into
 		// the SOURCE's drive instead would put the file somewhere nobody asked for.
-		auto target_auth = GetAuthContext(context, target);
-		if (target_auth.identity != auth.identity) {
+		if (target_target.auth.identity != auth.identity) {
 			throw IOException("sharepoint: cannot move '%s' to '%s': they resolve to different secrets or drives",
 			                  source, target);
 		}
@@ -594,12 +609,13 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 
 void SharepointFileSystem::RemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
-		auto uri = ParseForChange(filename);
+		auto context = RequireOpener(opener, "remove");
+		auto target = ResolveSharepointPath(context, filename);
+		auto uri = ParseForChange(target.path);
 		if (IsDriveRoot(uri)) {
 			throw IOException("sharepoint: refusing to remove '%s': it is the drive root", filename);
 		}
-		auto context = RequireOpener(opener, "remove");
-		auto auth = GetAuthContext(context, filename);
+		auto &auth = target.auth;
 		GraphClient client(auth);
 		// RemoveFile removes FILES. Graph's DELETE on a folder is recursive, so
 		// any caller of the FileSystem API (not only remove_file, which checks)
@@ -631,15 +647,25 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 		if (IsFileIdFallbackGlobProbe(path)) {
 			return result;
 		}
-		auto uri = ParseOrThrow(path);
+		if (IsSharepointUri(path)) {
+			auto uri = ParseOrThrow(path);
+			if (uri.kind == SharepointUriKind::FILE_ID || !uri.version.empty()) {
+				// A bare id, or an earlier version, addresses exactly one item; DuckDB
+				// globs it before opening (the '?' of "?version=" looks like a glob).
+				result.emplace_back(path);
+				return result;
+			}
+		}
+		auto context = RequireOpener(opener, "glob");
+		auto target = ResolveSharepointPath(context, path);
+		auto uri = ParseOrThrow(target.path);
 		if (uri.kind == SharepointUriKind::FILE_ID || !uri.version.empty()) {
-			// A bare id, or an earlier version, addresses exactly one item; DuckDB
-			// globs it before opening (the '?' of "?version=" looks like a glob).
+			// A sharing link, or a URL with version=: one item, as given (rebuilt
+			// from the library's address it would lose the version).
 			result.emplace_back(path);
 			return result;
 		}
-		auto context = RequireOpener(opener, "glob");
-		auto auth = GetAuthContext(context, path);
+		auto &auth = target.auth;
 		GraphClient client(auth);
 
 		// {a,b} alternation first, over the whole root-relative pattern (an
@@ -651,7 +677,8 @@ vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *
 		std::unordered_set<string> seen;
 		auto emit = [&](const string &rel) {
 			if (seen.insert(rel).second) {
-				result.emplace_back(string(SHAREPOINT_SCHEME) + rel);
+				// In the caller's form: under a browser URL, a browser URL.
+				result.emplace_back(WebPathOf(target, rel));
 			}
 		};
 		for (const auto &pattern : patterns) {

@@ -13,6 +13,7 @@
 #include "sharepoint_delta.hpp"
 #include "sharepoint_list.hpp"
 #include "sharepoint_uri.hpp"
+#include "sharepoint_weburl.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
@@ -363,30 +364,51 @@ struct ListBindData : public TableFunctionData {
 };
 
 //! The Graph site id ("host,siteGuid,webGuid") for `site`: the secret's own
-//! site (that of its drive) when empty; else an id as given, a server-relative
+//! site (that of its drive) when empty; else an id as given, a browser URL
+//! ("https://contoso.sharepoint.com/sites/Sales", #95), a server-relative
 //! path on the same host ("Sales", "sites/Sales", "teams/Ops"), or
 //! "host:/sites/Sales".
 string ResolveSite(GraphClient &client, const AuthContext &auth, const string &site) {
 	if (site.find(',') != string::npos) {
 		return site;
 	}
-	picojson::value holder;
-	const auto &library = AsObject(
-	    client.GraphGet("/v1.0/drives/" + auth.drive_id + "/list?$select=parentReference", "the secret's site"),
-	    "the secret's site", holder);
-	string own_site;
-	auto parent = library.find("parentReference");
-	if (parent != library.end() && parent->second.is<picojson::object>()) {
-		own_site = StringField(parent->second.get<picojson::object>(), "siteId");
-	}
-	if (own_site.empty()) {
-		throw IOException("sharepoint: could not tell which site the secret's drive belongs to");
-	}
+	auto own_site = [&]() {
+		if (auth.drive_id.empty()) {
+			throw InvalidInputException("sharepoint: name the site (its address from the browser, e.g. "
+			                            "'https://contoso.sharepoint.com/sites/Sales'): the secret names no drive "
+			                            "to take it from");
+		}
+		picojson::value holder;
+		const auto &library = AsObject(
+		    client.GraphGet("/v1.0/drives/" + auth.drive_id + "/list?$select=parentReference", "the secret's site"),
+		    "the secret's site", holder);
+		string id;
+		auto parent = library.find("parentReference");
+		if (parent != library.end() && parent->second.is<picojson::object>()) {
+			id = StringField(parent->second.get<picojson::object>(), "siteId");
+		}
+		if (id.empty()) {
+			throw IOException("sharepoint: could not tell which site the secret's drive belongs to");
+		}
+		return id;
+	};
 	if (site.empty()) {
-		return own_site;
+		return own_site();
 	}
 	string address = site;
-	if (site.find(':') == string::npos) {
+	if (IsSharepointWebUrl(site)) {
+		const auto parsed = ParseSharepointWebUrl(site);
+		if (!parsed.ok || parsed.url.kind != WebUrlKind::DIRECT) {
+			throw InvalidInputException("sharepoint: '%s' is not a site address", site);
+		}
+		address = parsed.url.host;
+		if (!parsed.url.site_path.empty()) {
+			address += ":";
+			for (auto &segment : StringUtil::Split(parsed.url.site_path, '/')) {
+				address += "/" + PercentEncodeSegment(segment);
+			}
+		}
+	} else if (site.find(':') == string::npos) {
 		// Same host as the secret's site; a bare name means /sites/<name>.
 		string relative = site;
 		while (!relative.empty() && relative[0] == '/') {
@@ -395,7 +417,8 @@ string ResolveSite(GraphClient &client, const AuthContext &auth, const string &s
 		if (relative.find('/') == string::npos) {
 			relative = "sites/" + relative;
 		}
-		address = own_site.substr(0, own_site.find(',')) + ":/" + relative;
+		const auto own = own_site();
+		address = own.substr(0, own.find(',')) + ":/" + relative;
 	}
 	const string what = "site '" + site + "'";
 	picojson::value site_holder;
@@ -434,7 +457,8 @@ ListTarget ResolveList(ClientContext &context, const string &list, const string 
 	// Lists hang off a site, not a path: the secret in scope for the drive
 	// root is the one used.
 	auto opener = ClientData::Get(context).file_opener.get();
-	t.auth = GetAuthContext(opener, SHAREPOINT_SCHEME);
+	// A named site needs no drive in the secret (#95); the secret's own site does.
+	t.auth = GetAuthContext(opener, SHAREPOINT_SCHEME, site.empty());
 	GraphClient client(t.auth);
 	t.site_id = ResolveSite(client, t.auth, site);
 
@@ -1840,6 +1864,10 @@ void ListChangesScan(ClientContext &, TableFunctionInput &input, DataChunk &outp
 }
 
 } // namespace
+
+string ResolveSiteId(GraphClient &client, const AuthContext &auth, const string &site) {
+	return ResolveSite(client, auth, site);
+}
 
 struct ListItemWriter::State {
 	ListWriteGlobalState g;

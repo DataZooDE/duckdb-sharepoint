@@ -75,7 +75,7 @@ copy for a long time after a re-upload:
 
 ```bash
 T=vYYYY.MM.DD; N=sharepoint; B=https://s3.eu-west-1.amazonaws.com/get.erpl.io
-for v in v1.5.6; do for a in linux_amd64 linux_arm64 osx_amd64 osx_arm64 windows_amd64; do
+for v in v1.5.6; do for a in linux_amd64 linux_arm64 osx_arm64 windows_amd64; do
   echo "$v $a: $(curl -sf $B/$N/$T/$v/$a/$N.duckdb_extension.gz | gunzip 2>/dev/null | tail -c 512 | strings -n 4 | grep -m1 -E '^v20')"
 done; done
 ```
@@ -123,7 +123,7 @@ titled `sharepoint: bump to vYYYY.MM.DD`.
    Done when the v1.5.6 binary exists on every platform:
 
    ```bash
-   for a in linux_amd64 linux_arm64 osx_amd64 osx_arm64 windows_amd64; do
+   for a in linux_amd64 linux_arm64 osx_arm64 windows_amd64; do
      echo "$a $(curl -s -o /dev/null -w '%{http_code}' \
        https://community-extensions.duckdb.org/v1.5.6/$a/sharepoint.duckdb_extension.gz)"
    done
@@ -131,7 +131,10 @@ titled `sharepoint: bump to vYYYY.MM.DD`.
 
 ## Excluded platforms, and why
 
-`windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads`. The extension is HTTPS
+`osx_amd64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads`. Intel macOS:
+community-extensions no longer builds it (since 2026-11; the v2026.11.03
+v1.5.6 build had no such job, for any extension), so neither do we. The
+extension is HTTPS
 calls to Graph plus a loopback redirect server for interactive OAuth, and
 neither works in a browser sandbox. A wasm side-module would build green and
 then fail to LOAD. vcpkg's OpenSSL port is fragile on mingw.
