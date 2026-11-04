@@ -8,6 +8,7 @@
 // cache would serve one principal's token to another (the bug the sibling
 // gdrive documents and fixed the same way).
 #include "sharepoint_auth.hpp"
+#include "sharepoint_credential_chain.hpp"
 #include "sharepoint_assertion.hpp"
 #include "sharepoint_certificate.hpp"
 #include "sharepoint_token_policy.hpp"
@@ -35,6 +36,10 @@
 #include <openssl/evp.h>
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <fstream>
 #include <random>
 #include <sstream>
@@ -594,6 +599,213 @@ void PersistRotatedRefreshToken(optional_ptr<FileOpener> opener, const SecretMat
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// PROVIDER credential_chain (#72): the workload's own Azure identity. The
+// order and parsing are sharepoint_credential_chain.*; the requests are here.
+// ---------------------------------------------------------------------------
+
+string EnvOr(const char *name) {
+	const char *v = std::getenv(name);
+	return v ? string(v) : string();
+}
+
+int64_t NowSeconds() {
+	return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+	    .count();
+}
+
+//! The managed identity endpoints are local, plain http and quick or absent:
+//! a short connect timeout keeps the chain moving where there is none.
+ChainToken ManagedIdentityToken(ChainSource source, const ChainEnv &env, const string &resource,
+                                const string &client_id) {
+	string base, path;
+	duckdb_httplib_openssl::Headers headers;
+	if (source == ChainSource::APP_SERVICE) {
+		const auto scheme_end = env.identity_endpoint.find("://");
+		const auto path_at =
+		    env.identity_endpoint.find('/', scheme_end == string::npos ? 0 : scheme_end + 3);
+		base = env.identity_endpoint.substr(0, path_at);
+		path = path_at == string::npos ? "/" : env.identity_endpoint.substr(path_at);
+		headers.emplace("X-IDENTITY-HEADER", env.identity_header);
+	} else {
+		base = "http://169.254.169.254";
+		path = "/metadata/identity/oauth2/token";
+		headers.emplace("Metadata", "true");
+	}
+	duckdb_httplib_openssl::Client cli(base.c_str());
+	cli.set_connection_timeout(1);
+	cli.set_read_timeout(10);
+	cli.set_follow_location(false);
+	auto res = cli.Get((path + "?" + ManagedIdentityQuery(source, resource, client_id)).c_str(), headers);
+	ChainToken t;
+	if (!res) {
+		t.error = "no endpoint answered";
+		return t;
+	}
+	return ParseManagedIdentityReply(res->status, res->body, NowSeconds());
+}
+
+ChainToken AzureCliToken(const string &resource) {
+	ChainToken t;
+#if defined(__EMSCRIPTEN__)
+	t.error = "not available in WebAssembly";
+	return t;
+#else
+	// `resource` is a checked Microsoft Graph host (IsAllowedGraphEndpoint):
+	// no shell-active characters.
+	const string command = "az account get-access-token --resource " + resource + " --output json 2>&1";
+#if defined(_WIN32)
+	FILE *pipe = _popen(command.c_str(), "r");
+#else
+	FILE *pipe = popen(command.c_str(), "r");
+#endif
+	if (!pipe) {
+		t.error = "could not run az";
+		return t;
+	}
+	string output;
+	char buf[4096];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0) {
+		output.append(buf, n);
+	}
+#if defined(_WIN32)
+	const int rc = _pclose(pipe);
+#else
+	const int rc = pclose(pipe);
+#endif
+	t = ParseAzureCliReply(output, NowSeconds());
+	if (!t.ok && rc != 0 && output.empty()) {
+		t.error = "az is not installed or failed";
+	}
+	return t;
+#endif
+}
+
+ChainToken WorkloadIdentityToken(const ChainEnv &env, const string &login_endpoint, const string &resource) {
+	ChainToken t;
+	std::ifstream in(env.federated_token_file, std::ios::binary);
+	std::stringstream buf;
+	buf << in.rdbuf();
+	string assertion = buf.str();
+	while (!assertion.empty() && (assertion.back() == '\n' || assertion.back() == '\r')) {
+		assertion.pop_back();
+	}
+	if (!in || assertion.empty()) {
+		t.error = "cannot read AZURE_FEDERATED_TOKEN_FILE";
+		return t;
+	}
+	if (!IsValidTenantId(env.tenant_id)) {
+		t.error = "AZURE_TENANT_ID is not a tenant GUID or domain";
+		return t;
+	}
+	duckdb_httplib_openssl::Params params;
+	params.emplace("client_id", env.client_id);
+	params.emplace("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer");
+	params.emplace("client_assertion", assertion);
+	params.emplace("scope", resource + "/.default");
+	params.emplace("grant_type", "client_credentials");
+	try {
+		auto obj = PostToken(login_endpoint, env.tenant_id, params, [](int status, const string &body) {
+			return "sharepoint: workload identity token request failed: HTTP " + std::to_string(status) + " " +
+			       body.substr(0, 300);
+		});
+		return ParseManagedIdentityReply(200, picojson::value(obj).serialize(), NowSeconds());
+	} catch (std::exception &e) {
+		t.error = e.what();
+		return t;
+	}
+}
+
+class ChainTokenSource : public TokenSource {
+public:
+	ChainTokenSource(string fp_p, string login_endpoint_p, string resource_p, string client_id_p)
+	    : fp(std::move(fp_p)), login_endpoint(std::move(login_endpoint_p)), resource(std::move(resource_p)),
+	      client_id(std::move(client_id_p)), mint_lock(MintLockFor(fp)) {
+	}
+	string Token() override {
+		{
+			lock_guard<mutex> guard(g_token_lock);
+			auto it = g_tokens.find(fp);
+			if (it != g_tokens.end() && Fresh(it->second)) {
+				return it->second.access_token;
+			}
+		}
+		lock_guard<mutex> mint_guard(*mint_lock);
+		{
+			lock_guard<mutex> guard(g_token_lock);
+			auto it = g_tokens.find(fp);
+			if (it != g_tokens.end() && Fresh(it->second)) {
+				return it->second.access_token;
+			}
+		}
+		return Mint();
+	}
+	string Refresh(const string &rejected) override {
+		lock_guard<mutex> mint_guard(*mint_lock);
+		{
+			lock_guard<mutex> guard(g_token_lock);
+			auto it = g_tokens.find(fp);
+			if (it != g_tokens.end() && it->second.access_token != rejected && Fresh(it->second)) {
+				return it->second.access_token;
+			}
+			g_tokens.erase(fp);
+		}
+		return Mint();
+	}
+
+private:
+	static bool Fresh(const CachedToken &t) {
+		using std::chrono::system_clock;
+		return TokenIsFresh(system_clock::to_time_t(t.minted_at), system_clock::to_time_t(t.expires_at),
+		                    system_clock::to_time_t(system_clock::now()), 0);
+	}
+
+	//! Each source in turn; the first token wins. Every failure is named in
+	//! the error when none does.
+	string Mint() {
+		ChainEnv env;
+		env.federated_token_file = EnvOr("AZURE_FEDERATED_TOKEN_FILE");
+		env.client_id = EnvOr("AZURE_CLIENT_ID");
+		env.tenant_id = EnvOr("AZURE_TENANT_ID");
+		env.identity_endpoint = EnvOr("IDENTITY_ENDPOINT");
+		env.identity_header = EnvOr("IDENTITY_HEADER");
+		string failures;
+		for (auto source : ChainOrder(env)) {
+			IncrementCounter(Counter::TOKEN_REQUEST);
+			ChainToken t;
+			switch (source) {
+			case ChainSource::WORKLOAD_IDENTITY:
+				t = WorkloadIdentityToken(env, login_endpoint, resource);
+				break;
+			case ChainSource::APP_SERVICE:
+			case ChainSource::IMDS:
+				t = ManagedIdentityToken(source, env, resource, client_id);
+				break;
+			default:
+				t = AzureCliToken(resource);
+				break;
+			}
+			if (t.ok) {
+				lock_guard<mutex> guard(g_token_lock);
+				const auto now = std::chrono::system_clock::now();
+				g_tokens[fp] = CachedToken {t.token, std::chrono::system_clock::from_time_t(t.expires_on), now};
+				return t.token;
+			}
+			failures += string(failures.empty() ? "" : "; ") + ChainSourceName(source) + ": " + t.error;
+		}
+		throw IOException("sharepoint: PROVIDER credential_chain found no Azure identity (%s). Run in Azure with a "
+		                  "managed identity, set the workload identity variables, or sign in with `az login`.",
+		                  failures);
+	}
+
+	string fp;
+	string login_endpoint;
+	string resource;
+	string client_id;
+	shared_ptr<mutex> mint_lock;
+};
+
 AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) {
 	const auto match = LookupSecret(opener, path);
 	const auto &secret = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
@@ -630,6 +842,22 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path) 
 	}
 
 	const string provider = duckdb_compat::Str(secret.GetProvider());
+	if (provider == "credential_chain") {
+		// No credential in the secret: the identity is the workload's. The
+		// cache key covers what picks the identity (env and user-assigned id).
+		const string mi_client_id = SecretField(secret, "client_id");
+		const string resource = GraphResource(graph_endpoint);
+		const string credential_fp =
+		    Fingerprint({provider, mi_client_id, resource, login_endpoint, EnvOr("AZURE_CLIENT_ID"),
+		                 EnvOr("AZURE_TENANT_ID"), EnvOr("AZURE_FEDERATED_TOKEN_FILE"), EnvOr("IDENTITY_ENDPOINT"),
+		                 EnvOr("AZURE_CONFIG_DIR")});
+		AuthContext auth;
+		auth.tokens = make_shared_ptr<ChainTokenSource>(credential_fp, login_endpoint, resource, mi_client_id);
+		auth.graph_endpoint = graph_endpoint;
+		auth.drive_id = ResolveDriveId(secret, graph_endpoint, auth.tokens->Token(), credential_fp);
+		auth.identity = Fingerprint({credential_fp, graph_endpoint, auth.drive_id});
+		return auth;
+	}
 	// The providers that sign a user in interactively (and own their secret's
 	// refresh token, writing it back).
 	const bool interactive = provider == "device_code" || provider == "authorization_code";

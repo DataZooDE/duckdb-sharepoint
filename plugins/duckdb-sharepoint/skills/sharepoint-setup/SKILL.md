@@ -3,7 +3,8 @@ name: sharepoint-setup
 description: >
   Installing and authenticating the sharepoint DuckDB extension: INSTALL/LOAD,
   CREATE SECRET (TYPE sharepoint) with PROVIDER client_credentials (app-only,
-  client secret), client_certificate (app-only, PEM certificate), device_code
+  client secret), client_certificate (app-only, PEM certificate),
+  credential_chain (the Azure workload's own identity, no secret), device_code
   and authorization_code (as a user, refresh token kept in the secret), config
   (a token you already have); TENANT_ID, CLIENT_ID, DRIVE_ID or SITE_ID,
   GRAPH_SCOPE (never SCOPE); which Graph permissions each feature needs
@@ -29,6 +30,7 @@ LOAD sharepoint;
 |---|---|---|
 | `client_credentials` (default) | unattended, as an app | `TENANT_ID`, `CLIENT_ID`, `CLIENT_SECRET` |
 | `client_certificate` | unattended, app with a certificate | `TENANT_ID`, `CLIENT_ID`, `CERTIFICATE_PATH` (PEM: cert + RSA key), optional `CERTIFICATE_PASSWORD` |
+| `credential_chain` | in Azure, no secret: workload identity, then managed identity (App Service / IMDS), then `az` CLI | optional `CLIENT_ID` of a user-assigned identity |
 | `device_code` | as yourself, any shell | `TENANT_ID`, `CLIENT_ID` (public client), optional `REFRESH_TOKEN` |
 | `authorization_code` | as yourself, browser on this machine | `TENANT_ID`, `CLIENT_ID`, optional `REDIRECT_PORT` (8020) |
 | `config` | a token you have | `ACCESS_TOKEN`, or `REFRESH_TOKEN` + `TENANT_ID` + `CLIENT_ID` |
@@ -42,7 +44,12 @@ CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,
     DRIVE_ID 'b!...');
 CREATE PERSISTENT SECRET me (TYPE sharepoint, PROVIDER device_code,
     TENANT_ID 'contoso.onmicrosoft.com', CLIENT_ID '...', DRIVE_ID 'b!...');
+CREATE SECRET az (TYPE sharepoint, PROVIDER credential_chain, DRIVE_ID 'b!...');
 ```
+
+`credential_chain` tries the sources in `DefaultAzureCredential`'s order and uses the
+first token; when none has an identity, the error lists each source and why. Grant the
+identity Graph's `Sites.ReadWrite.All` (or `Sites.Selected`) as an application permission.
 
 Rules that bite:
 - The OAuth scope option is **`GRAPH_SCOPE`**. `SCOPE` is DuckDB's path-prefix list for

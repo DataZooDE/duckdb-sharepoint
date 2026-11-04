@@ -882,20 +882,44 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   root folder itself is skipped.
 - `token := 'latest'` gives a token without enumerating the drive. An expired
   token (410 `resyncRequired`) is an error telling to start over.
-- Lists (`/sites/{s}/lists/{l}/items/delta`) are not done yet: they build on
-  the list column plan of #79–#82.
+- Lists: `sharepoint_list_changes` over `/sites/{s}/lists/{l}/items/delta`
+  with the list column plan, people lookup and choice typing of
+  `read_sharepoint_list`; a deleted item (`deleted` / `@removed`) has only
+  `id`. Same checkpoint row and token rules.
+
+## 16. `PROVIDER credential_chain` (#72)
+
+- Order as `DefaultAzureCredential`: workload identity (the federated token
+  file as a client assertion, the same grant as `client_certificate`), then a
+  managed identity -- App Service (`IDENTITY_ENDPOINT` + `X-IDENTITY-HEADER`,
+  api 2019-08-01) *or* IMDS (`169.254.169.254`, `Metadata: true`, api
+  2018-02-01; 1 s connect timeout) -- then `az account get-access-token`.
+  The first token wins; with none, every source's reason is in the error.
+  Pure parts (order, query strings, reply parsing) are
+  `sharepoint_credential_chain.*`.
+- Tokens are cached like the others, keyed by the environment that picks the
+  identity (`AZURE_*`, `IDENTITY_ENDPOINT`, `AZURE_CONFIG_DIR`) and the
+  user-assigned `CLIENT_ID`.
+- Live: CI has no managed identity but has `az`; the e2e test signs the CLI
+  in as the CI app in a throwaway `AZURE_CONFIG_DIR` and reads and writes
+  through the chain. The managed identity paths were checked against a local
+  stand-in endpoint; an Azure VM test needs Azure.
 
 ## 17. `ATTACH ... (TYPE sharepoint)` (#60)
 
 - A storage extension: the catalog has one schema, `main`; its tables are the
-  site's lists that are not hidden, from one `lists?$expand=columns` call per
-  page, loaded on first use and kept for the attach. No Graph call at ATTACH.
+  site's lists that are not hidden (`lists?$select=...`, paged), each planned
+  from its own `/columns` by `FetchListPlan` -- the endpoint the scan reads,
+  so the two cannot disagree on an unchanged list. `$expand=columns` on the
+  collection did: on the first live runs every attached list was refused as
+  changed (cause not pinned down). Loaded on first use and kept for the
+  attach; no Graph call at ATTACH itself.
 - Column types come from the definitions only (a catalog declares them before
   data is read): a choice column that may hold several values is always
   `VARCHAR[]`. A table's scan is `read_sharepoint_list`'s table function with
   bind data from `BindListForCatalog` (same plan, `fixed_types`); a list whose
   columns changed since the ATTACH is refused rather than scanned into the
-  wrong columns.
+  wrong columns; the error names the first column that differs.
 - Writes: `SharepointModify`, one sink operator for INSERT / UPDATE / DELETE
   over the `$batch` item writer (`ListItemWriter`). INSERT maps
   `column_index_map` so unnamed columns are left out (SharePoint defaults).
@@ -907,3 +931,14 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   virtuals (no `override`), and `Expression::GetReturnType()`.
 - Transactions: none -- each statement goes straight to Graph.
 
+## 18. Planner and To Do (#68)
+
+- Here rather than a sibling extension: same secret, Graph client and
+  install (#52's proposal). `read_planner_tasks`: the plan by id, or by name
+  among a group's plans (app-only) or the user's (delegated); buckets by
+  name; assignees are user ids (the keys of `assignments`).
+  `read_todo_tasks`: `/me` or `/users/{u}` (app-only has no `/me`), every
+  list or one by name; To Do dates come as `dateTime` + `timeZone` (UTC by
+  default) and are read as UTC.
+- Not verified live: needs `Tasks.Read.All` for the CI app and a test plan
+  (`SHAREPOINT_PLANNER_PLAN_ID`, `SHAREPOINT_TODO_USER`).

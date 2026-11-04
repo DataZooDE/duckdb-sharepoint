@@ -106,6 +106,25 @@ unique_ptr<BaseSecret> CreateClientCertificateSecret(ClientContext &, CreateSecr
 }
 
 // ---------------------------------------------------------------------------
+// PROVIDER credential_chain -- the workload's own Azure identity (#72): no
+// credential in the secret. Workload identity, then a managed identity (App
+// Service or IMDS), then the Azure CLI, as DefaultAzureCredential tries them.
+// CLIENT_ID picks a user-assigned managed identity.
+// ---------------------------------------------------------------------------
+unique_ptr<BaseSecret> CreateCredentialChainSecret(ClientContext &, CreateSecretInput &input) {
+	auto result = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
+	CopyOption(input, *result, "client_id");
+	CopyOption(input, *result, "drive_id");
+	CopyOption(input, *result, "site_id");
+	CopyOption(input, *result, "graph_scope");
+	if (!HasNonEmptyOption(input, "drive_id") && !HasNonEmptyOption(input, "site_id")) {
+		throw InvalidInputException("sharepoint secret (PROVIDER credential_chain) needs DRIVE_ID or SITE_ID:\n"
+		                            "  CREATE SECRET sp (TYPE sharepoint, PROVIDER credential_chain, DRIVE_ID 'b!...');");
+	}
+	return std::move(result);
+}
+
+// ---------------------------------------------------------------------------
 // PROVIDER config -- pre-obtained tokens, pasted in.
 // ---------------------------------------------------------------------------
 unique_ptr<BaseSecret> CreateConfigSecret(ClientContext &, CreateSecretInput &input) {
@@ -235,6 +254,11 @@ void RegisterSharepointSecrets(ExtensionLoader &loader) {
 	cert_fn.named_parameters["certificate_password"] = LogicalType(LogicalTypeId::VARCHAR);
 	RegisterCommonParameters(cert_fn);
 	loader.RegisterFunction(cert_fn);
+
+	CreateSecretFunction chain_fn = {kSecretTypeName, "credential_chain", CreateCredentialChainSecret, {}};
+	chain_fn.named_parameters["client_id"] = LogicalType(LogicalTypeId::VARCHAR);
+	RegisterCommonParameters(chain_fn);
+	loader.RegisterFunction(chain_fn);
 
 	CreateSecretFunction config_fn = {kSecretTypeName, "config", CreateConfigSecret, {}};
 	config_fn.named_parameters["access_token"] = LogicalType(LogicalTypeId::VARCHAR);
