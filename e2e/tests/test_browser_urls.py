@@ -53,7 +53,8 @@ def other_drive(graph):
 def test_browser_url_reads_writes_and_globs_in_its_own_library(other_drive, sql, secret_sql):
     other, folder = other_drive
     base = other.web_url()
-    other.upload(f"{folder}/nums one.csv", b"n\n1\n2\n3\n")
+    nums = b"n\n1\n2\n3\n"
+    other.upload(f"{folder}/nums one.csv", nums)
     url = _url(base, f"{folder}/nums one.csv")
     out = sql(f"""{secret_sql}
         SELECT sum(n) FROM read_csv('{url}');
@@ -62,7 +63,7 @@ def test_browser_url_reads_writes_and_globs_in_its_own_library(other_drive, sql,
         SELECT count(*), sum(n) FROM read_parquet('{_url(base, folder + "/*.parquet")}');
         SELECT string_agg(file, ',' ORDER BY file) FROM glob('{_url(base, folder + "/*")}');
     """).splitlines()
-    assert out[-4:-1] == ["6", "10", "2|30"]
+    assert out[-4:-1] == ["6", str(len(nums)), "2|30"]
     # Globbing a browser URL gives browser URLs back, under the same library.
     assert out[-1] == f"{_url(base, folder + '/nums one.csv')},{_url(base, folder + '/out.parquet')}"
     # The write landed in the URL's library -- not the secret's.
