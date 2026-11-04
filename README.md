@@ -422,6 +422,7 @@ and `SITE_ID` are SharePoint's, not Entra's.
 | `AADSTS7000218` | the app is not a public client | *Authentication → Allow public client flows* → **Enabled**, then **Save** |
 | `AADSTS50173` / `invalid_grant` | the refresh token expired or was revoked | sign in again (recreate the secret without `REFRESH_TOKEN`) |
 | HTTP 403 `accessDenied` | the app lacks a permission, or (with `Sites.Selected`) this site | add it under *API permissions* and click **Grant admin consent** (it shows *Not granted* until then); or grant the site (see *Least privilege*) |
+| `site '…' not found` (`itemNotFound`) | no such site at that path, or (with `Sites.Selected`, if Graph hides it) the app was not granted it | check the name; or grant the site (see *Least privilege*) |
 
 > The option is `GRAPH_SCOPE`, **not** `SCOPE`: DuckDB's `CREATE SECRET`
 > grammar reserves `SCOPE` for the secret's path-prefix list. An OAuth scope
