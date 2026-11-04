@@ -39,7 +39,7 @@ SELECT name, path, size, modified, modified_by, "Department"
 FROM read_sharepoint_files('sharepoint://Finance/**/*.xlsx');
 ```
 Fixed columns `path, name, size, created, modified, created_by(_email), modified_by(_email),
-content_type, id, web_url`, then the library's own columns, typed like list columns.
+content_type, id, web_url, checked_out_by(_email)` (NULL unless checked out), then the library's own columns, typed like list columns.
 
 ## Earlier versions
 ```sql

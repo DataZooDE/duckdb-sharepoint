@@ -319,7 +319,7 @@ FROM read_sharepoint_files('sharepoint://Finance/**/*.xlsx');
 
 One row per file the path or glob matches (the same glob syntax as
 `sharepoint://`): `path`, `name`, `size`, `created`, `modified`, `created_by`,
-`modified_by` (and their `_email`), `content_type`, `id` and `web_url`, then
+`modified_by` (and their `_email`), `content_type`, `id`, `web_url` and `checked_out_by` (and its `_email`; NULL unless checked out), then
 the library's own metadata columns, typed as `read_sharepoint_list` types a
 list's.
 

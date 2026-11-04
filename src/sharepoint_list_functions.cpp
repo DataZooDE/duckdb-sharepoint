@@ -1289,7 +1289,8 @@ const vector<std::pair<string, LogicalType>> &FileColumns() {
 	    {"modified", LogicalType::TIMESTAMP},    {"created_by", LogicalType::VARCHAR},
 	    {"created_by_email", LogicalType::VARCHAR}, {"modified_by", LogicalType::VARCHAR},
 	    {"modified_by_email", LogicalType::VARCHAR}, {"content_type", LogicalType::VARCHAR},
-	    {"id", LogicalType::VARCHAR},            {"web_url", LogicalType::VARCHAR}};
+	    {"id", LogicalType::VARCHAR},            {"web_url", LogicalType::VARCHAR},
+	    {"checked_out_by", LogicalType::VARCHAR}, {"checked_out_by_email", LogicalType::VARCHAR}};
 	return columns;
 }
 
@@ -1419,7 +1420,7 @@ unique_ptr<FunctionData> FilesBind(ClientContext &context, TableFunctionBindInpu
 			}
 		}
 		const string query = "?$select=id,name,size,createdDateTime,lastModifiedDateTime,createdBy,lastModifiedBy,"
-		                     "file,folder,webUrl&$expand=listItem($select=id;$expand=fields" +
+		                     "file,folder,webUrl,publication&$expand=listItem($select=id;$expand=fields" +
 		                     (select.empty() ? string() : "($select=" + select + ")") + ")";
 		vector<std::pair<string, picojson::object>> items; // path, driveItem
 		for (idx_t start = 0; start < matches.size(); start += kFilesPerBatch) {
@@ -1548,6 +1549,14 @@ unique_ptr<FunctionData> FilesBind(ClientContext &context, TableFunctionBindInpu
 			auto size = item.find("size");
 			const auto created_by = Who(item, "createdBy");
 			const auto modified_by = Who(item, "lastModifiedBy");
+			// Checked out (#98): the publication facet, returned only when
+			// selected; its checkedOutBy only while level is "checkout".
+			std::pair<Value, Value> checked_out_by {Value(LogicalType::VARCHAR), Value(LogicalType::VARCHAR)};
+			auto publication = item.find("publication");
+			if (publication != item.end() && publication->second.is<picojson::object>() &&
+			    StringField(publication->second.get<picojson::object>(), "level") == "checkout") {
+				checked_out_by = Who(publication->second.get<picojson::object>(), "checkedOutBy");
+			}
 			vector<Value> row = {Value(items[r].first),
 			                     Value(StringField(item, "name")),
 			                     size != item.end() && size->second.is<int64_t>()
@@ -1561,7 +1570,9 @@ unique_ptr<FunctionData> FilesBind(ClientContext &context, TableFunctionBindInpu
 			                     modified_by.second,
 			                     mime.empty() ? Value(LogicalType::VARCHAR) : Value(mime),
 			                     Value(StringField(item, "id")),
-			                     Value(StringField(item, "webUrl"))};
+			                     Value(StringField(item, "webUrl")),
+			                     checked_out_by.first,
+			                     checked_out_by.second};
 			for (idx_t c = 0; c < plan.size(); c++) {
 				auto value = custom[r][c];
 				if (value.IsNull() && (plan[c].person == ListPersonPart::NAME || plan[c].person == ListPersonPart::EMAIL)) {
