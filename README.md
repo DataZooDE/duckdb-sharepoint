@@ -352,6 +352,21 @@ extension finds it on the first search, or takes `region := 'EUR'`.
 `max_results` (default 500) caps the rows. Search indexes new content with a
 delay of minutes.
 
+## OneNote pages
+
+```sql
+SELECT notebook, section, title, created, modified, web_url
+FROM read_onenote_pages(site := 'https://contoso.sharepoint.com/sites/Sales', notebook := 'Projects');
+SELECT title FROM read_onenote_pages(notebook := 'Projects', section := 'Q4') WHERE modified > TIMESTAMP '2026-11-01';
+```
+
+The filesystem sees a notebook as a folder and each section as one `.one`
+file, so it can tell which section changed but not which page; this lists
+pages. OneNote has no delta: track with `WHERE modified > <last run>`.
+Microsoft restricts app-only access to the OneNote API, so sign in as a user
+(`device_code` / `authorization_code`) and add `Notes.Read` to `GRAPH_SCOPE`;
+an app-only refusal says so.
+
 ## Planner and To Do tasks
 
 ```sql
