@@ -228,7 +228,7 @@ def test_copy_upserts_by_key(graph, fixture_lists, sql, secret_sql):
             SELECT list(id ORDER BY Seq) FILTER (WHERE Seq BETWEEN 21 AND 30) FROM read_sharepoint_list('{name}');
             SELECT count(*) FROM read_sharepoint_list('{name}') WHERE Seq <= 30 AND Title IS NULL;
         """).splitlines()
-        before, counts, after, titles_lost = out[-5], out[-3], out[-2], out[-1]
+        before, counts, after, titles_lost = out[-4], out[-3], out[-2], out[-1]
         assert counts == f"40|40|{float(sum(range(1, 21)) + sum(i * 100 for i in range(21, 41)))}"
         assert after == before   # the same items, updated -- not new ones
         assert titles_lost == "0"  # columns not written are left as they were

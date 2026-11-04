@@ -74,15 +74,15 @@ def test_create_table_as_makes_a_list(graph, fixture_lists, sql, secret_sql):
         out = sql(f"""{secret_sql} {ATTACH}
             CREATE TABLE site."{name}" AS
             SELECT 'p' || i AS Title, i * 1.5 AS "Unit Price", i AS Qty, i % 2 = 0 AS Even,
-                   DATE '2026-01-01' + i AS Day, TIMESTAMP '2026-01-01 12:00:00' + INTERVAL (i) HOUR AS At
+                   DATE '2026-01-01' + i::INTEGER AS Due, TIMESTAMP '2026-01-01 12:00:00' + INTERVAL (i) HOUR AS Stamp
             FROM range(25) t(i);
-            SELECT count(*), sum(Qty), sum("Unit Price"), count(*) FILTER (WHERE Even), min(Day), max(At)
+            SELECT count(*), sum(Qty), sum("Unit Price"), count(*) FILTER (WHERE Even), min(Due), max(Stamp)
             FROM read_sharepoint_list('{name}');
             SELECT string_agg(column_name || ' ' || column_type, ', ' ORDER BY column_name)
-            FROM (DESCRIBE SELECT Title, "Unit Price", Qty, Even, Day, At FROM read_sharepoint_list('{name}'));
+            FROM (DESCRIBE SELECT Title, "Unit Price", Qty, Even, Due, Stamp FROM read_sharepoint_list('{name}'));
         """).splitlines()
         assert out[-2] == f"25|{float(sum(range(25)))}|{sum(i * 1.5 for i in range(25))}|13|2026-01-01|2026-01-02 12:00:00"
-        assert out[-1] == "At TIMESTAMP, Day DATE, Even BOOLEAN, Qty DOUBLE, Title VARCHAR, Unit Price DOUBLE"
+        assert out[-1] == "Due DATE, Even BOOLEAN, Qty DOUBLE, Stamp TIMESTAMP, Title VARCHAR, Unit Price DOUBLE"
 
         # The new table is usable at once in the same session, and a fresh
         # ATTACH lists it like any other list.
