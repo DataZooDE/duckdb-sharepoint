@@ -67,3 +67,11 @@ DELETE FROM sales.Orders WHERE Status = 'cancelled';
 Visible lists are tables of schema `main`, typed from their column definitions. Lists are read
 once per ATTACH: after changing columns in SharePoint, DETACH and ATTACH again. No CREATE/ALTER
 of lists, no RETURNING.
+## Planner and To Do tasks
+```sql
+SELECT bucket, title, status, due, assigned_to FROM read_planner_tasks('<plan id>');
+SELECT * FROM read_planner_tasks('Q1 launch', group := '<group id>');                   -- by name
+SELECT list, title, status, due FROM read_todo_tasks() WHERE status <> 'completed';     -- as yourself
+SELECT * FROM read_todo_tasks(user := 'anna@contoso.com', list := 'Tasks');             -- app-only
+```
+Needs `Tasks.Read.All` (application) or `Tasks.Read` (delegated: add it to `GRAPH_SCOPE`).

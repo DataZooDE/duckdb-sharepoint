@@ -6,6 +6,7 @@
 #include "sharepoint_filesystem.hpp"
 #include "sharepoint_list_functions.hpp"
 #include "sharepoint_catalog.hpp"
+#include "sharepoint_tasks.hpp"
 #include "sharepoint_changes.hpp"
 #include "sharepoint_versions.hpp"
 #include "sharepoint_search_functions.hpp"
@@ -186,6 +187,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	sharepoint::RegisterListFunctions(loader);
 	// ATTACH 'sharepoint://sites/x' (TYPE sharepoint): a site's lists as tables.
 	sharepoint::RegisterSharepointCatalog(loader);
+	sharepoint::RegisterTaskFunctions(loader);
 	sharepoint::RegisterChangeFunctions(loader);
 	sharepoint::RegisterVersionFunctions(loader);
 	sharepoint::RegisterSearchFunctions(loader);

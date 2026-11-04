@@ -305,6 +305,17 @@ items (columns left out keep SharePoint's defaults); `UPDATE` and `DELETE`
 address items by `id`. Lists are read once per `ATTACH`: after changing a
 list's columns in SharePoint, `DETACH` and `ATTACH` again. Creating or
 altering lists, and `RETURNING`, are not supported.
+## Planner and To Do tasks
+
+```sql
+SELECT bucket, title, status, due, assigned_to FROM read_planner_tasks('<plan id>');
+SELECT * FROM read_planner_tasks('Q1 launch', group := '<group id>');   -- by name
+SELECT list, title, status, due FROM read_todo_tasks() WHERE status <> 'completed';   -- as yourself
+SELECT * FROM read_todo_tasks(user := 'anna@contoso.com', list := 'Tasks');           -- app-only
+```
+
+These need Graph's `Tasks.Read.All` (application) or `Tasks.Read`
+(delegated: add it to `GRAPH_SCOPE`), with admin consent.
 
 ## Installation
 
