@@ -570,6 +570,12 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   started together made one run's `big.bin` disappear under another
   (404 `itemNotFound` on a read by id). Not a product bug -- stagger re-runs,
   and give new suites run-unique paths (`@RUN_ID@`), as the Excel suite does.
+- **An item's permissions, as listed** (2026-11-04, #98): for a file in a
+  fresh folder, `GET /items/{id}/permissions` (app-only) gave the site's
+  groups (owner / member / visitor, as `group` and `siteGroup`) with **no
+  `inheritedFrom`**, although the file inherits them, and the organization
+  link just created **without `link.webUrl`**. So `granted_by` is `direct`
+  for them and `link_url` NULL -- what Graph says, not what the docs suggest.
 - **An ungranted site under Sites.Selected: 403 or 404?** Not settled yet
   (#70). The first required run got 404 `itemNotFound` for
   `SHAREPOINT_UNGRANTED_SITE`, but the full-permission app got the same 404:

@@ -6,6 +6,7 @@
 #include "sharepoint_filesystem.hpp"
 #include "sharepoint_list_functions.hpp"
 #include "sharepoint_tasks.hpp"
+#include "sharepoint_permissions_functions.hpp"
 #include "sharepoint_discovery.hpp"
 #include "sharepoint_onenote.hpp"
 #include "sharepoint_catalog.hpp"
@@ -196,6 +197,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	sharepoint::RegisterSharepointCatalog(loader);
 	sharepoint::RegisterChangeFunctions(loader);
 	sharepoint::RegisterVersionFunctions(loader);
+	// sharepoint_permissions(): who can reach an item (#98).
+	sharepoint::RegisterPermissionFunctions(loader);
 	sharepoint::RegisterSearchFunctions(loader);
 
 	datazoo::RegisterBannerOption(loader);
