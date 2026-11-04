@@ -46,3 +46,12 @@ Columns matched by name; `id` present = update, NULL/absent = create. Lookups an
 set through `<name>_id`; read-only columns (created, modified, names, emails) are skipped, so a
 read result can be written back as it is. Sent in `$batch` calls of 20. `SITE 'Sales'` as a
 COPY option for another site.
+
+## Planner and To Do tasks
+```sql
+SELECT bucket, title, status, due, assigned_to FROM read_planner_tasks('<plan id>');
+SELECT * FROM read_planner_tasks('Q1 launch', group := '<group id>');                   -- by name
+SELECT list, title, status, due FROM read_todo_tasks() WHERE status <> 'completed';     -- as yourself
+SELECT * FROM read_todo_tasks(user := 'anna@contoso.com', list := 'Tasks');             -- app-only
+```
+Needs `Tasks.Read.All` (application) or `Tasks.Read` (delegated: add it to `GRAPH_SCOPE`).
