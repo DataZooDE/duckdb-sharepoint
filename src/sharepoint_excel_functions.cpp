@@ -350,13 +350,13 @@ unique_ptr<FunctionData> Finish(vector<string> names, vector<vector<ExcelCell>> 
 	return std::move(data);
 }
 
-unique_ptr<FunctionData> TableBind(ClientContext &context, TableFunctionBindInput &input,
+//! read_excel_table's bind, for the table function and an ATTACHed site's
+//! workbook tables (#100).
+unique_ptr<FunctionData> BindTable(ClientContext &context, const string &path, const string &table, bool all_varchar,
                                    vector<LogicalType> &return_types, duckdb_compat::BindNames &names) {
 	unique_ptr<FunctionData> result;
-	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
-		const auto table = StringArg(input, 1, "table name");
-		const bool all_varchar = BoolOption(input, "all_varchar", false);
-		auto wb = OpenWorkbook(context, StringArg(input, 0, "workbook path"));
+	{
+		auto wb = OpenWorkbook(context, path);
 		GraphClient client(wb.auth);
 		const string what = Quoted("table", table, wb);
 		const string base = "tables/" + EncodeWorkbookName(table);
@@ -377,6 +377,16 @@ unique_ptr<FunctionData> TableBind(ClientContext &context, TableFunctionBindInpu
 		result =
 		    Finish(ExcelHeaderNames(header_cells), ReadCells(client, wb, address), all_varchar, wb.date1904, return_types,
 		           names);
+	}
+	return result;
+}
+
+unique_ptr<FunctionData> TableBind(ClientContext &context, TableFunctionBindInput &input,
+                                   vector<LogicalType> &return_types, duckdb_compat::BindNames &names) {
+	unique_ptr<FunctionData> result;
+	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
+		result = BindTable(context, StringArg(input, 0, "workbook path"), StringArg(input, 1, "table name"),
+		                   BoolOption(input, "all_varchar", false), return_types, names);
 	});
 	return result;
 }
@@ -1064,6 +1074,73 @@ CopyFunction MakeExcelFrontend(const char *name, copy_to_plan_t plan) {
 }
 
 } // namespace
+
+// --- For an ATTACHed site's workbooks (#100) ----------------------------------------
+
+vector<string> ExcelWorkbookTables(ClientContext &context, const string &path) {
+	auto wb = OpenWorkbook(context, path);
+	GraphClient client(wb.auth);
+	const string what = "the tables of '" + wb.path + "'";
+	const auto tables = ParseObject(client.WorkbookGet(wb.item_id, "tables?$select=name", what), what);
+	vector<string> names;
+	if (auto values = ArrayField(tables, "value")) {
+		for (auto &t : *values) {
+			if (t.is<picojson::object>()) {
+				auto name = t.get<picojson::object>().find("name");
+				if (name != t.get<picojson::object>().end() && name->second.is<string>()) {
+					names.push_back(name->second.get<string>());
+				}
+			}
+		}
+	}
+	return names;
+}
+
+unique_ptr<FunctionData> BindExcelTableForCatalog(ClientContext &context, const string &path, const string &table,
+                                                  vector<string> &names, vector<LogicalType> &types) {
+	duckdb_compat::BindNames bound;
+	auto data = BindTable(context, path, table, false, types, bound);
+	for (auto &n : bound) {
+		names.push_back(duckdb_compat::Str(n));
+	}
+	return data;
+}
+
+TableFunction ExcelTableScanFunction() {
+	return TableFunction("read_excel_table", {LogicalType::VARCHAR, LogicalType::VARCHAR}, ExcelScan, TableBind,
+	                     CursorInit);
+}
+
+struct ExcelTableAppender::State {
+	ExcelWriteBindData bind;
+	unique_ptr<GlobalFunctionData> global;
+	LocalFunctionData local;
+};
+
+ExcelTableAppender::ExcelTableAppender(ClientContext &context, const string &path, const string &table,
+                                       const vector<string> &names, const vector<LogicalType> &types)
+    : state(make_uniq<State>()) {
+	state->bind.table_mode = true;
+	state->bind.table = table;
+	state->bind.sheet = table;
+	state->bind.names = names;
+	for (auto &t : types) {
+		state->bind.kinds.push_back(WriteKindFor(t));
+	}
+	state->global = ExcelWriteInitGlobal(context, state->bind, path);
+}
+
+ExcelTableAppender::~ExcelTableAppender() {
+}
+
+void ExcelTableAppender::Append(ExecutionContext &context, DataChunk &chunk) {
+	ExcelWriteSink(context, state->bind, *state->global, state->local, chunk);
+	written += chunk.size();
+}
+
+void ExcelTableAppender::Finish(ClientContext &context) {
+	ExcelWriteFinalize(context, state->bind, *state->global);
+}
 
 void RegisterExcelFunctions(ExtensionLoader &loader) {
 	Register(loader,

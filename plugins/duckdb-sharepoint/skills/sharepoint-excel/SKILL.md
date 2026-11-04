@@ -54,3 +54,9 @@ Choose: the workbook API (`read_excel_*`, `excel_table` / `excel_range`) for liv
 in-place writes into an existing workbook (other sheets and formulas kept); `read_xlsx` /
 `FORMAT xlsx` (to replace an existing file add `USE_TMP_FILE false`) for any .xlsx file Excel for the web will not open, and to create a new
 workbook or replace one whole. A `FORMAT xlsx` file is a normal workbook for the API after.
+
+## Workbooks in an attached site
+`ATTACH 'sharepoint://' AS site (TYPE sharepoint, WORKBOOKS 'Finance/')`: each .xlsx under the
+folder is a schema named by its path, its Excel tables are tables (`site."Finance/plan.xlsx".Sales`);
+SELECT reads live, INSERT appends (columns by name). No UPDATE/DELETE. Tables are typed by reading
+each once per ATTACH.

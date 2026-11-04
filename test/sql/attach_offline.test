@@ -27,3 +27,15 @@ no `sharepoint` secret configured
 
 statement ok
 DETACH sales;
+
+# WORKBOOKS (#100): a folder's workbooks as schemas, looked up lazily.
+statement ok
+ATTACH 'sharepoint://' AS wb (TYPE sharepoint, WORKBOOKS 'Finance/');
+
+statement error
+SELECT * FROM wb."Finance/plan.xlsx".Sales;
+----
+no `sharepoint` secret configured
+
+statement ok
+DETACH wb;
