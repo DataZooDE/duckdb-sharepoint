@@ -78,3 +78,19 @@ statement error
 SELECT * FROM read_sharepoint_files(NULL);
 ----
 must not be NULL
+
+# sharepoint_list_changes (#62, lists): registered; bad input fails first.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'sharepoint_list_changes' AND function_type = 'table';
+----
+1
+
+statement error
+SELECT * FROM sharepoint_list_changes(NULL);
+----
+must not be NULL
+
+statement error
+SELECT * FROM sharepoint_list_changes('Orders', token := 'a/b?c');
+----
+not a token sharepoint_list_changes returned
