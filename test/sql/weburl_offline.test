@@ -79,3 +79,14 @@ statement error
 SELECT * FROM sharepoint_drives('https://contoso.sharepoint.com/sites/Sales');
 ----
 no `sharepoint` secret configured
+
+# read_onenote_pages (#102): registered; needs a secret like everything else.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'read_onenote_pages';
+----
+1
+
+statement error
+SELECT * FROM read_onenote_pages(notebook := 'Projects');
+----
+no `sharepoint` secret configured
