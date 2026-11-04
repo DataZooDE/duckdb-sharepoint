@@ -55,3 +55,12 @@ SELECT * FROM sharepoint_list_changes('Orders', token := (SELECT token FROM sync
 The list's columns plus `_change`: `'upsert'`, `'delete'` (only `id` set) or `'checkpoint'`;
 the one checkpoint row carries the `token` to store for next time (as `sharepoint_changes`
 does for files).
+
+## Planner and To Do tasks
+```sql
+SELECT bucket, title, status, due, assigned_to FROM read_planner_tasks('<plan id>');
+SELECT * FROM read_planner_tasks('Q1 launch', group := '<group id>');                   -- by name
+SELECT list, title, status, due FROM read_todo_tasks() WHERE status <> 'completed';     -- as yourself
+SELECT * FROM read_todo_tasks(user := 'anna@contoso.com', list := 'Tasks');             -- app-only
+```
+Needs `Tasks.Read.All` (application) or `Tasks.Read` (delegated: add it to `GRAPH_SCOPE`).

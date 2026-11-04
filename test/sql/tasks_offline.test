@@ -1,0 +1,16 @@
+# name: test/sql/tasks_offline.test
+# description: read_planner_tasks / read_todo_tasks (#68) without a tenant:
+#              registered, and bad input fails before any Graph call.
+# group: [sharepoint]
+
+require sharepoint
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('read_planner_tasks', 'read_todo_tasks');
+----
+2
+
+statement error
+SELECT * FROM read_planner_tasks('');
+----
+needs a plan
