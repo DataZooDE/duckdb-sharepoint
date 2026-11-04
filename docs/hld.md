@@ -801,6 +801,17 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - **In place.** The target is a list, not a file, but COPY's temp-file rename
   would still be attempted for a name that exists as a local file; the same
   rewrite as the Excel writers (`sharepoint_copy_rewrite.hpp`) rules it out.
+- **Upsert by KEY (#97).** `KEY '<column>'` (a written column, checked at
+  bind) reads every item's id and key once, at the start of the COPY
+  (`items?$expand=fields($select=id,<key>)`, paged), into a `ListKeyIndex`
+  (pure, Catch2-tested). Each row without an `id` is then a PATCH of the item
+  with its key or a POST. Text keys compare exactly, numbers canonically
+  (`ListKeyOfNumber`: 17 = 17.0). Refused, because which item or row should
+  win is not ours to guess: a NULL key, a key two items share, a key repeated
+  in the rows written. A refusal mid-COPY leaves the batches already sent
+  written (a COPY to a list is not transactional). One read of the whole key
+  column per COPY rather than a `$filter` per batch: a list sync writes many
+  rows, and a filter needs the key indexed.
 
 ## 11. File versions: `sharepoint_versions` and `?version=` (#66)
 

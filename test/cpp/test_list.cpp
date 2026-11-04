@@ -366,3 +366,36 @@ TEST_CASE("FormatDateOnly: an instant on that date from UTC-10 to UTC+13:30", "[
 	REQUIRE(ParseIsoTimestamp(FormatDateOnly(d), us));
 	REQUIRE(DateOnlyDays(us) == d);
 }
+
+TEST_CASE("ListKeyOfNumber: one text per number", "[list][upsert]") {
+	REQUIRE(ListKeyOfNumber(17) == "17");
+	REQUIRE(ListKeyOfNumber(17.0) == "17");
+	REQUIRE(ListKeyOfNumber(1.7e1) == "17");
+	REQUIRE(ListKeyOfNumber(-3) == "-3");
+	REQUIRE(ListKeyOfNumber(0.5) == "0.5");
+	REQUIRE(ListKeyOfNumber(2.25) == ListKeyOfNumber(2.25));
+	REQUIRE(ListKeyOfNumber(1e20) != ListKeyOfNumber(1e20 + 1e6));
+}
+
+TEST_CASE("ListKeyIndex: update a known key, create an unknown one", "[list][upsert]") {
+	ListKeyIndex index;
+	index.AddItem("A-1", "11");
+	index.AddItem("A-2", "12");
+	index.AddItem("", "13"); // an item without a key is never matched
+	std::string id;
+	REQUIRE(index.Lookup("A-1", id) == ListKeyIndex::Match::UPDATE);
+	REQUIRE(id == "11");
+	REQUIRE(index.Lookup("A-9", id) == ListKeyIndex::Match::CREATE);
+	REQUIRE(index.Lookup("a-2", id) == ListKeyIndex::Match::CREATE); // exact match only
+}
+
+TEST_CASE("ListKeyIndex: two items with one key, or a key written twice, are refused", "[list][upsert]") {
+	ListKeyIndex index;
+	index.AddItem("A-1", "11");
+	index.AddItem("A-1", "14");
+	std::string id;
+	REQUIRE(index.Lookup("A-1", id) == ListKeyIndex::Match::AMBIGUOUS);
+	REQUIRE(index.Lookup("B-1", id) == ListKeyIndex::Match::CREATE);
+	REQUIRE(index.Lookup("B-1", id) == ListKeyIndex::Match::REPEATED);
+	REQUIRE(index.Lookup("A-1", id) == ListKeyIndex::Match::REPEATED);
+}

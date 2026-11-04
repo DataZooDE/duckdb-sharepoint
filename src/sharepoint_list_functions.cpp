@@ -976,7 +976,9 @@ void ListScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 // COPY (SELECT ...) TO 'Orders' (FORMAT sharepoint_list [, SITE 'Sales'])
 //
 // A row with an `id` updates that item (PATCH items/{id}/fields); a row
-// without one (no id column, or a NULL id) creates an item (POST items).
+// without one (no id column, or a NULL id) creates an item (POST items) --
+// or, with KEY '<column>' (#97), updates the item whose key column has the
+// row's value, and creates one only when none has (upsert).
 // Columns are matched to the list's by name (PlanListWrite), so a
 // read_sharepoint_list result can be changed and written back as it is.
 // The target is a list, not a file: the same in-place rewrite as the Excel
@@ -992,6 +994,7 @@ constexpr int kMaxBatchAttempts = 6;
 struct ListWriteBindData : public FunctionData {
 	string list;
 	string site;
+	string key; // KEY '<column>': upsert by it (#97)
 	vector<string> names;
 	vector<LogicalType> types;
 
@@ -1000,7 +1003,7 @@ struct ListWriteBindData : public FunctionData {
 	}
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<ListWriteBindData>();
-		return list == other.list && site == other.site && names == other.names;
+		return list == other.list && site == other.site && key == other.key && names == other.names;
 	}
 };
 
@@ -1018,9 +1021,23 @@ unique_ptr<FunctionData> ListWriteBind(ClientContext &, CopyFunctionBindInput &i
 			data->site = (*site)[0].ToString();
 		}
 	}
+	if (auto key = FindCopyOption(info.options, "key")) {
+		if (key->size() == 1 && !(*key)[0].IsNull()) {
+			data->key = (*key)[0].ToString();
+		}
+	}
 	for (idx_t i = 0; i < sql_types.size(); i++) {
 		data->names.push_back(duckdb_compat::Str(names[i]));
 		data->types.push_back(sql_types[i]);
+	}
+	if (!data->key.empty()) {
+		bool found = false;
+		for (auto &n : data->names) {
+			found = found || StringUtil::CIEquals(n, data->key);
+		}
+		if (!found) {
+			throw InvalidInputException("sharepoint: KEY '%s' is not one of the columns written", data->key);
+		}
 	}
 	return std::move(data);
 }
@@ -1035,7 +1052,38 @@ struct ListWriteGlobalState : public GlobalFunctionData {
 	ListTarget target;
 	vector<ListWriteColumn> columns;
 	vector<PendingRequest> pending;
+	//! KEY: the written column it is, and the list's items by it (#97).
+	idx_t key_column = DConstants::INVALID_INDEX;
+	string key_name;
+	ListKeyIndex keys;
 };
+
+//! A key as ListKeyIndex compares it: text as it is, a number canonical.
+string KeyText(const picojson::value &v) {
+	if (v.is<string>()) {
+		return v.get<string>();
+	}
+	if (v.is<int64_t>()) {
+		return ListKeyOfNumber(static_cast<double>(v.get<int64_t>()));
+	}
+	if (v.is<double>()) {
+		return ListKeyOfNumber(v.get<double>());
+	}
+	if (v.is<bool>()) {
+		return v.get<bool>() ? "true" : "false";
+	}
+	return string(); // null, or a collection: no key
+}
+
+string KeyText(const Value &v) {
+	if (v.type().IsNumeric()) {
+		return ListKeyOfNumber(v.GetValue<double>());
+	}
+	if (v.type().id() == LogicalTypeId::BOOLEAN) {
+		return BooleanValue::Get(v) ? "true" : "false";
+	}
+	return v.ToString();
+}
 
 picojson::value ToJsonField(const Value &v, const string &field) {
 	if (v.IsNull()) {
@@ -1085,6 +1133,30 @@ unique_ptr<GlobalFunctionData> ListWriteInitGlobal(ClientContext &context, Funct
 		string error;
 		if (!PlanListWrite(bind.names, g->target.plan, g->columns, error)) {
 			throw InvalidInputException("sharepoint: %s: %s", g->target.what, error);
+		}
+		if (!bind.key.empty()) {
+			for (idx_t c = 0; c < bind.names.size(); c++) {
+				if (StringUtil::CIEquals(bind.names[c], bind.key)) {
+					g->key_column = c;
+				}
+			}
+			const auto &col = g->columns[g->key_column];
+			if (col.target != ListWriteTarget::FIELD) {
+				throw InvalidInputException("sharepoint: KEY '%s' must be a column of %s that is written (not id, "
+				                            "created, modified or a lookup's display column)",
+				                            bind.key, g->target.what);
+			}
+			g->key_name = bind.key;
+			// Every item's key, once: a page of ids and keys per call.
+			GraphClient client(g->target.auth);
+			for (auto &fields : FetchItems(client, g->target.base, "id," + EncodeWorkbookName(col.field),
+			                               ListPageSize(context), "", g->target.what)) {
+				auto id = fields.find("id");
+				auto key = fields.find(col.field);
+				if (id != fields.end() && id->second.is<string>() && key != fields.end()) {
+					g->keys.AddItem(KeyText(key->second), id->second.get<string>());
+				}
+			}
 		}
 	});
 	return std::move(g);
@@ -1209,6 +1281,30 @@ void AddRow(ListWriteGlobalState &g, const vector<Value> &row, const Value &id) 
 	if (!id.IsNull()) {
 		p.item_id = id.ToString();
 	}
+	bool has_id = !id.IsNull();
+	for (idx_t c = 0; c < row.size() && !has_id; c++) {
+		has_id = g.columns[c].target == ListWriteTarget::ID && !row[c].IsNull();
+	}
+	if (g.key_column != DConstants::INVALID_INDEX && !has_id) {
+		// Upsert (#97): the item with this key, or a new one.
+		const auto &key = row[g.key_column];
+		if (key.IsNull()) {
+			throw InvalidInputException("sharepoint: writing %s with KEY '%s': a row has no %s", g.target.what,
+			                            g.key_name, g.key_name);
+		}
+		const auto text = KeyText(key);
+		switch (g.keys.Lookup(text, p.item_id)) {
+		case ListKeyIndex::Match::AMBIGUOUS:
+			throw InvalidInputException("sharepoint: writing %s with KEY '%s': several items have %s '%s'",
+			                            g.target.what, g.key_name, g.key_name, text);
+		case ListKeyIndex::Match::REPEATED:
+			throw InvalidInputException("sharepoint: writing %s with KEY '%s': %s '%s' occurs more than once in the "
+			                            "rows written",
+			                            g.target.what, g.key_name, g.key_name, text);
+		default:
+			break;
+		}
+	}
 	for (idx_t c = 0; c < row.size(); c++) {
 		auto &col = g.columns[c];
 		if (col.target == ListWriteTarget::SKIP) {
@@ -1265,6 +1361,7 @@ CopyFunctionExecutionMode ListWriteExecutionMode(bool, bool) {
 void ListCopyOptions(ClientContext &, CopyOptionsInput &input) {
 	AddCopyOption(input.options, kInPlaceMarker, LogicalType::BOOLEAN);
 	AddCopyOption(input.options, "site", LogicalType::VARCHAR);
+	AddCopyOption(input.options, "key", LogicalType::VARCHAR);
 }
 
 BoundStatement ListCopyPlan(Binder &binder, CopyStatement &stmt) {

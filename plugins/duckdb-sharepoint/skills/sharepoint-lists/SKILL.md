@@ -7,7 +7,8 @@ description: >
   VARCHAR or VARCHAR[], lookup value + _id, person name + _email + _id,
   created_by / modified_by), WHERE pushdown to Graph $filter on indexed
   columns (EXPLAIN shows it), paging past 5,000 items, and writing items with
-  COPY ... TO '<list>' (FORMAT sharepoint_list): create, or update by id. Use
+  COPY ... TO '<list>' (FORMAT sharepoint_list): create, update by id, or upsert
+  by KEY '<column>' (sync from another system). Use
   when reading a SharePoint list into SQL, filtering a large list, joining
   lists, or creating and updating list items.
 version: 2026.11.03
@@ -46,6 +47,14 @@ Columns matched by name; `id` present = update, NULL/absent = create. Lookups an
 set through `<name>_id`; read-only columns (created, modified, names, emails) are skipped, so a
 read result can be written back as it is. Sent in `$batch` calls of 20. `SITE 'Sales'` as a
 COPY option for another site.
+
+Upsert by a key column (no `id` needed): `KEY '<column>'` updates the item with that key,
+creates one if none has it. Keys are read once per COPY; text matches exactly, numbers by value.
+A NULL key, a key two items share, or one repeated in the rows is an error (earlier batches
+stay written).
+```sql
+COPY (SELECT order_no AS OrderNo, status AS Status FROM erp_orders) TO 'Orders' (FORMAT sharepoint_list, KEY 'OrderNo');
+```
 
 ## Only what changed
 ```sql

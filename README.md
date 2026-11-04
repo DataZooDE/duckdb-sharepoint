@@ -25,7 +25,7 @@ COPY results TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERW
 |---|---|---|
 | **Files** in document libraries and OneDrive | `read_parquet`, `read_csv`, `read_json`, `glob`, `ATTACH`, DuckLake: anything on a `sharepoint://` path | `COPY … TO 'sharepoint://…'`, streamed |
 | **Excel workbooks**, through the workbook API | `read_excel_table`, `read_excel_range` | `COPY … (FORMAT excel_table \| excel_range)`, in place |
-| **SharePoint lists** | `read_sharepoint_list` | `COPY … (FORMAT sharepoint_list)`: create, or update by `id` |
+| **SharePoint lists** | `read_sharepoint_list` | `COPY … (FORMAT sharepoint_list)`: create, update by `id`, or upsert by `KEY` |
 
 One install, one secret, and app-only or user sign-in. Built for DuckDB
 **v1.5.6** and **2.0**, by [DataZoo](https://data-zoo.de), and the sibling of
@@ -281,6 +281,20 @@ COPY (SELECT 'A-17' AS Title, 120.0 AS Amount, 2 AS Customer_id) TO 'Orders' (FO
 COPY (SELECT id, Amount * 1.1 AS Amount FROM read_sharepoint_list('Orders') WHERE Status = 'open')
 TO 'Orders' (FORMAT sharepoint_list);
 ```
+
+**Upsert by a key.** With `KEY '<column>'`, a row updates the item whose key
+column has its value and creates an item only when none has, so a sync needs
+no `id`:
+
+```sql
+COPY (SELECT order_no AS OrderNo, status AS Status, total AS Amount FROM erp_orders)
+TO 'Orders' (FORMAT sharepoint_list, KEY 'OrderNo');
+```
+
+The list's keys are read once per `COPY`. Text keys match exactly and numbers
+by value (`17` = `17.0`). A row without a key, a key two items share, and a
+key that occurs twice in the rows written are errors; rows sent before the
+error stay written. A row that also has an `id` is updated by its `id`.
 
 **Only what changed.** `sharepoint_list_changes` gives the items created,
 changed or deleted since a token, with the list's columns plus `_change`
