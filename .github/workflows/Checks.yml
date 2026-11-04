@@ -321,7 +321,7 @@ jobs:
           # Least privilege (#70): a second app ("duckdb-sharepoint selected")
           # with only Sites.Selected, granted write on the test site and
           # nothing else; SHAREPOINT_UNGRANTED_SITE is a site it must be refused
-          # (/sites/duckdb-ungranted). REQUIRE: a missing secret fails the job.
+          # (/sites/duckdbungranted). REQUIRE: a missing secret fails the job.
           SHAREPOINT_SELECTED_CLIENT_ID: ${{ secrets.SHAREPOINT_SELECTED_CLIENT_ID }}
           SHAREPOINT_SELECTED_CLIENT_SECRET: ${{ secrets.SHAREPOINT_SELECTED_CLIENT_SECRET }}
           SHAREPOINT_UNGRANTED_SITE: ${{ secrets.SHAREPOINT_UNGRANTED_SITE }}
