@@ -908,18 +908,19 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 ## 17. `ATTACH ... (TYPE sharepoint)` (#60)
 
 - A storage extension: the catalog has one schema, `main`; its tables are the
-  site's lists that are not hidden (`lists?$select=...`, paged), each planned
-  from its own `/columns` by `FetchListPlan` -- the endpoint the scan reads,
-  so the two cannot disagree on an unchanged list. `$expand=columns` on the
-  collection did: on the first live runs every attached list was refused as
-  changed (cause not pinned down). Loaded on first use and kept for the
-  attach; no Graph call at ATTACH itself.
+  site's lists that are not hidden, from one `lists?$expand=columns` call per
+  page, loaded on first use and kept for the attach. No Graph call at ATTACH.
 - Column types come from the definitions only (a catalog declares them before
   data is read): a choice column that may hold several values is always
   `VARCHAR[]`. A table's scan is `read_sharepoint_list`'s table function with
   bind data from `BindListForCatalog` (same plan, `fixed_types`); a list whose
   columns changed since the ATTACH is refused rather than scanned into the
   wrong columns; the error names the first column that differs.
+- `TableCatalogEntry`'s constructor moves `info.columns` out, so a subclass
+  that keeps its own copy (needed in 2.0, where the base holds none) must
+  take it before the base runs -- here as a delegating constructor's
+  argument. Copied in the member initializer, it was empty, and every
+  attached list was refused as changed on the first live runs.
 - Writes: `SharepointModify`, one sink operator for INSERT / UPDATE / DELETE
   over the `$batch` item writer (`ListItemWriter`). INSERT maps
   `column_index_map` so unnamed columns are left out (SharePoint defaults).

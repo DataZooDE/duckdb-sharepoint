@@ -413,26 +413,6 @@ string ResolveSite(GraphClient &client, const AuthContext &auth, const string &s
 	return id;
 }
 
-//! The column plan of the list at `base` ("/v1.0/sites/{s}/lists/{l}"), from
-//! its /columns. The one source for read_sharepoint_list and for an ATTACHed
-//! site's tables, which refuse to scan when the two disagree. ATTACH used to
-//! read `$expand=columns` on the lists collection instead, and on the first
-//! live runs every attached list disagreed with its scan (#60).
-vector<ListOutputColumn> FetchListPlan(GraphClient &client, const string &base, const string &what) {
-	vector<ListColumnDef> defs;
-	picojson::value cols_holder;
-	const auto &cols = AsObject(client.GraphGet(base + "/columns", what), what, cols_holder);
-	auto values = cols.find("value");
-	if (values != cols.end() && values->second.is<picojson::array>()) {
-		for (auto &c : values->second.get<picojson::array>()) {
-			if (c.is<picojson::object>()) {
-				defs.push_back(ParseColumnDef(c.get<picojson::object>()));
-			}
-		}
-	}
-	return PlanListColumns(defs);
-}
-
 //! A list resolved for reading or writing: where it is and its columns.
 struct ListTarget {
 	AuthContext auth;
@@ -462,7 +442,19 @@ ListTarget ResolveList(ClientContext &context, const string &list, const string 
 	    AsObject(client.GraphGet("/v1.0/sites/" + t.site_id + "/lists/" + list_ref + "?$select=id,displayName", t.what),
 	             t.what, holder);
 	t.base = "/v1.0/sites/" + t.site_id + "/lists/" + StringField(meta, "id");
-	t.plan = FetchListPlan(client, t.base, t.what);
+
+	vector<ListColumnDef> defs;
+	picojson::value cols_holder;
+	const auto &cols = AsObject(client.GraphGet(t.base + "/columns", t.what), t.what, cols_holder);
+	auto values = cols.find("value");
+	if (values != cols.end() && values->second.is<picojson::array>()) {
+		for (auto &c : values->second.get<picojson::array>()) {
+			if (c.is<picojson::object>()) {
+				defs.push_back(ParseColumnDef(c.get<picojson::object>()));
+			}
+		}
+	}
+	t.plan = PlanListColumns(defs);
 	return t;
 }
 
@@ -1912,7 +1904,7 @@ vector<CatalogList> ListCatalogLists(ClientContext &context, const string &site,
 	site_id = ResolveSite(client, auth, site);
 	const string what = "the lists of site '" + (site.empty() ? string("(the secret's)") : site) + "'";
 	vector<CatalogList> lists;
-	string next = "/v1.0/sites/" + site_id + "/lists?$select=id,displayName,list";
+	string next = "/v1.0/sites/" + site_id + "/lists?$select=id,displayName,list&$expand=columns";
 	for (int pages = 0; !next.empty(); pages++) {
 		if (pages >= kMaxItemPages) {
 			throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxItemPages);
@@ -1931,11 +1923,19 @@ vector<CatalogList> ListCatalogLists(ClientContext &context, const string &site,
 				    BoolField(info->second.get<picojson::object>(), "hidden")) {
 					continue;
 				}
+				vector<ListColumnDef> defs;
+				auto cols = l.find("columns");
+				if (cols != l.end() && cols->second.is<picojson::array>()) {
+					for (auto &c : cols->second.get<picojson::array>()) {
+						if (c.is<picojson::object>()) {
+							defs.push_back(ParseColumnDef(c.get<picojson::object>()));
+						}
+					}
+				}
 				CatalogList entry;
 				entry.id = StringField(l, "id");
 				entry.name = StringField(l, "displayName");
-				const string base = "/v1.0/sites/" + site_id + "/lists/" + entry.id;
-				for (auto &col : FetchListPlan(client, base, "list '" + entry.name + "'")) {
+				for (auto &col : PlanListColumns(defs)) {
 					entry.column_names.push_back(col.name);
 					entry.column_types.push_back(ToLogicalType(col.may_be_multi ? ListColumnType::VARCHAR_LIST : col.type));
 				}

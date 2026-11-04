@@ -90,8 +90,10 @@ class SharepointTable : public TableCatalogEntry {
 public:
 	SharepointTable(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, string list_id_p,
 	                string site_id_p)
-	    : TableCatalogEntry(catalog, schema, info), list_id(std::move(list_id_p)), site_id(std::move(site_id_p)),
-	      own_columns(info.columns.Copy()) {
+	    // The copy is taken here, as an argument: TableCatalogEntry's
+	    // constructor moves info.columns out, so copying in the member
+	    // initializer copied an empty list (#60, seen live).
+	    : SharepointTable(catalog, schema, info, info.columns.Copy(), std::move(list_id_p), std::move(site_id_p)) {
 	}
 
 	// Pure in 2.0 (the base no longer holds the columns); a non-virtual member
@@ -142,6 +144,12 @@ public:
 	string site_id;
 
 private:
+	SharepointTable(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, ColumnList columns,
+	                string list_id_p, string site_id_p)
+	    : TableCatalogEntry(catalog, schema, info), list_id(std::move(list_id_p)), site_id(std::move(site_id_p)),
+	      own_columns(std::move(columns)) {
+	}
+
 	ColumnList own_columns;
 };
 
