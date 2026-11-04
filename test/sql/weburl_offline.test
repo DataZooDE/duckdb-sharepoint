@@ -1,0 +1,92 @@
+# name: test/sql/weburl_offline.test
+# description: browser URLs, SITE_URL and the discovery functions (#95), offline
+# group: [sharepoint]
+#
+# No credentials: what is checked before any network call. That a URL, a
+# sharing link and SITE_URL reach the right file is e2e/tests/test_browser_urls.py.
+
+require sharepoint
+
+# A SharePoint browser URL is ours, not httpfs's: without a secret the error is
+# the extension's, not an anonymous HTTP request's.
+statement error
+SELECT * FROM read_csv('https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/x.csv');
+----
+no `sharepoint` secret configured
+
+statement error
+SELECT file_size('https://contoso.sharepoint.com/sites/Sales/Shared%20Documents/x.csv');
+----
+secret configured for
+
+statement error
+SELECT * FROM read_excel_table('https://contoso.sharepoint.com/:x:/s/Sales/EabCdEf?e=1', 'Sales');
+----
+no `sharepoint` secret configured
+
+# SITE_URL is checked when the secret is created.
+statement ok
+CREATE SECRET by_url (TYPE sharepoint, PROVIDER client_credentials, TENANT_ID 'contoso.onmicrosoft.com',
+    CLIENT_ID 'x', CLIENT_SECRET 'y', SITE_URL 'https://contoso.sharepoint.com/sites/Sales', DRIVE 'Documents');
+
+query II
+SELECT secret_string LIKE '%site_url=https://contoso.sharepoint.com/sites/Sales%',
+       secret_string LIKE '%drive=Documents%'
+FROM duckdb_secrets() WHERE name = 'by_url';
+----
+true	true
+
+statement ok
+DROP SECRET by_url;
+
+statement error
+CREATE SECRET bad (TYPE sharepoint, PROVIDER client_credentials, TENANT_ID 't', CLIENT_ID 'x', CLIENT_SECRET 'y',
+    SITE_URL 'https://example.com/sites/Sales');
+----
+is not a site address
+
+statement error
+CREATE SECRET bad (TYPE sharepoint, PROVIDER client_credentials, TENANT_ID 't', CLIENT_ID 'x', CLIENT_SECRET 'y',
+    SITE_URL 'https://contoso.sharepoint.com/:x:/s/Sales/Eab');
+----
+is not a site address
+
+statement error
+CREATE SECRET bad (TYPE sharepoint, PROVIDER client_credentials, TENANT_ID 't', CLIENT_ID 'x', CLIENT_SECRET 'y',
+    DRIVE 'Documents');
+----
+give the site too
+
+# credential_chain accepts SITE_URL as its location.
+statement ok
+CREATE SECRET chain (TYPE sharepoint, PROVIDER credential_chain, SITE_URL 'https://contoso.sharepoint.com/sites/Sales');
+
+statement ok
+DROP SECRET chain;
+
+# The discovery functions exist and need a secret, like everything else.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('sharepoint_sites', 'sharepoint_drives');
+----
+3
+
+statement error
+SELECT * FROM sharepoint_sites();
+----
+no `sharepoint` secret configured
+
+statement error
+SELECT * FROM sharepoint_drives('https://contoso.sharepoint.com/sites/Sales');
+----
+no `sharepoint` secret configured
+
+# read_onenote_pages (#102): registered; needs a secret like everything else.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'read_onenote_pages';
+----
+1
+
+statement error
+SELECT * FROM read_onenote_pages(notebook := 'Projects');
+----
+no `sharepoint` secret configured

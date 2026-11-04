@@ -2,6 +2,8 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace duckdb {
@@ -164,6 +166,30 @@ struct ListWriteColumn {
 //! the list does not have.
 bool PlanListWrite(const std::vector<std::string> &copy_names, const std::vector<ListOutputColumn> &plan,
                    std::vector<ListWriteColumn> &out, std::string &error);
+
+//! The text a KEY column's value is matched by (#97): a number in one
+//! canonical form (17, 17.0 and 1.7e1 are all "17"), so a key read from Graph
+//! as JSON and one written from SQL agree.
+std::string ListKeyOfNumber(double value);
+
+//! Upsert by key (#97): which existing item a row's key names. Built from the
+//! list's items, then asked once per written row.
+class ListKeyIndex {
+public:
+	//! An existing item and its key ("" = no key: never matched).
+	void AddItem(const std::string &key, const std::string &item_id);
+
+	enum class Match { CREATE, UPDATE, AMBIGUOUS, REPEATED };
+	//! For one row's key: UPDATE `item_id`, or CREATE (no item has it), or
+	//! AMBIGUOUS (several items have it), or REPEATED (an earlier row of this
+	//! write had it -- which of the two should win is not ours to guess).
+	Match Lookup(const std::string &key, std::string &item_id);
+
+private:
+	std::unordered_map<std::string, std::string> items_;
+	std::unordered_set<std::string> ambiguous_;
+	std::unordered_set<std::string> seen_;
+};
 
 } // namespace sharepoint
 } // namespace duckdb

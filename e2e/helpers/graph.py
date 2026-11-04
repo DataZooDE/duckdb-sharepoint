@@ -158,3 +158,27 @@ class Graph:
             out.extend(body.get("value", []))
             url = body.get("@odata.nextLink", "")
         return out
+
+    def get(self, path: str) -> dict:
+        """GET a Graph path ("/drives/{id}?$select=webUrl"), as JSON."""
+        r = self._req("GET", f"{GRAPH}{path}")
+        r.raise_for_status()
+        return r.json()
+
+    def web_url(self) -> str:
+        """The drive's (document library's) address as the browser shows it."""
+        return self.get(f"/drives/{self.drive_id}?$select=webUrl")["webUrl"].rstrip("/")
+
+    def site_web_url(self) -> str:
+        """The address of the site the drive belongs to."""
+        site = self.get(f"/drives/{self.drive_id}/list?$select=parentReference")["parentReference"]["siteId"]
+        return self.get(f"/sites/{site}?$select=webUrl")["webUrl"].rstrip("/")
+
+    def share_link(self, path: str) -> str:
+        """An organization-wide view link to the item at `path` (a "sharing
+        link" as Copy link gives it)."""
+        item = self.stat(path)
+        r = self._req("POST", f"{GRAPH}/drives/{self.drive_id}/items/{item['id']}/createLink",
+                      json={"type": "view", "scope": "organization"})
+        r.raise_for_status()
+        return r.json()["link"]["webUrl"]

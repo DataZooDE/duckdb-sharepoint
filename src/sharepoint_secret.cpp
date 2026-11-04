@@ -6,6 +6,7 @@
 // drive_id and site_id are identifiers, not secrets, so they are shown.
 #include "sharepoint_secret.hpp"
 #include "sharepoint_delegated.hpp"
+#include "sharepoint_weburl.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -37,14 +38,37 @@ bool HasNonEmptyOption(const CreateSecretInput &input, const char *key) {
 // here; the token is not fetched until first use (GetAuthContext), so CREATE
 // SECRET makes no network call and a rotated secret needs no recreation.
 // ---------------------------------------------------------------------------
+// Where the paths hang off: DRIVE_ID, or SITE_ID / SITE_URL (the site's
+// default library, or DRIVE by name), resolved at first use. SITE_URL is the
+// address from the browser (#95); it is checked here, offline.
+void CopyLocationOptions(CreateSecretInput &input, KeyValueSecret &result) {
+	CopyOption(input, result, "drive_id");
+	CopyOption(input, result, "site_id");
+	CopyOption(input, result, "site_url");
+	CopyOption(input, result, "drive");
+	if (HasNonEmptyOption(input, "site_url")) {
+		const auto site_url = input.options.find("site_url")->second.ToString();
+		const auto parsed = ParseSharepointWebUrl(site_url);
+		if (!parsed.ok || parsed.url.kind != WebUrlKind::DIRECT) {
+			throw InvalidInputException("sharepoint secret: SITE_URL '%s' is not a site address; copy it from the "
+			                            "browser, e.g. 'https://contoso.sharepoint.com/sites/Sales'",
+			                            site_url);
+		}
+	}
+	if (HasNonEmptyOption(input, "drive") && !HasNonEmptyOption(input, "site_url") &&
+	    !HasNonEmptyOption(input, "site_id")) {
+		throw InvalidInputException("sharepoint secret: DRIVE names a document library of a site; give the site "
+		                            "too (SITE_URL or SITE_ID)");
+	}
+}
+
 unique_ptr<BaseSecret> CreateClientCredentialsSecret(ClientContext &, CreateSecretInput &input) {
 	auto result = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
 
 	CopyOption(input, *result, "tenant_id");
 	CopyOption(input, *result, "client_id");
 	CopyOption(input, *result, "client_secret");
-	CopyOption(input, *result, "drive_id");
-	CopyOption(input, *result, "site_id");
+	CopyLocationOptions(input, *result);
 	// Named GRAPH_SCOPE, NOT SCOPE: DuckDB's CREATE SECRET grammar hard-codes
 	// SCOPE as the secret's path-prefix list, so an option of that name never
 	// reaches input.options. Left unset, the scope defaults at use time to
@@ -59,7 +83,7 @@ unique_ptr<BaseSecret> CreateClientCredentialsSecret(ClientContext &, CreateSecr
 			    "Files.ReadWrite.All) APPLICATION permission with admin consent, then:\n"
 			    "  CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,\n"
 			    "                    TENANT_ID '...', CLIENT_ID '...', CLIENT_SECRET '...',\n"
-			    "                    DRIVE_ID 'b!...');");
+			    "                    SITE_URL 'https://contoso.sharepoint.com/sites/Sales');");
 		}
 	}
 
@@ -85,8 +109,7 @@ unique_ptr<BaseSecret> CreateClientCertificateSecret(ClientContext &, CreateSecr
 	CopyOption(input, *result, "client_id");
 	CopyOption(input, *result, "certificate_path");
 	CopyOption(input, *result, "certificate_password");
-	CopyOption(input, *result, "drive_id");
-	CopyOption(input, *result, "site_id");
+	CopyLocationOptions(input, *result);
 	CopyOption(input, *result, "graph_scope");
 
 	for (const char *required : {"tenant_id", "client_id", "certificate_path"}) {
@@ -97,7 +120,7 @@ unique_ptr<BaseSecret> CreateClientCertificateSecret(ClientContext &, CreateSecr
 			    "certificate to the app registration (Certificates & secrets), then:\n"
 			    "  CREATE SECRET sp (TYPE sharepoint, PROVIDER client_certificate,\n"
 			    "                    TENANT_ID '...', CLIENT_ID '...', CERTIFICATE_PATH '/etc/sp/app.pem',\n"
-			    "                    DRIVE_ID 'b!...');");
+			    "                    SITE_URL 'https://contoso.sharepoint.com/sites/Sales');");
 		}
 	}
 
@@ -114,12 +137,12 @@ unique_ptr<BaseSecret> CreateClientCertificateSecret(ClientContext &, CreateSecr
 unique_ptr<BaseSecret> CreateCredentialChainSecret(ClientContext &, CreateSecretInput &input) {
 	auto result = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
 	CopyOption(input, *result, "client_id");
-	CopyOption(input, *result, "drive_id");
-	CopyOption(input, *result, "site_id");
+	CopyLocationOptions(input, *result);
 	CopyOption(input, *result, "graph_scope");
-	if (!HasNonEmptyOption(input, "drive_id") && !HasNonEmptyOption(input, "site_id")) {
-		throw InvalidInputException("sharepoint secret (PROVIDER credential_chain) needs DRIVE_ID or SITE_ID:\n"
-		                            "  CREATE SECRET sp (TYPE sharepoint, PROVIDER credential_chain, DRIVE_ID 'b!...');");
+	if (!HasNonEmptyOption(input, "drive_id") && !HasNonEmptyOption(input, "site_id") &&
+	    !HasNonEmptyOption(input, "site_url")) {
+		throw InvalidInputException("sharepoint secret (PROVIDER credential_chain) needs SITE_URL, DRIVE_ID or SITE_ID:\n"
+		                            "  CREATE SECRET sp (TYPE sharepoint, PROVIDER credential_chain, SITE_URL 'https://contoso.sharepoint.com/sites/Sales');");
 	}
 	return std::move(result);
 }
@@ -135,8 +158,7 @@ unique_ptr<BaseSecret> CreateConfigSecret(ClientContext &, CreateSecretInput &in
 	CopyOption(input, *result, "tenant_id");
 	CopyOption(input, *result, "client_id");
 	CopyOption(input, *result, "client_secret");
-	CopyOption(input, *result, "drive_id");
-	CopyOption(input, *result, "site_id");
+	CopyLocationOptions(input, *result);
 	CopyOption(input, *result, "graph_scope");
 
 	if (!HasNonEmptyOption(input, "access_token") && !HasNonEmptyOption(input, "refresh_token")) {
@@ -181,8 +203,7 @@ void CopyDelegatedOptions(CreateSecretInput &input, KeyValueSecret &result, cons
 	CopyOption(input, result, "tenant_id");
 	CopyOption(input, result, "client_id");
 	CopyOption(input, result, "refresh_token");
-	CopyOption(input, result, "drive_id");
-	CopyOption(input, result, "site_id");
+	CopyLocationOptions(input, result);
 	CopyOption(input, result, "graph_scope");
 	if (!HasNonEmptyOption(input, "tenant_id") || !HasNonEmptyOption(input, "client_id")) {
 		throw InvalidInputException(
@@ -190,7 +211,7 @@ void CopyDelegatedOptions(CreateSecretInput &input, KeyValueSecret &result, cons
 		    "public client flows enabled and the delegated Files.ReadWrite.All, Sites.ReadWrite.All and "
 		    "offline_access permissions, e.g.\n"
 		    "  CREATE SECRET sp_user (TYPE sharepoint, PROVIDER %s,\n"
-		    "                         TENANT_ID '...', CLIENT_ID '...', DRIVE_ID 'b!...');",
+		    "                         TENANT_ID '...', CLIENT_ID '...', SITE_URL 'https://contoso.sharepoint.com/sites/Sales');",
 		    provider, provider);
 	}
 	// Redacted from the outset: the refresh token is written back after the
@@ -225,6 +246,10 @@ void RegisterCommonParameters(CreateSecretFunction &function) {
 	// drive_id is not given. Exactly one is expected.
 	function.named_parameters["drive_id"] = LogicalType(LogicalTypeId::VARCHAR);
 	function.named_parameters["site_id"] = LogicalType(LogicalTypeId::VARCHAR);
+	// site_url: the site's address from the browser; drive: one of its
+	// document libraries by name (default: the site's default library).
+	function.named_parameters["site_url"] = LogicalType(LogicalTypeId::VARCHAR);
+	function.named_parameters["drive"] = LogicalType(LogicalTypeId::VARCHAR);
 	function.named_parameters["graph_scope"] = LogicalType(LogicalTypeId::VARCHAR);
 }
 

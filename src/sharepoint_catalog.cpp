@@ -21,7 +21,9 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/common/mutex.hpp"
@@ -84,6 +86,17 @@ void SetSchemaName(CreateSchemaInfo &info, const string &name) {
 }
 
 class SharepointSchema;
+
+//! A CreateTableInfo's table name: GetTableName() in 2.0, the `table`
+//! member before.
+template <class INFO>
+auto TableNameOf(const INFO &info, int) -> decltype(duckdb_compat::Str(info.GetTableName())) {
+	return duckdb_compat::Str(info.GetTableName());
+}
+template <class INFO>
+auto TableNameOf(const INFO &info, long) -> decltype(duckdb_compat::Str(info.table)) {
+	return duckdb_compat::Str(info.table);
+}
 
 // --- Table: one list ------------------------------------------------------------
 class SharepointTable : public TableCatalogEntry {
@@ -200,8 +213,51 @@ public:
 	optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction, CreateFunctionInfo &) override {
 		ReadOnly("CREATE FUNCTION");
 	}
-	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction, BoundCreateTableInfo &) override {
-		ReadOnly("CREATE TABLE");
+	//! CREATE TABLE: a new list (#97); CREATE TABLE AS creates it the same
+	//! way at execution (SharepointModify) and then inserts.
+	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction transaction, BoundCreateTableInfo &info) override {
+		if (!transaction.context) {
+			throw InvalidInputException("sharepoint: CREATE TABLE on an attached site needs a client connection");
+		}
+		return CreateList(*transaction.context, info).get();
+	}
+
+	//! The list for `info`: created, or -- IF NOT EXISTS -- the one there.
+	optional_ptr<SharepointTable> CreateList(ClientContext &context, BoundCreateTableInfo &info) {
+		Load(context);
+		auto &base = info.Base();
+		const string name = TableNameOf(base, 0);
+		{
+			lock_guard<mutex> guard(lock);
+			for (auto &table : tables) {
+				if (StringUtil::CIEquals(duckdb_compat::Str(table->name), name)) {
+					if (base.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+						return table.get();
+					}
+					throw CatalogException("sharepoint: the site already has a list '%s'%s", name,
+					                       base.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT
+					                           ? " (OR REPLACE would delete its items; DROP is not supported)"
+					                           : "");
+				}
+			}
+		}
+		vector<string> names;
+		vector<LogicalType> types;
+		for (auto &col : base.columns.Logical()) {
+			names.push_back(duckdb_compat::Str(col.Name()));
+			types.push_back(col.Type());
+		}
+		const auto list_id = CreateListForCatalog(context, site_id, name, names, types);
+		// The table as the scan will see the list: from its own column plan.
+		auto list = CatalogListOf(context, site_id, list_id);
+		CreateTableInfo entry_info(*this, duckdb_compat::FunctionName(name));
+		for (idx_t i = 0; i < list.column_names.size(); i++) {
+			entry_info.columns.AddColumn(
+			    ColumnDefinition(duckdb_compat::FunctionName(list.column_names[i]), list.column_types[i]));
+		}
+		lock_guard<mutex> guard(lock);
+		tables.push_back(make_uniq<SharepointTable>(catalog, *this, entry_info, list_id, site_id));
+		return tables.back().get();
 	}
 	optional_ptr<CatalogEntry> CreateView(CatalogTransaction, CreateViewInfo &) override {
 		ReadOnly("CREATE VIEW");
@@ -239,7 +295,6 @@ private:
 		if (loaded) {
 			return;
 		}
-		string site_id;
 		auto lists = ListCatalogLists(context, site, site_id);
 		case_insensitive_set_t used;
 		for (auto &list : lists) {
@@ -259,6 +314,7 @@ private:
 	}
 
 	string site;
+	string site_id; // the site's Graph id, once loaded
 	mutex lock;
 	bool loaded = false;
 	vector<unique_ptr<SharepointTable>> tables;
@@ -272,14 +328,20 @@ struct ModifyState : public GlobalSinkState {
 	bool returned = false;
 };
 
+//! CREATE TABLE AS (#97): the list is created when the insert starts.
+struct CreateTarget {
+	SharepointSchema &schema;
+	unique_ptr<BoundCreateTableInfo> info;
+};
+
 class SharepointModify : public PhysicalOperator {
 public:
-	SharepointModify(PhysicalPlan &plan, ModifyKind kind_p, SharepointTable &table_p, vector<string> names_p,
-	                 vector<idx_t> source_p, vector<unique_ptr<Expression>> expressions_p, idx_t row_id_p,
-	                 idx_t estimated_cardinality)
+	SharepointModify(PhysicalPlan &plan, ModifyKind kind_p, optional_ptr<SharepointTable> table_p,
+	                 vector<string> names_p, vector<idx_t> source_p, vector<unique_ptr<Expression>> expressions_p,
+	                 idx_t row_id_p, idx_t estimated_cardinality, unique_ptr<CreateTarget> create_p = nullptr)
 	    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, {LogicalType::BIGINT}, estimated_cardinality),
 	      kind(kind_p), table(table_p), names(std::move(names_p)), source(std::move(source_p)),
-	      expressions(std::move(expressions_p)), row_id(row_id_p) {
+	      expressions(std::move(expressions_p)), row_id(row_id_p), create(std::move(create_p)) {
 	}
 
 	string GetName() const override {
@@ -290,8 +352,14 @@ public:
 
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
 		auto state = make_uniq<ModifyState>();
-		state->writer =
-		    make_uniq<ListItemWriter>(context, table.list_id, table.site_id, names, kind == ModifyKind::DELETE);
+		auto target = table;
+		DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
+			if (create) {
+				target = create->schema.CreateList(context, *create->info);
+			}
+			state->writer =
+			    make_uniq<ListItemWriter>(context, target->list_id, target->site_id, names, kind == ModifyKind::DELETE);
+		});
 		return std::move(state);
 	}
 
@@ -360,11 +428,12 @@ public:
 
 private:
 	ModifyKind kind;
-	SharepointTable &table;
+	optional_ptr<SharepointTable> table; // null for CREATE TABLE AS: `create` makes it
 	vector<string> names;              // the list columns written, in `source` / expression order
 	vector<idx_t> source;              // INSERT: the child column of each name
 	vector<unique_ptr<Expression>> expressions; // UPDATE: the new values
 	idx_t row_id;                      // DELETE: the child column holding the row id
+	unique_ptr<CreateTarget> create;   // CREATE TABLE AS
 };
 
 // --- Catalog ----------------------------------------------------------------------
@@ -399,9 +468,21 @@ public:
 	void ScanSchemas(ClientContext &, std::function<void(SchemaCatalogEntry &)> callback) override {
 		callback(*main_schema);
 	}
-	PhysicalOperator &PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &, LogicalCreateTable &,
-	                                    PhysicalOperator &) override {
-		ReadOnly("CREATE TABLE AS");
+	PhysicalOperator &PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &planner, LogicalCreateTable &op,
+	                                    PhysicalOperator &plan) override {
+		// The new list's columns are the query's, in order (#97).
+		vector<string> names;
+		vector<idx_t> source;
+		for (auto &col : op.info->Base().columns.Logical()) {
+			source.push_back(names.size());
+			names.push_back(duckdb_compat::Str(col.Name()));
+		}
+		auto create = make_uniq<CreateTarget>(CreateTarget {op.schema.Cast<SharepointSchema>(), std::move(op.info)});
+		auto &insert = planner.Make<SharepointModify>(ModifyKind::INSERT, nullptr, std::move(names), std::move(source),
+		                                              vector<unique_ptr<Expression>>(), 0, op.estimated_cardinality,
+		                                              std::move(create));
+		insert.children.push_back(plan);
+		return insert;
 	}
 	PhysicalOperator &PlanInsert(ClientContext &, PhysicalPlanGenerator &planner, LogicalInsert &op,
 	                             optional_ptr<PhysicalOperator> plan) override {

@@ -807,6 +807,17 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - **In place.** The target is a list, not a file, but COPY's temp-file rename
   would still be attempted for a name that exists as a local file; the same
   rewrite as the Excel writers (`sharepoint_copy_rewrite.hpp`) rules it out.
+- **Upsert by KEY (#97).** `KEY '<column>'` (a written column, checked at
+  bind) reads every item's id and key once, at the start of the COPY
+  (`items?$expand=fields($select=id,<key>)`, paged), into a `ListKeyIndex`
+  (pure, Catch2-tested). Each row without an `id` is then a PATCH of the item
+  with its key or a POST. Text keys compare exactly, numbers canonically
+  (`ListKeyOfNumber`: 17 = 17.0). Refused, because which item or row should
+  win is not ours to guess: a NULL key, a key two items share, a key repeated
+  in the rows written. A refusal mid-COPY leaves the batches already sent
+  written (a COPY to a list is not transactional). One read of the whole key
+  column per COPY rather than a `$filter` per batch: a list sync writes many
+  rows, and a filter needs the key indexed.
 
 ## 11. File versions: `sharepoint_versions` and `?version=` (#66)
 
@@ -941,6 +952,16 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - 1.5 / 2.0: the catalog API is the same but for names (`string` vs
   `Identifier`: `FunctionName`, `SetQualifiedName` via SFINAE), a few pure
   virtuals (no `override`), and `Expression::GetReturnType()`.
+- CREATE TABLE (#97): `SharepointSchema::CreateList` POSTs a generic list
+  (`CreateListForCatalog`: VARCHAR text, numbers number, BOOLEAN boolean,
+  DATE dateOnly, TIMESTAMP dateTime; `Title` is the list's own; the internal
+  name keeps letters, digits and `_`, the display name is the column name),
+  then builds the catalog entry from the new list's own column plan
+  (`CatalogListOf`), so the scan's column check sees what a fresh ATTACH
+  would. CREATE TABLE AS is `PlanCreateTableAs` -> the INSERT operator with a
+  `CreateTarget`: the list is created when the operator's sink state is made,
+  as DuckDB's postgres scanner does it, then the rows stream through the
+  item writer. `OR REPLACE` is refused (it would mean deleting a list).
 - Transactions: none -- each statement goes straight to Graph.
 
 ## 18. Planner and To Do (#68)
@@ -954,3 +975,38 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   default) and are read as UTC.
 - Not verified live: needs `Tasks.Read.All` for the CI app and a test plan
   (`SHAREPOINT_PLANNER_PLAN_ID`, `SHAREPOINT_TODO_USER`).
+
+## 19. Browser addresses, `SITE_URL`, `sharepoint_sites` / `sharepoint_drives` (#95)
+
+- **Which filesystem.** DuckDB gives a path to the *last* registered
+  filesystem whose `CanHandleFile` accepts it, unless one returns
+  `IsManuallySet()`. httpfs claims every `https://`, so a SharePoint URL would
+  go to whichever loaded last -- httpfs autoloads on the first other https
+  path. `SharepointFileSystem::IsManuallySet()` returns true, and
+  `CanHandleFile` claims only `https://*.sharepoint.com` (and the US Gov /
+  China hosts); every other https URL stays with httpfs (checked locally,
+  httpfs loaded after sharepoint).
+- **Where it resolves.** Every filesystem entry point (and `OpenWorkbook`,
+  `sharepoint_versions`) calls `ResolveSharepointPath` instead of
+  `GetAuthContext`: a `sharepoint://` path is itself; a direct URL becomes
+  (the library's drive, `sharepoint://<path in it>`) by matching the site's
+  libraries' `webUrl` (one `/sites/{host}:/{path}` and one `/drives` call per
+  site, cached per credentials); a sharing link becomes
+  `sharepoint://id:<item>` on the item's drive via
+  `GET /shares/u!{base64url}/driveItem` (cached). The auth context gets that
+  drive and the identity `Fingerprint(credential_fp, graph, drive)` --
+  the same formula as for `sharepoint://`, so the block cache and the
+  same-drive check on moves see one file whichever way it is named.
+- **Back to URLs.** A glob under a browser URL returns browser URLs (the
+  library's webUrl + percent-encoded path), and `sharepoint_versions(url)`
+  returns `url?version=<label>`; a `sharepoint://` result there would bind to
+  the *secret's* drive. `version=` is the one query parameter kept; the
+  browser's own (`web=1`, `d=`, `e=`) are dropped. `/:x:/r/<path>` (a redirect
+  link) carries its path and is direct; `/:x:/s/...` and `_layouts/...Doc.aspx`
+  go to `/shares`.
+- **Secrets without a drive.** `GetAuthContext(..., require_drive=false)`
+  for the discovery functions, browser URLs and `site :=`: a secret may name
+  no drive at all. `SITE_URL` (+ `DRIVE` by name, or a library's own address)
+  resolves like `SITE_ID`, once per credentials + site + library.
+- **Scope.** `read_sharepoint_files` and `sharepoint_changes` keep
+  `sharepoint://` only: their output paths are relative to the secret's drive.

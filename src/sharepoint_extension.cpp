@@ -7,6 +7,8 @@
 #include "sharepoint_list_functions.hpp"
 #include "sharepoint_tasks.hpp"
 #include "sharepoint_permissions_functions.hpp"
+#include "sharepoint_discovery.hpp"
+#include "sharepoint_onenote.hpp"
 #include "sharepoint_catalog.hpp"
 #include "sharepoint_changes.hpp"
 #include "sharepoint_versions.hpp"
@@ -187,6 +189,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// read_sharepoint_list(): a SharePoint list as a table, same secret.
 	sharepoint::RegisterListFunctions(loader);
 	sharepoint::RegisterTaskFunctions(loader);
+	// sharepoint_sites() / sharepoint_drives(): find a site and library (#95).
+	sharepoint::RegisterDiscoveryFunctions(loader);
+	// read_onenote_pages(): OneNote pages with change times (#102).
+	sharepoint::RegisterOneNoteFunctions(loader);
 	// ATTACH 'sharepoint://sites/x' (TYPE sharepoint): a site's lists as tables.
 	sharepoint::RegisterSharepointCatalog(loader);
 	sharepoint::RegisterChangeFunctions(loader);

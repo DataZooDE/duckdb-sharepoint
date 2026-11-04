@@ -8,6 +8,9 @@ class ExtensionLoader;
 
 namespace sharepoint {
 
+class GraphClient;
+struct AuthContext;
+
 //! Registers read_sharepoint_list(list, site := ...): a SharePoint list as a
 //! table through Microsoft Graph, over the same secret as sharepoint://. See
 //! docs/hld.md §10.
@@ -28,6 +31,11 @@ struct CatalogList {
 //! one Graph call per page of lists ($expand=columns). Also the site's id.
 vector<CatalogList> ListCatalogLists(ClientContext &context, const string &site, string &site_id);
 
+//! The Graph site id for `site` as read_sharepoint_list's site := takes it:
+//! empty (the secret's own site), a browser URL, "Sales", "sites/Sales",
+//! "host:/sites/Sales", or a site id.
+string ResolveSiteId(GraphClient &client, const AuthContext &auth, const string &site);
+
 //! read_sharepoint_list's table function (scan, filter and projection
 //! pushdown), for a catalog table's GetScanFunction.
 TableFunction ListScanFunction();
@@ -38,6 +46,16 @@ TableFunction ListScanFunction();
 unique_ptr<FunctionData> BindListForCatalog(ClientContext &context, const string &list_id, const string &site_id,
                                             TableCatalogEntry &table, vector<string> &names,
                                             vector<LogicalType> &types);
+
+//! One list as ListCatalogLists shows it, by id (for a list just created).
+CatalogList CatalogListOf(ClientContext &context, const string &site_id, const string &list_id);
+
+//! CREATE TABLE on an ATTACHed site (#97): a new generic list named `name`,
+//! one column per name (text, number, boolean, date-only or date-time from
+//! the DuckDB type; "Title" is the list's own). Its id. Needs
+//! Sites.Manage.All.
+string CreateListForCatalog(ClientContext &context, const string &site_id, const string &name,
+                            const vector<string> &column_names, const vector<LogicalType> &column_types);
 
 //! Writes items of one list in $batch calls of 20: an ATTACHed table's
 //! INSERT, UPDATE and DELETE. Columns are matched by name as COPY ... (FORMAT

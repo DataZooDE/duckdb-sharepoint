@@ -19,5 +19,11 @@ SELECT * FROM sales.Orders;
 ----
 no `sharepoint` secret configured
 
+# CREATE TABLE (AS) creates a list (#97): it gets as far as needing a secret.
+statement error
+CREATE TABLE sales.Forecast AS SELECT 1 AS Amount;
+----
+no `sharepoint` secret configured
+
 statement ok
 DETACH sales;

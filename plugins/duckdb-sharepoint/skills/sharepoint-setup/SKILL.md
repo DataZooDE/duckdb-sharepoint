@@ -6,7 +6,8 @@ description: >
   client secret), client_certificate (app-only, PEM certificate),
   credential_chain (the Azure workload's own identity, no secret), device_code
   and authorization_code (as a user, refresh token kept in the secret), config
-  (a token you already have); TENANT_ID, CLIENT_ID, DRIVE_ID or SITE_ID,
+  (a token you already have); TENANT_ID, CLIENT_ID, SITE_URL (+ DRIVE) or DRIVE_ID / SITE_ID,
+  sharepoint_sites() / sharepoint_drives() to find them,
   GRAPH_SCOPE (never SCOPE); which Graph permissions each feature needs
   (Sites.ReadWrite.All, Sites.Manage.All, Sites.Selected least privilege);
   national clouds; and what Entra/Graph errors mean (AADSTS700016,
@@ -35,13 +36,15 @@ LOAD sharepoint;
 | `authorization_code` | as yourself, browser on this machine | `TENANT_ID`, `CLIENT_ID`, optional `REDIRECT_PORT` (8020) |
 | `config` | a token you have | `ACCESS_TOKEN`, or `REFRESH_TOKEN` + `TENANT_ID` + `CLIENT_ID` |
 
-Every provider also takes `DRIVE_ID` (a document library, `b!...`) **or** `SITE_ID`
-(its default library), and optional `GRAPH_SCOPE`.
+Every provider also takes where `sharepoint://` paths hang off: `SITE_URL` (the site's address
+from the browser; its default library, or `DRIVE '<library name>'`; a library's own address
+picks that library), **or** `DRIVE_ID` (`b!...`) / `SITE_ID` (Graph ids); and optional
+`GRAPH_SCOPE`. None is required for browser-address paths, `site :=` and discovery.
 
 ```sql
 CREATE SECRET sp (TYPE sharepoint, PROVIDER client_credentials,
     TENANT_ID 'contoso.onmicrosoft.com', CLIENT_ID '...', CLIENT_SECRET '...',
-    DRIVE_ID 'b!...');
+    SITE_URL 'https://contoso.sharepoint.com/sites/Sales');
 CREATE PERSISTENT SECRET me (TYPE sharepoint, PROVIDER device_code,
     TENANT_ID 'contoso.onmicrosoft.com', CLIENT_ID '...', DRIVE_ID 'b!...');
 CREATE SECRET az (TYPE sharepoint, PROVIDER credential_chain, DRIVE_ID 'b!...');
@@ -59,6 +62,14 @@ Rules that bite:
 - Credentials go in the secret, never in queries; `getenv('...')` works in CREATE SECRET.
 - A `PERSISTENT` delegated secret stores its refresh token on disk (redacted in
   `duckdb_secrets()`); Entra rotates it, the extension writes the newest back.
+
+## Finding the site and library
+```sql
+SELECT name, web_url FROM sharepoint_sites();            -- or sharepoint_sites(search := 'Sales')
+SELECT name, web_url, id FROM sharepoint_drives('https://contoso.sharepoint.com/sites/Sales');
+```
+`web_url` → `SITE_URL` / paths, `name` → `DRIVE`, `id` → `DRIVE_ID`. Work before the secret
+names any drive. App-only `sharepoint_sites()` needs `Sites.Read.All` or `Sites.ReadWrite.All`.
 
 ## Permissions (Graph, admin consent)
 - Files, Excel: `Files.ReadWrite.All` or `Sites.ReadWrite.All`.

@@ -41,6 +41,9 @@ struct AuthContext {
 	string drive_id;
 	//! Graph base URL (sharepoint_graph_endpoint), no trailing slash.
 	string graph_endpoint;
+	//! Fingerprint of the credentials and cloud alone: with another drive id,
+	//! the identity of the same principal on that drive (browser URLs, #95).
+	string credential_fp;
 
 	//! Identity fingerprint: SHA-256 over the credential material, the Graph
 	//! cloud and the drive -- the key any per-identity cache (block cache) must
@@ -68,7 +71,27 @@ struct AuthContext {
 //!   * PROVIDER device_code / authorization_code -> the delegated sign-in on
 //!     first use (sharepoint_delegated_flow.hpp), the refresh token stored
 //!     back into the secret, then grant_type=refresh_token as a public client.
-AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path);
+//!
+//! `require_drive` false: a secret that names no drive (no SITE_URL,
+//! DRIVE_ID or SITE_ID) is accepted with an empty drive_id -- for the
+//! discovery functions that find one (#95).
+AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path, bool require_drive = true);
+
+//! A path as the filesystem works on it (#95): `path` is a sharepoint://
+//! path on `auth.drive_id`. A sharepoint:// path is itself, on the secret's
+//! drive. A browser URL is resolved -- a direct one to its library and the
+//! path in it (`web_prefix` = the library's webUrl, to map results back), a
+//! sharing link to "sharepoint://id:<item>" on the item's drive. Cached.
+struct ResolvedPath {
+	AuthContext auth;
+	string path;
+	string web_prefix;
+};
+ResolvedPath ResolveSharepointPath(optional_ptr<FileOpener> opener, const string &path);
+
+//! `root_relative` (a path in target's drive) as the caller wrote paths: a
+//! browser URL under the same library, or a sharepoint:// path.
+string WebPathOf(const ResolvedPath &target, const string &root_relative);
 
 //! True if any `sharepoint` secret exists at all (whatever its scope). Lets
 //! FileExists answer core's speculative probes with false when the extension
