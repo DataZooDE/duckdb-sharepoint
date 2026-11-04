@@ -240,6 +240,17 @@ COPY (SELECT id, Amount * 1.1 AS Amount FROM read_sharepoint_list('Orders') WHER
 TO 'Orders' (FORMAT sharepoint_list);
 ```
 
+**Only what changed.** `sharepoint_list_changes` gives the items created,
+changed or deleted since a token, with the list's columns plus `_change`
+(`'upsert'`, `'delete'` with only `id` set, or `'checkpoint'`) and, on the one
+checkpoint row, the `token` for next time -- as `sharepoint_changes` does for
+files:
+
+```sql
+SELECT * FROM sharepoint_list_changes('Orders', token := 'latest');            -- just a token
+SELECT * FROM sharepoint_list_changes('Orders', token := (SELECT token FROM sync));
+```
+
 `created`, `modified` and a lookup's display value are skipped (a lookup is
 set through `<name>_id`), so a list read with `read_sharepoint_list` can be
 changed and written back as it is.

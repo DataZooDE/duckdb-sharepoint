@@ -903,3 +903,7 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   through the chain. The managed identity paths were checked against a local
   stand-in endpoint; an Azure VM test needs Azure.
 
+- Lists: `sharepoint_list_changes` over `/sites/{s}/lists/{l}/items/delta`
+  with the list column plan, people lookup and choice typing of
+  `read_sharepoint_list`; a deleted item (`deleted` / `@removed`) has only
+  `id`. Same checkpoint row and token rules.

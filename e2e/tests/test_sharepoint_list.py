@@ -279,3 +279,52 @@ def test_date_only_column_reads_and_writes_dates(graph, fixture_lists, sql, secr
         assert all(v.endswith("Z") for v in raw.values()), raw
     finally:
         graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}")
+
+
+def test_list_changes_since_a_token(graph, fixture_lists, sql, secret_sql):
+    """sharepoint_list_changes (#62): a token from 'latest', then exactly the
+    items created, changed and deleted since, and one checkpoint row with the
+    next token every time."""
+    site, _, _ = fixture_lists
+    import uuid
+    name = f"_duckdb_sharepoint_e2e_delta_{uuid.uuid4().hex[:8]}"
+    created = _ok(graph._req("POST", f"{GRAPH}/sites/{site}/lists", json={
+        "displayName": name, "list": {"template": "genericList"},
+        "columns": [{"name": "Amount", "number": {}}]}), "create delta list")["id"]
+
+    def changes(token):
+        deadline = time.time() + 90
+        while True:
+            out = sql(f"""{secret_sql}
+                SELECT _change || '|' || coalesce(Title, '-') || '|' || coalesce(Amount::VARCHAR, '-')
+                FROM sharepoint_list_changes('{name}', token := '{token}') WHERE _change <> 'checkpoint' ORDER BY 1;
+                SELECT '#' || count(*) FILTER (WHERE _change = 'checkpoint') || '#' || max(token)
+                FROM sharepoint_list_changes('{name}', token := '{token}');
+            """).splitlines()
+            rows = [line for line in out if line.startswith(("upsert|", "delete|"))]
+            checkpoint = [line for line in out if line.startswith("#")][-1]
+            if len(rows) >= 2 or time.time() > deadline:
+                count, next_token = checkpoint[1:].split("#", 1)
+                assert count == "1" and next_token, checkpoint
+                return rows, next_token
+            time.sleep(10)
+
+    try:
+        out = sql(f"""{secret_sql}
+            SELECT token FROM sharepoint_list_changes('{name}', token := 'latest') WHERE _change = 'checkpoint';
+        """).splitlines()
+        t0 = out[-1]
+        sql(f"""{secret_sql}
+            COPY (SELECT * FROM (VALUES ('a', 1.0), ('b', 2.0)) t(Title, Amount)) TO '{name}' (FORMAT sharepoint_list);
+        """)
+        rows, t1 = changes(t0)
+        assert rows == ["upsert|a|1.0", "upsert|b|2.0"], rows
+
+        out = sql(f"{secret_sql} SELECT id, Title FROM read_sharepoint_list('{name}') ORDER BY Title;").splitlines()
+        ids = dict(reversed(line.split("|")) for line in out[-2:])
+        sql(f"{secret_sql} COPY (SELECT {ids['a']} AS id, 5.0 AS Amount) TO '{name}' (FORMAT sharepoint_list);")
+        graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}/items/{ids['b']}")
+        rows, _ = changes(t1)
+        assert rows == ["delete|-|-", "upsert|a|5.0"], rows
+    finally:
+        graph._req("DELETE", f"{GRAPH}/sites/{site}/lists/{created}")

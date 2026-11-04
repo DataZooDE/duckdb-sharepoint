@@ -10,6 +10,7 @@
 #include "sharepoint_copy_rewrite.hpp"
 #include "sharepoint_counters.hpp"
 #include "sharepoint_errors.hpp"
+#include "sharepoint_delta.hpp"
 #include "sharepoint_list.hpp"
 #include "sharepoint_uri.hpp"
 
@@ -29,6 +30,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <cmath>
 #include <cstdint>
 #include "duckdb_compat.hpp"
@@ -1568,6 +1570,225 @@ void FilesScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
 	duckdb_compat::SetChildCardinality(output, out);
 }
 
+
+// ===========================================================================
+// sharepoint_list_changes('Orders', token := ...) (#62, lists): the items
+// added, changed and deleted since a token -- Graph's list item delta. The
+// list's own columns, then `_change` ('upsert' / 'delete' / 'checkpoint') and
+// `token` (on the checkpoint row: the token for next time).
+// ===========================================================================
+
+struct ListChangesBindData : public TableFunctionData {
+	vector<vector<Value>> rows;
+};
+
+unique_ptr<FunctionData> ListChangesBind(ClientContext &context, TableFunctionBindInput &input,
+                                         vector<LogicalType> &return_types, duckdb_compat::BindNames &names) {
+	unique_ptr<FunctionData> result;
+	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
+		if (input.inputs[0].IsNull()) {
+			throw InvalidInputException("sharepoint: the list name must not be NULL");
+		}
+		string site, token;
+		if (auto v = duckdb_compat::FindNamedParameter(input.named_parameters, "site")) {
+			if (!v->IsNull()) {
+				site = StringValue::Get(*v);
+			}
+		}
+		if (auto v = duckdb_compat::FindNamedParameter(input.named_parameters, "token")) {
+			if (!v->IsNull()) {
+				token = StringValue::Get(*v);
+			}
+		}
+		for (char c : token) {
+			if (!(isalnum(static_cast<unsigned char>(c)) || c == '%' || c == '-' || c == '_' || c == '.' || c == '~' ||
+			      c == '=')) {
+				throw InvalidInputException("sharepoint: that is not a token sharepoint_list_changes returned");
+			}
+		}
+		auto target = ResolveList(context, StringValue::Get(input.inputs[0]), site);
+		GraphClient client(target.auth);
+		auto &plan = target.plan;
+		const string what = "the changes of " + target.what;
+
+		string select;
+		std::set<string> selected;
+		for (auto &col : plan) {
+			const bool multi_person = col.person != ListPersonPart::NONE && col.type != ListColumnType::BIGINT &&
+			                          col.type != ListColumnType::VARCHAR;
+			for (auto &field : {col.field, multi_person ? col.person_field : string()}) {
+				if (!field.empty() && selected.insert(field).second) {
+					select += (select.empty() ? "" : ",") + EncodeWorkbookName(field);
+				}
+			}
+		}
+		string next = target.base + "/items/delta?$expand=fields($select=" + select + ")" +
+		              (token.empty() ? string() : "&token=" + token);
+		vector<picojson::object> items;
+		vector<bool> deleted;
+		std::unordered_map<string, idx_t> index_of; // an item seen twice: its last state wins
+		string next_token;
+		for (int pages = 0; !next.empty(); pages++) {
+			if (pages >= kMaxItemPages) {
+				throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxItemPages);
+			}
+			picojson::value holder;
+			try {
+				AsObject(client.GraphGet(next, what), what, holder);
+			} catch (std::exception &e) {
+				const string text = e.what();
+				if (text.find("HTTP 410") != string::npos || text.find("resyncRequired") != string::npos) {
+					throw InvalidInputException("sharepoint: the token for %s has expired; start over with token := "
+					                            "NULL (all items) or 'latest' (from now on)",
+					                            what);
+				}
+				throw;
+			}
+			const auto &page = holder.get<picojson::object>();
+			auto values = page.find("value");
+			if (values != page.end() && values->second.is<picojson::array>()) {
+				for (auto &v : values->second.get<picojson::array>()) {
+					if (!v.is<picojson::object>()) {
+						continue;
+					}
+					const auto &item = v.get<picojson::object>();
+					const auto id = StringField(item, "id");
+					const bool gone = item.find("deleted") != item.end() || item.find("@removed") != item.end();
+					picojson::object fields;
+					auto f = item.find("fields");
+					if (!gone && f != item.end() && f->second.is<picojson::object>()) {
+						fields = f->second.get<picojson::object>();
+					}
+					fields["id"] = picojson::value(id);
+					auto seen = index_of.find(id);
+					if (seen != index_of.end()) {
+						items[seen->second] = std::move(fields);
+						deleted[seen->second] = gone;
+					} else {
+						index_of[id] = items.size();
+						items.push_back(std::move(fields));
+						deleted.push_back(gone);
+					}
+				}
+			}
+			auto next_link = page.find("@odata.nextLink");
+			auto delta_link = page.find("@odata.deltaLink");
+			if (next_link != page.end() && next_link->second.is<string>()) {
+				next = GraphPathOfLink(next_link->second.get<string>());
+			} else {
+				if (delta_link != page.end() && delta_link->second.is<string>()) {
+					next_token = DeltaToken(delta_link->second.get<string>());
+				}
+				next.clear();
+			}
+		}
+		if (next_token.empty()) {
+			throw IOException("sharepoint: %s: Graph returned no delta token", what);
+		}
+		// A choice column is a list when any changed item says so (as
+		// read_sharepoint_list decides from all items).
+		for (auto &col : plan) {
+			if (!col.may_be_multi) {
+				continue;
+			}
+			for (auto &fields : items) {
+				auto it = fields.find(col.field);
+				if (it != fields.end() && it->second.is<picojson::array>()) {
+					col.type = ListColumnType::VARCHAR_LIST;
+					break;
+				}
+			}
+		}
+		auto rows = RowsOf(items, plan);
+		// People's names and emails, as read_sharepoint_list looks them up.
+		CursorState lookup;
+		std::set<int64_t> person_ids;
+		for (idx_t c = 0; c < plan.size(); c++) {
+			if (plan[c].person != ListPersonPart::ID) {
+				continue;
+			}
+			for (auto &row : rows) {
+				auto &id = row[c];
+				if (id.IsNull()) {
+					continue;
+				}
+				if (id.type().id() == LogicalTypeId::LIST) {
+					for (auto &e : ListValue::GetChildren(id)) {
+						if (!e.IsNull()) {
+							person_ids.insert(e.GetValue<int64_t>());
+						}
+					}
+				} else {
+					person_ids.insert(id.GetValue<int64_t>());
+				}
+			}
+		}
+		if (!person_ids.empty()) {
+			lookup.people = ResolvePeople(client, "/sites/" + target.site_id, what,
+			                              vector<int64_t>(person_ids.begin(), person_ids.end()));
+		}
+		auto data = make_uniq<ListChangesBindData>();
+		for (idx_t r = 0; r < rows.size(); r++) {
+			auto &row = rows[r];
+			for (idx_t c = 0; c < plan.size(); c++) {
+				if (!row[c].IsNull() ||
+				    (plan[c].person != ListPersonPart::NAME && plan[c].person != ListPersonPart::EMAIL)) {
+					continue;
+				}
+				for (idx_t i = 0; i < plan.size(); i++) {
+					if (plan[i].person == ListPersonPart::ID && plan[i].field == plan[c].field) {
+						row[c] = LookedUp(lookup, plan[c], row[i]);
+					}
+				}
+			}
+			row.push_back(Value(deleted[r] ? "delete" : "upsert"));
+			row.push_back(Value(LogicalType::VARCHAR));
+			data->rows.push_back(std::move(row));
+		}
+		vector<Value> checkpoint;
+		for (auto &col : plan) {
+			checkpoint.push_back(Value(ToLogicalType(col.type)));
+		}
+		checkpoint.push_back(Value("checkpoint"));
+		checkpoint.push_back(Value(next_token));
+		data->rows.push_back(std::move(checkpoint));
+
+		for (auto &col : plan) {
+			return_types.push_back(ToLogicalType(col.type));
+			names.emplace_back(col.name);
+		}
+		names.emplace_back("_change");
+		return_types.push_back(LogicalType::VARCHAR);
+		names.emplace_back("token");
+		return_types.push_back(LogicalType::VARCHAR);
+		result = std::move(data);
+	});
+	return result;
+}
+
+struct ListChangesCursor : public GlobalTableFunctionState {
+	idx_t cursor = 0;
+};
+
+unique_ptr<GlobalTableFunctionState> ListChangesInit(ClientContext &, TableFunctionInitInput &) {
+	return make_uniq<ListChangesCursor>();
+}
+
+void ListChangesScan(ClientContext &, TableFunctionInput &input, DataChunk &output) {
+	auto &data = input.bind_data->Cast<ListChangesBindData>();
+	auto &state = input.global_state->Cast<ListChangesCursor>();
+	idx_t out = 0;
+	while (state.cursor < data.rows.size() && out < STANDARD_VECTOR_SIZE) {
+		auto &row = data.rows[state.cursor];
+		for (idx_t c = 0; c < row.size(); c++) {
+			output.SetValue(c, out, row[c]);
+		}
+		state.cursor++;
+		out++;
+	}
+	duckdb_compat::SetChildCardinality(output, out);
+}
+
 } // namespace
 
 void RegisterListFunctions(ExtensionLoader &loader) {
@@ -1603,6 +1824,25 @@ void RegisterListFunctions(ExtensionLoader &loader) {
 		files_desc.categories = {"sharepoint", "list"};
 		files_info.descriptions.push_back(std::move(files_desc));
 		loader.RegisterFunction(std::move(files_info));
+	}
+
+	{
+		TableFunction changes("sharepoint_list_changes", {LogicalType::VARCHAR}, ListChangesScan, ListChangesBind,
+		                      ListChangesInit);
+		duckdb_compat::NameParameters(changes, {"list"});
+		duckdb_compat::AddNamedParameter(changes, "token", LogicalType::VARCHAR);
+		duckdb_compat::AddNamedParameter(changes, "site", LogicalType::VARCHAR);
+		CreateTableFunctionInfo changes_info(changes);
+		FunctionDescription changes_desc;
+		changes_desc.description =
+		    "The items of a SharePoint list added, changed or deleted since a token (Graph's delta query): the list's "
+		    "columns as read_sharepoint_list gives them, then _change ('upsert', 'delete' -- only id is set -- or "
+		    "'checkpoint') and token, set on the one checkpoint row: the token for next time. No token: every item; "
+		    "token := 'latest': none, just a token.";
+		changes_desc.examples = {"SELECT * FROM sharepoint_list_changes('Orders', token := 'aTE09...')"};
+		changes_desc.categories = {"sharepoint", "list"};
+		changes_info.descriptions.push_back(std::move(changes_desc));
+		loader.RegisterFunction(std::move(changes_info));
 	}
 
 	CopyFunction front(duckdb_compat::FunctionName(kListFormat));
