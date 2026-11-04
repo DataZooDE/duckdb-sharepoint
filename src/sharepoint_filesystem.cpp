@@ -163,6 +163,7 @@ void SharepointFileHandle::Close() {
 		client.AbortUploadSession(session);
 		return;
 	}
+	string written_id;
 	try {
 		DriveItemMeta written;
 		if (upload->OnClose() == ChunkedUploadBuffer::CloseAction::SINGLE_REQUEST) {
@@ -174,10 +175,7 @@ void SharepointFileHandle::Close() {
 			client.SendUploadChunk(session, *upload, /*final=*/true);
 			written = client.CommitUploadSession(session, upload->Total());
 		}
-		if (!written.id.empty()) {
-			static_cast<SharepointFileSystem &>(file_system)
-			    .RememberWrite(auth.identity + "|" + write_root_relative, written.id);
-		}
+		written_id = written.id;
 	} catch (...) {
 		// A failed close is a failed write: discard the session (nothing is
 		// published) and let the error surface.
@@ -187,7 +185,12 @@ void SharepointFileHandle::Close() {
 		throw;
 	}
 	upload.reset();
-	static_cast<SharepointFileSystem &>(file_system).InvalidateMeta(auth.identity + "|" + write_root_relative);
+	auto &fs = static_cast<SharepointFileSystem &>(file_system);
+	fs.InvalidateMeta(auth.identity + "|" + write_root_relative);
+	// After the invalidation, which also forgets earlier writes of this path.
+	if (!written_id.empty()) {
+		fs.RememberWrite(auth.identity + "|" + write_root_relative, written_id);
+	}
 }
 
 bool SharepointFileSystem::MetaCacheGet(const string &key, DriveItemMeta &out) {
