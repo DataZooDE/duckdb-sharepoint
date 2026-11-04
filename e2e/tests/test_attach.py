@@ -124,4 +124,5 @@ def test_workbook_tables(graph, scratch, sql, secret_sql):
     """).splitlines()
     assert out[-1] == "4|34|1", out
     out = sql(f"{secret_sql} {attach} DELETE FROM site.\"{wb}\".Sales WHERE Units = 5;", expect_error=True)
-    assert "not supported on an attached SharePoint site" in out, out
+    # Refused -- by DuckDB's binder (no base table behind the scan), before ours.
+    assert "Can only delete from base table" in out or "not supported on an attached SharePoint site" in out, out
