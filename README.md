@@ -287,6 +287,25 @@ extension finds it on the first search, or takes `region := 'EUR'`.
 `max_results` (default 500) caps the rows. Search indexes new content with a
 delay of minutes.
 
+## A site as a database: `ATTACH`
+
+```sql
+ATTACH 'sharepoint://sites/Sales' AS sales (TYPE sharepoint);    -- 'sharepoint://' = the secret's site
+SHOW ALL TABLES;                                                  -- the site's lists
+SELECT * FROM sales.Orders WHERE Status = 'open';                 -- read_sharepoint_list underneath
+INSERT INTO sales.Orders (Title, Amount) VALUES ('A-18', 99);
+UPDATE sales.Orders SET Status = 'closed' WHERE id = 17;
+DELETE FROM sales.Orders WHERE Status = 'cancelled';
+```
+
+The site's visible lists are the tables of schema `main`, typed from their
+column definitions (a multi-select choice column is `VARCHAR[]`). Reads go
+through `read_sharepoint_list`, filter pushdown included. `INSERT` creates
+items (columns left out keep SharePoint's defaults); `UPDATE` and `DELETE`
+address items by `id`. Lists are read once per `ATTACH`: after changing a
+list's columns in SharePoint, `DETACH` and `ATTACH` again. Creating or
+altering lists, and `RETURNING`, are not supported.
+
 ## Installation
 
 ```sql

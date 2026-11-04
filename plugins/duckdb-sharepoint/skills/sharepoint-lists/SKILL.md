@@ -55,3 +55,15 @@ SELECT * FROM sharepoint_list_changes('Orders', token := (SELECT token FROM sync
 The list's columns plus `_change`: `'upsert'`, `'delete'` (only `id` set) or `'checkpoint'`;
 the one checkpoint row carries the `token` to store for next time (as `sharepoint_changes`
 does for files).
+## A site as a database: ATTACH
+```sql
+ATTACH 'sharepoint://sites/Sales' AS sales (TYPE sharepoint);   -- 'sharepoint://' = the secret's site
+SHOW ALL TABLES;                                                 -- the site's lists
+SELECT * FROM sales.Orders WHERE Status = 'open';                -- read_sharepoint_list, pushdown included
+INSERT INTO sales.Orders (Title, Amount) VALUES ('A-18', 99);
+UPDATE sales.Orders SET Status = 'closed' WHERE id = 17;
+DELETE FROM sales.Orders WHERE Status = 'cancelled';
+```
+Visible lists are tables of schema `main`, typed from their column definitions. Lists are read
+once per ATTACH: after changing columns in SharePoint, DETACH and ATTACH again. No CREATE/ALTER
+of lists, no RETURNING.

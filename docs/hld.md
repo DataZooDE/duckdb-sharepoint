@@ -907,3 +907,25 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   with the list column plan, people lookup and choice typing of
   `read_sharepoint_list`; a deleted item (`deleted` / `@removed`) has only
   `id`. Same checkpoint row and token rules.
+## 17. `ATTACH ... (TYPE sharepoint)` (#60)
+
+- A storage extension: the catalog has one schema, `main`; its tables are the
+  site's lists that are not hidden, from one `lists?$expand=columns` call per
+  page, loaded on first use and kept for the attach. No Graph call at ATTACH.
+- Column types come from the definitions only (a catalog declares them before
+  data is read): a choice column that may hold several values is always
+  `VARCHAR[]`. A table's scan is `read_sharepoint_list`'s table function with
+  bind data from `BindListForCatalog` (same plan, `fixed_types`); a list whose
+  columns changed since the ATTACH is refused rather than scanned into the
+  wrong columns.
+- Writes: `SharepointModify`, one sink operator for INSERT / UPDATE / DELETE
+  over the `$batch` item writer (`ListItemWriter`). INSERT maps
+  `column_index_map` so unnamed columns are left out (SharePoint defaults).
+  UPDATE evaluates the new values as PhysicalUpdate does; the row id -- which
+  the list scan emits as the item id -- is the child's last column. DELETE
+  sends `DELETE items/{id}` (a 404 counts as done).
+- 1.5 / 2.0: the catalog API is the same but for names (`string` vs
+  `Identifier`: `FunctionName`, `SetQualifiedName` via SFINAE), a few pure
+  virtuals (no `override`), and `Expression::GetReturnType()`.
+- Transactions: none -- each statement goes straight to Graph.
+
