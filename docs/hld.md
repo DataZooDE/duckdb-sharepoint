@@ -570,6 +570,13 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   started together made one run's `big.bin` disappear under another
   (404 `itemNotFound` on a read by id). Not a product bug -- stagger re-runs,
   and give new suites run-unique paths (`@RUN_ID@`), as the Excel suite does.
+- **An ungranted site under Sites.Selected: 403 or 404?** Not settled yet
+  (#70). The first required run got 404 `itemNotFound` for
+  `SHAREPOINT_UNGRANTED_SITE`, but the full-permission app got the same 404:
+  the site did not exist at that path. `ResolveSite` puts the grant hint on
+  a site 404 as well as on the 403, and the e2e test first resolves the site
+  with the full-permission app, so a missing site fails as such. Record the
+  real answer here once the test passes.
 - **Delegated-app setup failures**, met recreating the public-client app for
   #47: `AADSTS700016` (client ID and tenant from different places -- take both
   from the app's Overview page), `AADSTS7000218` (*Allow public client flows*
