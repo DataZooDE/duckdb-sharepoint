@@ -768,7 +768,13 @@ void SplitParent(const string &root_relative, string &parent, string &name) {
 } // namespace
 
 void GraphClient::MoveByPath(const string &source_root_relative, const string &target_root_relative) {
+	// A file written moments ago may not be found by its path yet (hld §7a):
+	// a few looks, with backoff, before calling it missing.
 	auto src = StatByPath(source_root_relative);
+	for (int attempt = 1; !src.found && attempt <= 4; attempt++) {
+		SleepBeforeRetry(attempt, 0);
+		src = StatByPath(source_root_relative);
+	}
 	if (!src.found) {
 		throw IOException("sharepoint: move source '%s' does not exist", source_root_relative.c_str());
 	}

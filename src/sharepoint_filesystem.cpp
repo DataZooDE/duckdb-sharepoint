@@ -8,6 +8,7 @@
 #include "sharepoint_glob.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/file_opener.hpp"
 #include "duckdb/common/local_file_system.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -578,7 +579,13 @@ void SharepointFileSystem::MoveFile(const string &source, const string &target, 
 		if (RecentWrite(auth.identity + "|" + src.RootRelativePath(), written_id)) {
 			GraphClient(auth).MoveById(written_id, src.RootRelativePath(), dst.RootRelativePath());
 		} else {
-			GraphClient(auth).MoveByPath(src.RootRelativePath(), dst.RootRelativePath());
+			try {
+				GraphClient(auth).MoveByPath(src.RootRelativePath(), dst.RootRelativePath());
+			} catch (IOException &e) {
+				lock_guard<mutex> guard(meta_cache_lock);
+				throw IOException("%s (no write of it recorded in this process; %llu recorded)", ErrorData(e).RawMessage(),
+				                  (unsigned long long)recent_writes.size());
+			}
 		}
 		InvalidateMeta(auth.identity + "|" + src.RootRelativePath());
 		InvalidateMeta(auth.identity + "|" + dst.RootRelativePath());
