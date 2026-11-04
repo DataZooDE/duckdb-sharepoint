@@ -64,3 +64,16 @@ SELECT list, title, status, due FROM read_todo_tasks() WHERE status <> 'complete
 SELECT * FROM read_todo_tasks(user := 'anna@contoso.com', list := 'Tasks');             -- app-only
 ```
 Needs `Tasks.Read.All` (application) or `Tasks.Read` (delegated: add it to `GRAPH_SCOPE`).
+
+## A site as a database: ATTACH
+```sql
+ATTACH 'sharepoint://sites/Sales' AS sales (TYPE sharepoint);   -- 'sharepoint://' = the secret's site
+SHOW ALL TABLES;                                                 -- the site's lists
+SELECT * FROM sales.Orders WHERE Status = 'open';                -- read_sharepoint_list, pushdown included
+INSERT INTO sales.Orders (Title, Amount) VALUES ('A-18', 99);
+UPDATE sales.Orders SET Status = 'closed' WHERE id = 17;
+DELETE FROM sales.Orders WHERE Status = 'cancelled';
+```
+Visible lists are tables of schema `main`, typed from their column definitions. Lists are read
+once per ATTACH: after changing columns in SharePoint, DETACH and ATTACH again. No CREATE/ALTER
+of lists, no RETURNING.
