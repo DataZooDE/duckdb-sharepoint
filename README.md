@@ -192,16 +192,20 @@ SELECT * FROM read_parquet('sharepoint://Finance/actuals.parquet?version=3.0');
 
 **Who can see it.** `sharepoint_permissions` lists, for a file or folder or
 the files a glob matches, one row per grantee: the `roles`, how it was
-granted (`direct`, `inherited` from the site or a parent folder, or a sharing
-`link`), the user, group or app, and for a link its type, scope (`anonymous`,
-`organization`, `users`) and address. For audits such as "what is shared with
-anyone":
+granted (`direct`, `inherited`, or a sharing `link`), the user, group or app,
+and for a link its type and scope (`anonymous`, `organization`, `users`). For
+audits such as "what is shared with anyone":
 
 ```sql
 SELECT path, link_scope, link_url, expires
 FROM sharepoint_permissions('sharepoint://Finance/**')
 WHERE granted_by = 'link' AND link_scope = 'anonymous';
 ```
+
+As Graph reports them: the site's own groups appear as `direct` grants on
+each item that inherits them (Graph's listing has no `inheritedFrom` for
+them), and a link's `link_url` can be NULL (Graph's listing may leave out
+the address).
 
 `write_blob`, `remove_file`, `move_file` and `file_size` don't depend on the
 scheme, so they work for any filesystem DuckDB can reach (`s3://`, `gs://`,

@@ -31,10 +31,11 @@ def test_links_and_inherited_grants(graph, scratch, sql, secret_sql):
                list_sort(roles)::VARCHAR || '|' || coalesce(link_url, '-') || '|' || coalesce(inherited_from, '-')
         FROM sharepoint_permissions('sharepoint://{scratch}/a.csv') ORDER BY 1;
     """).splitlines()[1:]
-    links = [r for r in rows if r.startswith("link|") and "|organization|" in r]
-    assert len(links) == 1, rows
-    assert link in links[0] or link.split("?")[0] in links[0], (link, rows)
-    assert any(r.split("|")[1] != "-" for r in rows), rows  # grants with a grantee (the site's groups)
+    # Seen live (hld §7a): the listing gives the link without its webUrl, and
+    # the site's groups without inheritedFrom -- so they read as 'direct'.
+    links = [r for r in rows if r.startswith("link|") and "|organization|" in r and "[read]" in r]
+    assert len(links) == 1, (link, rows)
+    assert any(r.split("|")[1] in ("group", "site_group") for r in rows), rows  # the site's groups
     out = sql(f"""{secret_sql}
         SELECT string_agg(DISTINCT parse_filename(path), ',' ORDER BY parse_filename(path))
         FROM sharepoint_permissions('sharepoint://{scratch}/*.csv');

@@ -62,7 +62,7 @@ Table functions take no subqueries: pass a stored token via `SET VARIABLE t = (.
 SELECT path, granted_by, grantee_type, grantee, grantee_email, roles, link_scope, link_url, expires
 FROM sharepoint_permissions('sharepoint://Finance/**');      -- a file, a folder, or a glob of files
 ```
-One row per grantee; `granted_by` = `direct` | `inherited` | `link`; `link_scope` =
+One row per grantee; `granted_by` = `direct` | `inherited` | `link` (Graph lists a site's groups as direct, without inheritedFrom; link_url may be NULL); `link_scope` =
 `anonymous` | `organization` | `users`. An org link nobody used yet has no grantee (NULL).
 
 ## Search
