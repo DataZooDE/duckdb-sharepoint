@@ -56,6 +56,17 @@ COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, SITE 'Sales');
 ----
 no `sharepoint` secret configured
 
+# KEY (#97): upsert by a written column -- checked at bind, before any secret.
+statement error
+COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, KEY 'OrderNo');
+----
+KEY 'OrderNo' is not one of the columns written
+
+statement error
+COPY (SELECT 'A-1' AS OrderNo) TO 'Orders' (FORMAT sharepoint_list, KEY 'orderno');
+----
+no `sharepoint` secret configured
+
 # OVERWRITE has no meaning for a list (yet): refused, not passed on.
 statement error
 COPY (SELECT 'x' AS Title) TO 'Orders' (FORMAT sharepoint_list, OVERWRITE);

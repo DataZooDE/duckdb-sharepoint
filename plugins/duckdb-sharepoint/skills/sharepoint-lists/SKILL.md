@@ -7,7 +7,8 @@ description: >
   VARCHAR or VARCHAR[], lookup value + _id, person name + _email + _id,
   created_by / modified_by), WHERE pushdown to Graph $filter on indexed
   columns (EXPLAIN shows it), paging past 5,000 items, and writing items with
-  COPY ... TO '<list>' (FORMAT sharepoint_list): create, or update by id. Use
+  COPY ... TO '<list>' (FORMAT sharepoint_list): create, update by id, or upsert
+  by KEY '<column>' (sync from another system). Use
   when reading a SharePoint list into SQL, filtering a large list, joining
   lists, or creating and updating list items.
 version: 2026.11.03
@@ -47,6 +48,14 @@ set through `<name>_id`; read-only columns (created, modified, names, emails) ar
 read result can be written back as it is. Sent in `$batch` calls of 20. `SITE 'Sales'` as a
 COPY option for another site.
 
+Upsert by a key column (no `id` needed): `KEY '<column>'` updates the item with that key,
+creates one if none has it. Keys are read once per COPY; text matches exactly, numbers by value.
+A NULL key, a key two items share, or one repeated in the rows is an error (earlier batches
+stay written).
+```sql
+COPY (SELECT order_no AS OrderNo, status AS Status FROM erp_orders) TO 'Orders' (FORMAT sharepoint_list, KEY 'OrderNo');
+```
+
 ## Only what changed
 ```sql
 SELECT * FROM sharepoint_list_changes('Orders', token := 'latest');               -- just a token
@@ -82,5 +91,7 @@ UPDATE sales.Orders SET Status = 'closed' WHERE id = 17;
 DELETE FROM sales.Orders WHERE Status = 'cancelled';
 ```
 Visible lists are tables of schema `main`, typed from their column definitions. Lists are read
-once per ATTACH: after changing columns in SharePoint, DETACH and ATTACH again. No CREATE/ALTER
-of lists, no RETURNING.
+once per ATTACH: after changing columns in SharePoint, DETACH and ATTACH again.
+`CREATE TABLE site.X AS SELECT ...` (or with columns) creates a list: text/number/boolean/DATE
+(date-only)/TIMESTAMP columns, `Title` = the list's own; needs Sites.Manage.All. No DROP/ALTER,
+no RETURNING.
