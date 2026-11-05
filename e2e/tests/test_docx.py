@@ -44,13 +44,16 @@ def test_docx_template_filled_into_sharepoint(graph, scratch, sql, secret_sql):
                     VARIABLES {{'customer': 'Initech', 'valid_until': 'soon', 'quote_no': 'Q-2'}});
         SELECT string_agg(text, '|' ORDER BY idx) FROM read_docx('{out}');
         SELECT string_agg(Region || '=' || Units, ',') FROM read_docx_table('{out}');
+        SELECT string_agg(text, '|' ORDER BY idx) FROM read_docx('{tmpl}');
     """).splitlines()
-    assert lines[-4:] == [
+    assert lines[-5:] == [
         "Quote for ACME|Valid until 2026-12-31|Thank you.",
         "North=10,South=7",
         "Quote for Initech|Valid until soon|Thank you.",
         "West=3",
+        # The template is untouched. (Not by size: SharePoint rewrites an
+        # uploaded .docx to embed its document properties, hld §7a.)
+        "Quote for {{customer}}|Valid until {{ valid_until }}|Thank you.",
     ], lines
-    # The overwrite left no temporary file behind, and the template is untouched.
+    # The overwrite left no temporary file behind.
     assert [c["name"] for c in graph.children(f"{scratch}/out")] == ["quote.docx"]
-    assert graph.stat(f"{scratch}/templates/quote.docx")["size"] == len(TEMPLATE)
