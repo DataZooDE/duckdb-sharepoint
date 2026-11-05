@@ -4,6 +4,7 @@
 #include "sharepoint_weburl.hpp"
 
 #include <cctype>
+#include <cstdint>
 
 #include <picojson.h>
 
