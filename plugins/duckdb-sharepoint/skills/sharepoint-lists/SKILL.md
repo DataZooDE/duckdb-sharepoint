@@ -65,6 +65,15 @@ The list's columns plus `_change`: `'upsert'`, `'delete'` (only `id` set) or `'c
 the one checkpoint row carries the `token` to store for next time (as `sharepoint_changes`
 does for files).
 
+## Attachments
+```sql
+SELECT item_id, file_name, url FROM read_sharepoint_list_attachments('Expenses', site := 'Finance');
+SELECT content FROM read_sharepoint_list_attachments('Expenses', item_id := 7);   -- BLOB, fetched only if selected
+```
+Read-only. SharePoint's own API (Graph has none): **not with a client secret** -- use
+`client_certificate` or a user sign-in; the app also needs "Office 365 SharePoint Online"
+Sites.Read.All (application) or Sites.Selected with a grant, besides Graph's permissions.
+
 ## OneNote pages
 ```sql
 SELECT notebook, section, title, created, modified, web_url FROM read_onenote_pages(notebook := 'Projects');

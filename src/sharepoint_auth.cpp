@@ -896,7 +896,14 @@ private:
 	shared_ptr<mutex> mint_lock;
 };
 
-AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path, bool require_drive) {
+namespace {
+
+//! GetAuthContext, or with `rest_host` set (#97) the same credentials for
+//! SharePoint's own REST API on that host: only `tokens` and `credential_fp`
+//! are filled, no drive is resolved.
+AuthContext BuildAuthContext(optional_ptr<FileOpener> opener, const string &path, bool require_drive,
+                             const string &rest_host, bool *client_secret_app) {
+	const bool rest = !rest_host.empty();
 	const auto match = LookupSecret(opener, path);
 	const auto &secret = dynamic_cast<const KeyValueSecret &>(match.GetSecret());
 
@@ -936,7 +943,7 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path, 
 		// No credential in the secret: the identity is the workload's. The
 		// cache key covers what picks the identity (env and user-assigned id).
 		const string mi_client_id = SecretField(secret, "client_id");
-		const string resource = GraphResource(graph_endpoint);
+		const string resource = rest ? "https://" + rest_host : GraphResource(graph_endpoint);
 		const string credential_fp =
 		    Fingerprint({provider, mi_client_id, resource, login_endpoint, EnvOr("AZURE_CLIENT_ID"),
 		                 EnvOr("AZURE_TENANT_ID"), EnvOr("AZURE_FEDERATED_TOKEN_FILE"), EnvOr("IDENTITY_ENDPOINT"),
@@ -944,8 +951,11 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path, 
 		AuthContext auth;
 		auth.tokens = make_shared_ptr<ChainTokenSource>(credential_fp, login_endpoint, resource, mi_client_id);
 		auth.graph_endpoint = graph_endpoint;
-		auth.drive_id = ResolveDriveId(secret, graph_endpoint, auth.tokens->Token(), credential_fp, require_drive);
 		auth.credential_fp = credential_fp;
+		if (rest) {
+			return auth;
+		}
+		auth.drive_id = ResolveDriveId(secret, graph_endpoint, auth.tokens->Token(), credential_fp, require_drive);
 		auth.identity = Fingerprint({credential_fp, graph_endpoint, auth.drive_id});
 		return auth;
 	}
@@ -988,9 +998,15 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path, 
 	// permissions plus offline_access (or Entra issues no refresh token). A
 	// config refresh token without CLIENT_SECRET is a public-client (delegated)
 	// one too.
-	const string scope = !configured_scope.empty()                                ? configured_scope
+	// SharePoint's REST API: whatever the app is consented for there, app-only
+	// or delegated alike (a refresh token redeems for another resource).
+	const string scope = rest                                                      ? "https://" + rest_host + "/.default"
+	                     : !configured_scope.empty()                                ? configured_scope
 	                     : IsDelegatedCredential(provider, !client_secret.empty()) ? DelegatedGraphScope(graph_endpoint)
 	                                                                               : DefaultGraphScope(graph_endpoint);
+	if (client_secret_app) {
+		*client_secret_app = provider == "client_credentials";
+	}
 
 	// A config secret with ONLY an ACCESS_TOKEN is used as-is -- the caller owns
 	// its lifetime. With a REFRESH_TOKEN as well, the refresh grant is used, so
@@ -1010,12 +1026,24 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path, 
 	string credential_fp = fingerprint_for(lineage);
 
 	shared_ptr<TokenSource> tokens;
+	if (rest && !static_token.empty()) {
+		throw InvalidInputException("sharepoint: secret '%s' holds only an ACCESS_TOKEN, which is for Microsoft Graph; "
+		                            "SharePoint's own API (list attachments) needs a token of its own -- give the "
+		                            "secret a REFRESH_TOKEN, or use another provider",
+		                            duckdb_compat::Str(secret.GetName()));
+	}
 	if (!static_token.empty()) {
 		tokens = make_shared_ptr<StaticTokenSource>(static_token);
 	} else {
 		if (!IsValidTenantId(tenant)) {
 			throw InvalidInputException("sharepoint: TENANT_ID must be a tenant GUID or domain (letters, digits, "
 			                            "'-', '.')");
+		}
+		if (rest && interactive && refresh_token.empty()) {
+			// GetAuthContext signs in first (the caller resolves the list through Graph).
+			throw IOException("sharepoint secret '%s' has no refresh token yet: run any query on a sharepoint:// path "
+			                  "first, to sign in",
+			                  duckdb_compat::Str(secret.GetName()));
 		}
 		if (interactive && refresh_token.empty()) {
 			// No refresh token yet: the interactive sign-in, once. Afterwards the
@@ -1047,6 +1075,13 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path, 
 		}
 		tokens = make_shared_ptr<MintingTokenSource>(std::move(req));
 	}
+	if (rest) {
+		AuthContext auth;
+		auth.tokens = tokens;
+		auth.graph_endpoint = graph_endpoint;
+		auth.credential_fp = credential_fp;
+		return auth;
+	}
 	const string token = tokens->Token();
 	if (interactive) {
 		PersistRotatedRefreshToken(opener, match, credential_fp, refresh_token, lineage);
@@ -1061,6 +1096,21 @@ AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path, 
 	// same-drive check on moves: credentials + cloud + drive.
 	auth.identity = Fingerprint({credential_fp, graph_endpoint, auth.drive_id});
 	return auth;
+}
+
+} // namespace
+
+AuthContext GetAuthContext(optional_ptr<FileOpener> opener, const string &path, bool require_drive) {
+	return BuildAuthContext(opener, path, require_drive, string(), nullptr);
+}
+
+shared_ptr<TokenSource> GetSharepointRestTokens(optional_ptr<FileOpener> opener, const string &path,
+                                                const string &host, bool &client_secret_app) {
+	// A token goes only to a SharePoint host, never to one a caller made up.
+	if (host.empty() || !IsSharepointWebUrl("https://" + host + "/")) {
+		throw InvalidInputException("sharepoint: '%s' is not a SharePoint host", host);
+	}
+	return BuildAuthContext(opener, path, false, StringUtil::Lower(host), &client_secret_app).tokens;
 }
 
 ResolvedPath ResolveSharepointPath(optional_ptr<FileOpener> opener, const string &path) {

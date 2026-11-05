@@ -101,6 +101,7 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_permissions.cpp
     src/sharepoint_weburl.cpp
     src/sharepoint_docx.cpp
+    src/sharepoint_attachments.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -124,6 +125,7 @@ file(GLOB DUCKDB_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_discovery.cpp
     src/sharepoint_onenote.cpp
     src/sharepoint_docx_functions.cpp
+    src/sharepoint_attachments_functions.cpp
     src/sharepoint_catalog.cpp
     src/sharepoint_changes.cpp
     src/sharepoint_versions.cpp
