@@ -1031,5 +1031,18 @@ string GraphClient::WorkbookGet(const string &item_id, const string &resource, c
 	return WorkbookCall("GET", item_id, resource, string(), string(), what, true, nullptr);
 }
 
+int SharepointRestGet(TokenSource &tokens, const string &host, const string &path, string &body) {
+	IncrementCounter(Counter::SHAREPOINT_LIST);
+	auto &cli = GraphConnection("https://" + host);
+	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + tokens.Token()},
+	                                     {"Accept", "application/json;odata=nometadata"}};
+	auto res = SendWithRetry(tokens, h, [&] { return cli.Get(path.c_str(), h); });
+	if (!res) {
+		throw IOException("sharepoint: a request to %s failed at the transport layer", host.c_str());
+	}
+	body = res->body;
+	return res->status;
+}
+
 } // namespace sharepoint
 } // namespace duckdb

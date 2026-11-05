@@ -833,6 +833,20 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   written (a COPY to a list is not transactional). One read of the whole key
   column per COPY rather than a `$filter` per batch: a list sync writes many
   rows, and a filter needs the key indexed.
+- **Attachments (#97).** `read_sharepoint_list_attachments` resolves the
+  list and its site through Graph, then reads SharePoint's own REST API on
+  the site's host -- Graph v1.0 has no attachment API. One request lists
+  every item's `AttachmentFiles` (`$expand`, paged by `odata.nextLink`, which
+  is followed only on the same host); content is one
+  `GetFileByServerRelativePath(...)/$value` per row, and only when the
+  `content` column is projected. The token is the same secret's credentials
+  for the resource `https://<host>` (`GetSharepointRestTokens`: scope
+  `https://<host>/.default`, app-only or a refresh token redeemed for it; the
+  host must be a SharePoint host). SharePoint's API refuses app-only tokens
+  from a client secret; the error says so and names `client_certificate`.
+  The app also needs a SharePoint API permission ("Office 365 SharePoint
+  Online"), not only Graph's. Paths, pages and errors are pure
+  (`sharepoint_attachments`, Catch2-tested).
 
 ## 11. File versions: `sharepoint_versions` and `?version=` (#66)
 

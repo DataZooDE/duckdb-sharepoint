@@ -438,6 +438,25 @@ SELECT * FROM sharepoint_list_changes('Orders', token := (SELECT token FROM sync
 set through `<name>_id`), so a list read with `read_sharepoint_list` can be
 changed and written back as it is.
 
+**Attachments.** `read_sharepoint_list_attachments` gives the files attached
+to a list's items: `item_id`, `file_name`, `url`, and `content` as a BLOB,
+downloaded only when you select it.
+
+```sql
+SELECT item_id, file_name FROM read_sharepoint_list_attachments('Expenses', site := 'Finance');
+-- Save each attachment of item 7 as a file (write_blob works on any filesystem).
+SELECT write_blob('archive/7-' || file_name, content)
+FROM read_sharepoint_list_attachments('Expenses', site := 'Finance', item_id := 7);
+```
+
+Microsoft Graph has no API for attachments, so they come from SharePoint's
+own API. That API does **not** accept a client secret: use a certificate
+(`client_certificate`, the same app) or a user sign-in (`device_code`,
+`authorization_code`, or `credential_chain` with `az login`). An app also
+needs a permission of the SharePoint API itself -- *Office 365 SharePoint
+Online* -> *Application* -> `Sites.Read.All` (or `Sites.Selected` with a
+grant) -- in addition to Graph's. Read-only: attachments can't be added.
+
 ### What's in a library: `read_sharepoint_files`
 
 ```sql
@@ -777,6 +796,9 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
 - **Lists.**
   - Only predicates on indexed columns are sent to SharePoint, and none for
     a list with a multi-select choice column.
+  - Attachments are read-only, and need a certificate or a user sign-in
+    (SharePoint's own API refuses client secrets) plus a SharePoint API
+    permission.
   - A date-only column is read as a DATE on sites from UTC-10:00 to
     UTC+13:30. Graph doesn't say a site's time zone, so sites at UTC-11,
     UTC-12, UTC+13:45 and UTC+14 read such dates a day off.

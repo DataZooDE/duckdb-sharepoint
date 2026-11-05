@@ -1,0 +1,32 @@
+# name: test/sql/attachments_offline.test
+# description: read_sharepoint_list_attachments (#97) without credentials:
+#              registered, and bad input fails before any request. Reading
+#              real attachments is e2e/tests/test_list_attachments.py.
+# group: [sharepoint]
+
+require sharepoint
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'read_sharepoint_list_attachments' AND function_type = 'table';
+----
+1
+
+statement error
+SELECT * FROM read_sharepoint_list_attachments(NULL);
+----
+name a list
+
+statement error
+SELECT * FROM read_sharepoint_list_attachments('id:');
+----
+name a list
+
+statement error
+SELECT * FROM read_sharepoint_list_attachments('Orders', item_id := 0);
+----
+item_id must be a list item's id
+
+statement error
+SELECT * FROM read_sharepoint_list_attachments('Orders');
+----
+no `sharepoint` secret configured

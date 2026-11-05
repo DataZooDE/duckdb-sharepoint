@@ -9,6 +9,7 @@
 #include "sharepoint_permissions_functions.hpp"
 #include "sharepoint_discovery.hpp"
 #include "sharepoint_onenote.hpp"
+#include "sharepoint_attachments_functions.hpp"
 #include "sharepoint_docx_functions.hpp"
 #include "sharepoint_catalog.hpp"
 #include "sharepoint_changes.hpp"
@@ -196,6 +197,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	sharepoint::RegisterOneNoteFunctions(loader);
 	// read_docx() / read_docx_table(): Word documents as rows (#103).
 	sharepoint::RegisterDocxFunctions(loader);
+	sharepoint::RegisterAttachmentFunctions(loader);
 	// ATTACH 'sharepoint://sites/x' (TYPE sharepoint): a site's lists as tables.
 	sharepoint::RegisterSharepointCatalog(loader);
 	sharepoint::RegisterChangeFunctions(loader);

@@ -93,6 +93,14 @@ ResolvedPath ResolveSharepointPath(optional_ptr<FileOpener> opener, const string
 //! browser URL under the same library, or a sharepoint:// path.
 string WebPathOf(const ResolvedPath &target, const string &root_relative);
 
+//! The secret in scope for `path`, as a token source for SharePoint's own
+//! REST API on `host` ("contoso.sharepoint.com"; #97: list attachments, which
+//! Graph has no API for). Same credentials, resource https://<host>.
+//! `client_secret_app` is set for PROVIDER client_credentials, whose app-only
+//! tokens that API refuses -- for the error message.
+shared_ptr<TokenSource> GetSharepointRestTokens(optional_ptr<FileOpener> opener, const string &path,
+                                                const string &host, bool &client_secret_app);
+
 //! True if any `sharepoint` secret exists at all (whatever its scope). Lets
 //! FileExists answer core's speculative probes with false when the extension
 //! is simply unconfigured, while user-facing calls still get the loud

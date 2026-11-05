@@ -158,5 +158,12 @@ private:
 	const AuthContext &auth;
 };
 
+//! GET `path` from SharePoint's own REST API on https://<host> (#97: list
+//! attachments, which Graph has no API for), with a token from `tokens` and
+//! the retries Graph calls get. The status; `body` gets the answer whatever
+//! it is. Throws only when no answer came. `host` must be a SharePoint host
+//! (GetSharepointRestTokens checks it).
+int SharepointRestGet(TokenSource &tokens, const string &host, const string &path, string &body);
+
 } // namespace sharepoint
 } // namespace duckdb
