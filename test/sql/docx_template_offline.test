@@ -1,0 +1,73 @@
+# name: test/sql/docx_template_offline.test
+# description: COPY ... (FORMAT docx, TEMPLATE ...) (#104) on a local template
+#              -- the writer reads and writes through DuckDB's filesystem, so
+#              no tenant is needed here; e2e/tests/test_docx.py writes via
+#              sharepoint://.
+# group: [sharepoint]
+
+require sharepoint
+
+# Placeholders from VARIABLES and the first row; the {{#rows}} row repeated.
+statement ok
+COPY (SELECT * FROM (VALUES ('North', 10, 'ACME & Co'), ('South', NULL, 'ACME & Co')) t(region, units, customer))
+TO '__TEST_DIR__/quote.docx'
+(FORMAT docx, TEMPLATE 'test/data/docx/template/quote.docx', VARIABLES {'valid_until': DATE '2026-12-31', 'quote_no': 'Q-42'});
+
+query IT
+SELECT idx, text FROM read_docx('__TEST_DIR__/quote.docx') ORDER BY idx;
+----
+1	Quote for ACME & Co
+2	Valid until 2026-12-31
+3	Thank you.
+
+query TT
+SELECT Region, Units FROM read_docx_table('__TEST_DIR__/quote.docx');
+----
+North	10
+South	(empty)
+
+# Over an existing file (COPY's temporary file, then a move); VARIABLES wins
+# over a column; no rows drop the repeated row.
+statement ok
+COPY (SELECT 'x' AS region, 1 AS units, 'ignored' AS customer WHERE false)
+TO '__TEST_DIR__/quote.docx'
+(FORMAT docx, TEMPLATE 'test/data/docx/template/quote.docx',
+ VARIABLES {'customer': 'Initech', 'valid_until': 'soon', 'quote_no': 1});
+
+query T
+SELECT string_agg(text, '|' ORDER BY idx) FROM read_docx('__TEST_DIR__/quote.docx');
+----
+Quote for Initech|Valid until soon|Thank you.
+
+query I
+SELECT count(*) FROM read_docx_table('__TEST_DIR__/quote.docx');
+----
+0
+
+# A placeholder nothing fills.
+statement error
+COPY (SELECT 'North' AS region, 1 AS units) TO '__TEST_DIR__/bad.docx'
+(FORMAT docx, TEMPLATE 'test/data/docx/template/quote.docx');
+----
+no value for {{customer}}
+
+# Several rows, but nowhere to repeat them.
+statement error
+COPY (SELECT * FROM range(2)) TO '__TEST_DIR__/bad.docx' (FORMAT docx, TEMPLATE 'test/data/docx/fixture.docx');
+----
+has no table row marked {{#rows}}
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/bad.docx' (FORMAT docx);
+----
+needs TEMPLATE
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/bad.docx' (FORMAT docx, TEMPLATE 'test/data/excel/fixture.xlsx');
+----
+is not a Word document
+
+statement error
+COPY (SELECT 1) TO '__TEST_DIR__/bad.docx' (FORMAT docx, TEMPLATE 'test/data/docx/fixture.docx', VARIABLES 'x');
+----
+VARIABLES takes a STRUCT

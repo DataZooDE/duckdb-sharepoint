@@ -2,14 +2,20 @@
 // rows, read as files through DuckDB's filesystem (sharepoint://, a browser
 // address, or any path), unzipped with sharepoint_excel's Zip* helpers and
 // parsed by sharepoint_docx (pure). No Graph Word API.
+//
+// COPY ... TO 'x.docx' (FORMAT docx, TEMPLATE 't.docx') (#104): a template
+// filled from the query (sharepoint_docx's FillDocxPart, pure) and written as
+// a new file -- there is no Graph API for editing Word documents.
 #include "sharepoint_docx_functions.hpp"
 #include "sharepoint_banner.hpp"
+#include "sharepoint_copy_rewrite.hpp"
 #include "sharepoint_docx.hpp"
 #include "sharepoint_excel.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/gzip_file_system.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/function/copy_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
@@ -190,9 +196,194 @@ void Register(ExtensionLoader &loader, TableFunctionSet set, const string &descr
 	loader.RegisterFunction(std::move(info));
 }
 
+// --- COPY ... TO 'x.docx' (FORMAT docx, TEMPLATE 't.docx') ------------------
+
+struct DocxWriteBindData : public FunctionData {
+	string template_path;
+	DocxValues variables; // VARIABLES {...}: win over the first row's columns
+	vector<string> names;
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<DocxWriteBindData>(*this);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<DocxWriteBindData>();
+		return template_path == other.template_path && variables == other.variables && names == other.names;
+	}
+};
+
+//! A value as the document shows it: its text, NULL as nothing.
+string DocxText(const Value &v) {
+	return v.IsNull() ? string() : v.ToString();
+}
+
+unique_ptr<FunctionData> DocxWriteBind(ClientContext &, CopyFunctionBindInput &input,
+                                       const duckdb_compat::CopyBindNames &names, const vector<LogicalType> &) {
+	auto &info = input.info;
+	auto data = make_uniq<DocxWriteBindData>();
+	auto tmpl = FindCopyOption(info.options, "template");
+	if (!tmpl || tmpl->size() != 1 || (*tmpl)[0].IsNull()) {
+		throw InvalidInputException("sharepoint: FORMAT docx needs TEMPLATE '<a .docx>' to fill");
+	}
+	data->template_path = (*tmpl)[0].ToString();
+	if (auto vars = FindCopyOption(info.options, "variables")) {
+		if (vars->size() != 1) {
+			throw InvalidInputException("sharepoint: VARIABLES takes one STRUCT, e.g. {'customer': 'ACME'}");
+		}
+		auto &v = (*vars)[0];
+		if (v.type().id() == LogicalTypeId::STRUCT) {
+			auto &children = StructValue::GetChildren(v);
+			for (idx_t i = 0; i < children.size(); i++) {
+				data->variables[DocxKey(duckdb_compat::Str(StructType::GetChildName(v.type(), i)))] =
+				    DocxText(children[i]);
+			}
+		} else if (v.type().id() == LogicalTypeId::MAP) {
+			for (auto &entry : MapValue::GetChildren(v)) {
+				auto &kv = StructValue::GetChildren(entry);
+				data->variables[DocxKey(kv[0].ToString())] = DocxText(kv[1]);
+			}
+		} else {
+			throw InvalidInputException("sharepoint: VARIABLES takes a STRUCT, e.g. {'customer': 'ACME'}, not %s",
+			                            v.type().ToString());
+		}
+	}
+	for (auto &n : names) {
+		data->names.push_back(duckdb_compat::Str(n));
+	}
+	return std::move(data);
+}
+
+struct DocxWriteGlobalState : public GlobalFunctionData {
+	string file_path;
+	vector<DocxValues> rows;
+};
+
+unique_ptr<GlobalFunctionData> DocxWriteInitGlobal(ClientContext &, FunctionData &, const string &file_path) {
+	auto g = make_uniq<DocxWriteGlobalState>();
+	g->file_path = file_path;
+	return std::move(g);
+}
+
+unique_ptr<LocalFunctionData> DocxWriteInitLocal(ExecutionContext &, FunctionData &) {
+	return make_uniq<LocalFunctionData>();
+}
+
+void DocxWriteSink(ExecutionContext &, FunctionData &bind_p, GlobalFunctionData &gstate_p, LocalFunctionData &,
+                   DataChunk &input) {
+	auto &bind = bind_p.Cast<DocxWriteBindData>();
+	auto &g = gstate_p.Cast<DocxWriteGlobalState>();
+	for (idx_t r = 0; r < input.size(); r++) {
+		DocxValues row;
+		for (idx_t c = 0; c < input.ColumnCount(); c++) {
+			row[DocxKey(bind.names[c])] = DocxText(input.GetValue(c, r));
+		}
+		g.rows.push_back(std::move(row));
+	}
+}
+
+void DocxWriteCombine(ExecutionContext &, FunctionData &, GlobalFunctionData &, LocalFunctionData &) {
+}
+
+string ReadWhole(ClientContext &context, const string &path) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	const auto size = static_cast<uint64_t>(handle->GetFileSize());
+	if (size > kMaxDocxBytes) {
+		throw InvalidInputException("sharepoint: '%s' is larger than %llu MB", path,
+		                            (unsigned long long)(kMaxDocxBytes >> 20));
+	}
+	string bytes(size, '\0');
+	handle->Read(&bytes[0], size, 0);
+	return bytes;
+}
+
+void DocxWriteFinalize(ClientContext &context, FunctionData &bind_p, GlobalFunctionData &gstate_p) {
+	auto &bind = bind_p.Cast<DocxWriteBindData>();
+	auto &g = gstate_p.Cast<DocxWriteGlobalState>();
+	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
+		const auto &path = bind.template_path;
+		vector<ZipMember> members;
+		string error;
+		if (!ReadZipMembers(ReadWhole(context, path), members, error)) {
+			throw InvalidInputException("sharepoint: the template '%s' is not a Word document (.docx): %s", path,
+			                            error);
+		}
+		DocxFillInput input;
+		if (!g.rows.empty()) {
+			input.scalars = g.rows[0];
+		}
+		for (auto &v : bind.variables) {
+			input.scalars[v.first] = v.second;
+		}
+		input.rows = std::move(g.rows);
+		bool has_body = false, repeated = false;
+		for (auto &m : members) {
+			if (!IsDocxTemplatePart(m.name)) {
+				continue;
+			}
+			has_body = has_body || m.name == "word/document.xml";
+			if (m.method != 0 && m.method != 8) {
+				throw InvalidInputException("sharepoint: the template '%s' compresses %s in a way not supported", path,
+				                            m.name);
+			}
+			auto xml = m.method == 8 ? GZipFileSystem::UncompressGZIPString(
+			                               GzipFrame(m.data, m.crc32, static_cast<uint32_t>(m.uncompressed_size)))
+			                         : m.data;
+			string filled;
+			if (!FillDocxPart(xml, input, filled, repeated, error)) {
+				throw InvalidInputException("sharepoint: the template '%s' (%s): %s", path, m.name, error);
+			}
+			if (filled != xml) {
+				m.method = 0;
+				m.crc32 = ZipCrc32(filled);
+				m.uncompressed_size = filled.size();
+				m.data = std::move(filled);
+			}
+		}
+		if (!has_body) {
+			throw InvalidInputException("sharepoint: the template '%s' is not a Word document (.docx)", path);
+		}
+		if (!repeated && input.rows.size() > 1) {
+			throw InvalidInputException(
+			    "sharepoint: the query returned %llu rows, but the template '%s' has no table row marked {{#rows}} "
+			    "to repeat for them",
+			    (unsigned long long)input.rows.size(), path);
+		}
+		const auto zip = WriteZip(members);
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto out = fs.OpenFile(g.file_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+		out->Write(const_cast<char *>(zip.data()), zip.size());
+		// Closed here, so a SharePoint file is published before COPY moves its
+		// temporary file over an existing target.
+		out->Close();
+	});
+}
+
+CopyFunctionExecutionMode DocxWriteExecutionMode(bool, bool) {
+	// One writer, rows in query order: they become the repeated rows in order.
+	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
+}
+
+void DocxCopyOptions(ClientContext &, CopyOptionsInput &input) {
+	AddCopyOption(input.options, "template", LogicalType::VARCHAR);
+	AddCopyOption(input.options, "variables", LogicalType::ANY);
+}
+
 } // namespace
 
 void RegisterDocxFunctions(ExtensionLoader &loader) {
+	CopyFunction writer(duckdb_compat::FunctionName("docx"));
+	writer.copy_options = DocxCopyOptions;
+	writer.copy_to_bind = DocxWriteBind;
+	writer.copy_to_initialize_global = DocxWriteInitGlobal;
+	writer.copy_to_initialize_local = DocxWriteInitLocal;
+	writer.copy_to_sink = DocxWriteSink;
+	writer.copy_to_combine = DocxWriteCombine;
+	writer.copy_to_finalize = DocxWriteFinalize;
+	writer.execution_mode = DocxWriteExecutionMode;
+	writer.extension = "docx";
+	loader.RegisterFunction(writer);
+
 	TableFunctionSet docx("read_docx");
 	docx.AddFunction(TableFunction("read_docx", {LogicalType::VARCHAR}, RowsScan, DocxBind, CursorInit));
 	Register(loader, docx,
