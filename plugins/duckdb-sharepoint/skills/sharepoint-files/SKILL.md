@@ -90,6 +90,15 @@ SELECT * FROM read_docx_table('sharepoint://Reports/q4.docx', 2);   -- n-th tabl
 ```
 Body paragraphs only (table text is in read_docx_table); any filesystem, not only sharepoint://.
 
+Fill a Word template (a new file, or replaces one; the template's layout stays):
+```sql
+COPY (SELECT product, qty, price FROM lines) TO 'sharepoint://Quotes/Q-42.docx'
+(FORMAT docx, TEMPLATE 'sharepoint://Templates/quote.docx', VARIABLES {'customer': 'ACME'});
+```
+`{{name}}` → VARIABLES, else the first row's column (case-insensitive); a table row containing `{{#rows}}`
+repeats per query row (`{{/rows}}` optional). Values are text — format in SQL. Unfilled placeholder = error;
+several rows without a `{{#rows}}` row = error.
+
 ## Search
 ```sql
 SELECT name, path, modified, summary FROM search_sharepoint('quarterly forecast');

@@ -579,6 +579,12 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   move published a truncated zip and the later writes aborted. Not fixable
   in the filesystem: overwrite with `USE_TMP_FILE false` (documented, and
   what the e2e test does).
+- **SharePoint rewrites an uploaded Office file** (2026-11-05, #104): a
+  1917-byte .docx uploaded through Graph was 9573 bytes when listed later --
+  SharePoint embeds its document properties (property demotion) into Office
+  files. Its text and tables are unchanged, but size and hash are not the
+  bytes sent: never compare an Office file in SharePoint with its upload by
+  size or content hash.
 - **An item's permissions, as listed** (2026-11-04, #98): for a file in a
   fresh folder, `GET /items/{id}/permissions` (app-only) gave the site's
   groups (owner / member / visitor, as `group` and `siteGroup`) with **no

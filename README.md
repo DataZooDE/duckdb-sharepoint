@@ -268,6 +268,25 @@ SELECT file, text FROM read_docx('sharepoint://Contracts/*.docx') WHERE text ILI
 SELECT * FROM read_docx_table('sharepoint://Reports/q4.docx', 2);
 ```
 
+To **write** one, fill a template: `{{name}}` in the text is replaced by a
+value, and a table row holding `{{#rows}}` is repeated once per query row.
+Values come from `VARIABLES`, else from the query's columns (the first row,
+outside the repeated row). Layout, styles, headers and footers stay as the
+template has them; the result is a new file (or replaces one).
+
+```sql
+COPY (SELECT product, qty, price FROM quote_lines WHERE quote_no = 'Q-42')
+TO 'sharepoint://Sales/Quotes/Q-42.docx'
+(FORMAT docx, TEMPLATE 'sharepoint://Sales/Templates/quote.docx',
+ VARIABLES {'customer': 'ACME', 'valid_until': DATE '2026-12-31'});
+```
+
+In the template, a placeholder may be typed with any formatting (it takes
+that of its first character), names ignore case, and `{{/rows}}` may close
+the repeated row for readability. Values are written as text: format
+numbers and dates in the query (`format`, `strftime`). A placeholder without
+a value is an error, as are several rows with no `{{#rows}}` row to take them.
+
 `write_blob`, `remove_file`, `move_file` and `file_size` don't depend on the
 scheme, so they work for any filesystem DuckDB can reach (`s3://`, `gs://`,
 local paths). They are shared with duckdb-gdrive, so both extensions can be
