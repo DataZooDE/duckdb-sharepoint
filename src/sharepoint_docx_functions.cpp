@@ -37,14 +37,14 @@ string ArgString(TableFunctionBindInput &input, idx_t i, const char *what) {
 
 //! The files `path` names: itself, or what its glob matches.
 vector<string> Files(ClientContext &context, const string &path) {
+	// The context's filesystem brings its own opener (passing one is an error).
 	auto &fs = FileSystem::GetFileSystem(context);
-	auto opener = ClientData::Get(context).file_opener.get();
 	vector<string> files;
 	if (!FileSystem::HasGlob(path)) {
 		files.push_back(path);
 		return files;
 	}
-	for (auto &f : fs.Glob(path, opener)) {
+	for (auto &f : fs.Glob(path)) {
 		files.push_back(f.path);
 	}
 	if (files.empty()) {

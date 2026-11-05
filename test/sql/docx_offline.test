@@ -20,6 +20,12 @@ SELECT Region, Units FROM read_docx_table('test/data/docx/fixture.docx') ORDER B
 North	10
 South	7
 
+# A glob.
+query II
+SELECT count(DISTINCT file), count(*) FROM read_docx('test/data/docx/*.docx');
+----
+1	4
+
 statement error
 SELECT * FROM read_docx_table('test/data/docx/fixture.docx', 2);
 ----
