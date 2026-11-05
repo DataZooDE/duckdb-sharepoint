@@ -258,6 +258,16 @@ each item that inherits them (Graph's listing has no `inheritedFrom` for
 them), and a link's `link_url` can be NULL (Graph's listing may leave out
 the address).
 
+**Word documents.** `read_docx` gives the paragraphs of `.docx` files (a path
+or a glob) with their style and heading level; `read_docx_table` the n-th
+table of one, its first row as column names. They read the file itself, so
+they work on any filesystem DuckDB can reach:
+
+```sql
+SELECT file, text FROM read_docx('sharepoint://Contracts/*.docx') WHERE text ILIKE '%notice period%';
+SELECT * FROM read_docx_table('sharepoint://Reports/q4.docx', 2);
+```
+
 `write_blob`, `remove_file`, `move_file` and `file_size` don't depend on the
 scheme, so they work for any filesystem DuckDB can reach (`s3://`, `gs://`,
 local paths). They are shared with duckdb-gdrive, so both extensions can be

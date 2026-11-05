@@ -1,0 +1,37 @@
+# name: test/sql/docx_offline.test
+# description: read_docx / read_docx_table (#103) on a local fixture -- the
+#              functions read through DuckDB's filesystem, so no tenant is
+#              needed here; e2e/tests/test_docx.py reads it via sharepoint://.
+# group: [sharepoint]
+
+require sharepoint
+
+query IITT
+SELECT idx, heading_level, style, text FROM read_docx('test/data/docx/fixture.docx') ORDER BY idx;
+----
+1	1	Heading1	Service contract
+2	NULL	NULL	Notice period: 3 months
+3	2	Heading2	Terms
+4	NULL	NULL	Fees & payment
+
+query TT
+SELECT Region, Units FROM read_docx_table('test/data/docx/fixture.docx') ORDER BY Region;
+----
+North	10
+South	7
+
+# A glob.
+query II
+SELECT count(DISTINCT file), count(*) FROM read_docx('test/data/docx/*.docx');
+----
+1	4
+
+statement error
+SELECT * FROM read_docx_table('test/data/docx/fixture.docx', 2);
+----
+has 1 table(s); there is no table 2
+
+statement error
+SELECT * FROM read_docx('test/data/excel/fixture.xlsx');
+----
+is not a Word document

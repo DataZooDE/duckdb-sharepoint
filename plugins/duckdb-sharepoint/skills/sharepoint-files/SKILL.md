@@ -83,6 +83,13 @@ FROM sharepoint_permissions('sharepoint://Finance/**');      -- a file, a folder
 One row per grantee; `granted_by` = `direct` | `inherited` | `link` (Graph lists a site's groups as direct, without inheritedFrom; link_url may be NULL); `link_scope` =
 `anonymous` | `organization` | `users`. An org link nobody used yet has no grantee (NULL).
 
+## Word documents
+```sql
+SELECT file, idx, style, heading_level, text FROM read_docx('sharepoint://Contracts/*.docx');
+SELECT * FROM read_docx_table('sharepoint://Reports/q4.docx', 2);   -- n-th table (default 1), all VARCHAR
+```
+Body paragraphs only (table text is in read_docx_table); any filesystem, not only sharepoint://.
+
 ## Search
 ```sql
 SELECT name, path, modified, summary FROM search_sharepoint('quarterly forecast');
