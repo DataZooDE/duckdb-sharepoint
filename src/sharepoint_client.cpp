@@ -156,6 +156,18 @@ string ErrorCode(const string &body) {
 	}
 }
 
+//! A write onto a folder's name: Graph refuses it (501 "Cannot upload content
+//! to an item representing a folder" for an upload, verified 2026-11-07) --
+//! say so in the reader's words, not Graph's server-error ones.
+[[noreturn]] void ThrowUploadError(const string &op, const string &root_relative_path, int status,
+                                   const string &body) {
+	if (status == 501 && body.find("representing a folder") != string::npos) {
+		throw IOException("sharepoint: cannot write to 'sharepoint://%s': it is a folder, not a file",
+		                  root_relative_path.c_str());
+	}
+	ThrowGraph(op, status, body);
+}
+
 // Send a Graph request, retrying transport failures, 5xx and throttling
 // (429/503, Graph's throttling codes) with backoff -- Graph throttles
 // SharePoint aggressively, and one 429 must not fail a whole scan. Every
@@ -488,7 +500,7 @@ DriveItemMeta GraphClient::PutContent(const string &root_relative_path, const st
 		throw IOException("sharepoint: upload of '%s' failed at the transport layer", root_relative_path.c_str());
 	}
 	if (res->status < 200 || res->status >= 300) {
-		ThrowGraph("upload '" + root_relative_path + "'", res->status, res->body);
+		ThrowUploadError("upload '" + root_relative_path + "'", root_relative_path, res->status, res->body);
 	}
 	picojson::value v;
 	if (!picojson::parse(v, res->body).empty() || !v.is<picojson::object>()) {
@@ -518,8 +530,8 @@ void GraphClient::OpenUploadSession(const string &root_relative_path, GraphUploa
 	auto sres = SendWithRetry(*auth.tokens, h,
 	                          [&] { return cli.Post(session_path.c_str(), h, session_body, "application/json"); });
 	if (!sres || sres->status < 200 || sres->status >= 300) {
-		ThrowGraph("createUploadSession '" + root_relative_path + "'", sres ? sres->status : 0,
-		           sres ? sres->body : string());
+		ThrowUploadError("createUploadSession '" + root_relative_path + "'", root_relative_path, sres ? sres->status : 0,
+		                 sres ? sres->body : string());
 	}
 	picojson::value v;
 	if (!picojson::parse(v, sres->body).empty() || !v.is<picojson::object>()) {
@@ -808,6 +820,15 @@ void GraphClient::MoveById(const string &item_id, const string &source_root_rela
 	IncrementCounter(Counter::MOVE);
 	auto res = SendWithRetry(*auth.tokens, h, [&] { return cli.Patch(path.c_str(), h, picojson::value(body).serialize(), "application/json"); });
 	if (!res || res->status < 200 || res->status >= 300) {
+		// A move onto a FOLDER's name conflicts (409 nameAlreadyExists, even with
+		// replace; verified 2026-11-07): name the cause.
+		if (res && res->status == 409) {
+			auto existing = StatByPath(target_root_relative);
+			if (existing.found && existing.is_folder) {
+				throw IOException("sharepoint: cannot move '%s' onto 'sharepoint://%s': it is a folder, not a file",
+				                  source_root_relative.c_str(), target_root_relative.c_str());
+			}
+		}
 		ThrowGraph("move '" + source_root_relative + "' -> '" + target_root_relative + "'",
 		           res ? res->status : 0, res ? res->body : string());
 	}
@@ -967,6 +988,10 @@ string GraphClient::WorkbookCall(const string &method, const string &item_id, co
 		ThrowGraph((method == "GET" ? "read " : "write ") + what, res->status, res->body);
 	}
 	return res->body;
+}
+
+string EncodeGraphPath(const string &path) {
+	return EncodePath(path);
 }
 
 string GraphPathOfLink(const string &link) {

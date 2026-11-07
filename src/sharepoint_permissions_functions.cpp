@@ -86,7 +86,9 @@ unique_ptr<FunctionData> PermissionsBind(ClientContext &context, TableFunctionBi
 				if (!expanded.ok || expanded.uri.segments.empty()) {
 					continue;
 				}
-				for (auto &rel : sharepoint::GlobFiles(expanded.uri.segments, lister)) {
+				// Files AND folders: a folder shared with everyone exposes its whole
+				// tree, and an audit that saw only files came back clean.
+				for (auto &rel : sharepoint::GlobItems(expanded.uri.segments, lister)) {
 					const auto meta = client.StatByPath(rel);
 					if (meta.found) {
 						items.emplace_back(string(SHAREPOINT_SCHEME) + rel, meta.id);
@@ -168,7 +170,8 @@ void RegisterPermissionFunctions(ExtensionLoader &loader) {
 	CreateTableFunctionInfo info(fn);
 	FunctionDescription desc;
 	desc.description =
-	    "Who can reach a file or folder (or the files a glob matches): one row per grantee of each permission -- "
+	    "Who can reach a file or folder (or the files and folders a glob matches): one row per grantee of each "
+	    "permission -- "
 	    "roles, granted_by (direct, inherited, link), the user, group or app, and for a sharing link its type, "
 	    "scope (anonymous, organization, users) and address.";
 	desc.examples = {"SELECT path, grantee, roles, link_scope FROM sharepoint_permissions('sharepoint://Finance/**')"};

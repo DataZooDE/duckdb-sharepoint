@@ -12,6 +12,7 @@
 #include "sharepoint_errors.hpp"
 #include "sharepoint_delta.hpp"
 #include "sharepoint_list.hpp"
+#include "sharepoint_glob.hpp"
 #include "sharepoint_uri.hpp"
 #include "sharepoint_weburl.hpp"
 
@@ -1526,8 +1527,36 @@ unique_ptr<FunctionData> FilesBind(ClientContext &context, TableFunctionBindInpu
 
 		// The files: the filesystem's glob (its syntax, its immutable-prefix
 		// cache), then each file's driveItem with its listItem fields.
+		// A path that names one thing (no glob characters) is checked first: a
+		// version describes no file of its own (its metadata would be the
+		// current file's), a missing path is an error rather than zero rows (as
+		// in sharepoint_permissions), and a folder means the files directly in
+		// it. Found in duckdb-gdrive's review, same code shape here.
+		string glob_pattern = pattern;
+		{
+			auto parsed = ParseSharepointUri(pattern);
+			if (parsed.ok && !parsed.uri.version.empty()) {
+				throw InvalidInputException("sharepoint: name the file, not one of its versions: '%s' "
+				                            "(sharepoint_versions lists them)",
+				                            pattern);
+			}
+			bool literal = parsed.ok && parsed.uri.kind == SharepointUriKind::PATH;
+			for (auto &segment : parsed.uri.segments) {
+				literal = literal && !HasGlobMetacharacters(segment);
+			}
+			if (literal) {
+				const auto meta = client.StatByPath(parsed.uri.RootRelativePath());
+				if (!meta.found) {
+					throw IOException("sharepoint: no such file or folder: '%s'", pattern);
+				}
+				if (meta.is_folder) {
+					const auto rel = parsed.uri.RootRelativePath();
+					glob_pattern = string(SHAREPOINT_SCHEME) + (rel.empty() ? "*" : rel + "/*");
+				}
+			}
+		}
 		auto &fs = FileSystem::GetFileSystem(context);
-		const auto matches = fs.Glob(pattern); // the opener is pushed by DuckDB (passing one throws)
+		const auto matches = fs.Glob(glob_pattern); // the opener is pushed by DuckDB (passing one throws)
 		string select;
 		std::set<string> selected;
 		for (auto &col : plan) {

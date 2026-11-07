@@ -59,3 +59,16 @@ def test_anyone_link(graph, scratch, sql, secret_sql):
         WHERE granted_by = 'link' AND link_scope = 'anonymous';
     """).splitlines()
     assert out[-1] == "1", out
+
+
+def test_a_glob_audits_folders_too(graph, scratch, sql, secret_sql):
+    """A folder shared with everyone exposes its whole tree; a glob that saw
+    only files let an audit come back clean (exploratory testing of
+    duckdb-gdrive, 2026-11-07, checked here)."""
+    graph.mkdir(f"{scratch}/shared")
+    graph.upload(f"{scratch}/shared/a.csv", b"n\n1\n")
+    graph.upload(f"{scratch}/top.csv", b"n\n1\n")
+    out = sql(f"""{secret_sql}
+        SELECT string_agg(DISTINCT parse_filename(path), ',' ORDER BY parse_filename(path))
+        FROM sharepoint_permissions('sharepoint://{scratch}/*');""").splitlines()
+    assert out[-1] == "shared,top.csv", out

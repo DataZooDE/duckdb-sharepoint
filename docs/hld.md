@@ -604,6 +604,28 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   off; it must be switched on *and saved*), `AADSTS50173` (the stored refresh
   token expired; `make delegated_login` again).
 
+- **Checked against duckdb-gdrive's review, 2026-11-07.** A crew review and
+  exploratory testing of the sibling found bugs in code shaped like ours;
+  each was checked here, live, red first:
+  - A write onto a FOLDER's name is refused by Graph -- an upload answers
+    `501 notSupported` ("Cannot upload content to an item representing a
+    folder"), a move `409 nameAlreadyExists`, even with
+    `conflictBehavior=replace`. Not data loss here (in gdrive it was); the
+    error now says "is a folder".
+  - The delta reports a renamed or moved FOLDER, not its children, whose
+    paths then go stale in a mirror. `sharepoint_changes` lists a changed
+    folder's subtree (by id: the delta can describe a folder at a path it has
+    since left, and that path 404s).
+  - A drive-wide delta filtered by path drops a move OUT of the folder, so a
+    mirror kept the moved file. `outside := true` reports it, and a folder
+    moved out with its subtree, as path-less deletes. An ANCESTOR of the
+    watched folder also appears in the delta (its children changed) and must
+    be skipped: walked as "moved out", it deleted the folder's own files from
+    the mirror -- caught by the mirror test.
+  - `sharepoint_permissions` over a glob saw files only; a folder shared
+    with everyone escaped an audit. `read_sharepoint_files` returned zero rows
+    for a missing path and the CURRENT metadata under a `?version=` path.
+
 ## 8. Two-actor note
 
 The extension binary is built and released from **this** repo (ghcr / the

@@ -52,7 +52,7 @@ SELECT name, path, size, modified, modified_by, "Department"
 FROM read_sharepoint_files('sharepoint://Finance/**/*.xlsx');
 ```
 Fixed columns `path, name, size, created, modified, created_by(_email), modified_by(_email),
-content_type, id, web_url, checked_out_by(_email)` (NULL unless checked out), then the library's own columns, typed like list columns.
+content_type, id, web_url, checked_out_by(_email)` (NULL unless checked out), then the library's own columns, typed like list columns. A folder path means its files; a missing path is an error; a `?version=` path is refused.
 
 ## Earlier versions
 ```sql
@@ -64,13 +64,16 @@ SELECT * FROM read_parquet('sharepoint://f.parquet?version=3.0');   -- any reade
 ```sql
 SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := 'latest');  -- just a token
 SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := '<token>');
+SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := '<token>', outside := true);  -- for a mirror
 ```
 Rows: `_change` = `upsert` | `delete` (by `id`; path may be NULL) | `checkpoint` (exactly one,
 last; its `token` is for next time), with `modified_by` / `modified_by_email` (who; NULL for
-deletes). No token = full listing. Expired token → start over.
+deletes). No token = full listing. Expired token → start over. A folder renamed or moved in
+brings its subtree (new paths). Moved OUT is reported only with `outside := true` (path-less
+deletes, a folder with its subtree; also reports changes elsewhere in the drive).
 Mirror pattern (README "Keeping a mirror"): store the token FIRST, then the listing
-(`read_sharepoint_files`); each run: changes since the token → delete their ids, insert the
-upserts, store the new token. Lists: `sharepoint_list_changes`, or `WHERE modified > ts`
+(`read_sharepoint_files`); each run: changes since the token with `outside := true` → delete
+their ids, insert the non-folder upserts, store the new token. Lists: `sharepoint_list_changes`, or `WHERE modified > ts`
 (pushed down when Modified is indexed).
 Table functions take no subqueries: pass a stored token via `SET VARIABLE t = (...)` and
 `getvariable('t')`.
@@ -78,7 +81,7 @@ Table functions take no subqueries: pass a stored token via `SET VARIABLE t = (.
 ## Who can see it (permissions)
 ```sql
 SELECT path, granted_by, grantee_type, grantee, grantee_email, roles, link_scope, link_url, expires
-FROM sharepoint_permissions('sharepoint://Finance/**');      -- a file, a folder, or a glob of files
+FROM sharepoint_permissions('sharepoint://Finance/**');      -- a file, a folder, or a glob (files AND folders)
 ```
 One row per grantee; `granted_by` = `direct` | `inherited` | `link` (Graph lists a site's groups as direct, without inheritedFrom; link_url may be NULL); `link_scope` =
 `anonymous` | `organization` | `users`. An org link nobody used yet has no grantee (NULL).
