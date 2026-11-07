@@ -1065,3 +1065,23 @@ TEST_CASE("raw request head is the request minus its body", "[rawhttp]") {
 	REQUIRE(whole == head + "xyz");
 	REQUIRE_FALSE(BuildRawHttpHead("PUT", "h", 443, "/u", {{"Content-Length", "9"}}, 3, head));
 }
+
+TEST_CASE("GlobItems also returns the folders a pattern matches", "[glob]") {
+	// For sharepoint_permissions: a folder shared with everyone exposes its
+	// whole tree, so an audit must see the folders a glob matches too. Found
+	// by exploratory testing of duckdb-gdrive, 2026-11-07.
+	const std::map<std::string, std::vector<GlobEntry>> tree = {
+	    {"", {{"Finance", true}, {"readme.md", false}}},
+	    {"Finance", {{"2025", true}, {"summary.parquet", false}}},
+	    {"Finance/2025", {{"q1.parquet", false}}},
+	};
+	auto list = TreeLister(tree);
+	REQUIRE(Sorted(GlobItems({"Finance", "*"}, list)) ==
+	        std::vector<std::string> {"Finance/2025", "Finance/summary.parquet"});
+	REQUIRE(Sorted(GlobItems({"Finance", "**"}, list)) ==
+	        std::vector<std::string> {"Finance/2025", "Finance/2025/q1.parquet", "Finance/summary.parquet"});
+	// A file pattern matches no folder: GlobItems is GlobFiles plus folders.
+	REQUIRE(Sorted(GlobItems({"**", "*.parquet"}, list)) == Sorted(GlobFiles({"**", "*.parquet"}, list)));
+	// GlobFiles is unchanged: files only.
+	REQUIRE(Sorted(GlobFiles({"Finance", "*"}, list)) == std::vector<std::string> {"Finance/summary.parquet"});
+}

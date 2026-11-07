@@ -145,6 +145,19 @@ class Graph:
         r.raise_for_status()
         return True
 
+    def move(self, path: str, new_parent: str | None = None, new_name: str | None = None) -> dict:
+        """Move and/or rename the item at `path` (a rename when only
+        `new_name` is given), as a user would in the browser."""
+        item = self.stat(path)
+        body: dict = {}
+        if new_parent is not None:
+            body["parentReference"] = {"id": self.stat(new_parent)["id"]}
+        if new_name is not None:
+            body["name"] = new_name
+        r = self._req("PATCH", f"{GRAPH}/drives/{self.drive_id}/items/{item['id']}", json=body)
+        r.raise_for_status()
+        return r.json()
+
     def children(self, path: str) -> list[dict]:
         url = self._item(path) + ":/children?$top=200" if path.strip("/") else \
             f"{GRAPH}/drives/{self.drive_id}/root/children?$top=200"

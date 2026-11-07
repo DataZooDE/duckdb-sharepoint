@@ -278,7 +278,7 @@ std::string Join(const std::string &folder, const std::string &name) {
 // Match segments[i..] against the contents of `folder`. A folder tree has no
 // cycles, so the descent always terminates.
 void GlobRecurse(const std::vector<std::string> &segs, std::size_t i, const std::string &folder,
-                 const GlobLister &list, ListCache &cache, std::vector<std::string> &out) {
+                 const GlobLister &list, ListCache &cache, std::vector<std::string> &out, bool folders) {
 	const auto &children = ListOnce(folder, list, cache);
 	const std::string &seg = segs[i];
 	const bool is_last = (i + 1 == segs.size());
@@ -288,7 +288,10 @@ void GlobRecurse(const std::vector<std::string> &segs, std::size_t i, const std:
 			// A trailing ** is every file at or below this folder.
 			for (const auto &c : children) {
 				if (c.is_folder) {
-					GlobRecurse(segs, i, Join(folder, c.name), list, cache, out); // ** persists downward
+					if (folders) {
+						out.push_back(Join(folder, c.name));
+					}
+					GlobRecurse(segs, i, Join(folder, c.name), list, cache, out, folders); // ** persists downward
 				} else {
 					out.push_back(Join(folder, c.name));
 				}
@@ -296,11 +299,11 @@ void GlobRecurse(const std::vector<std::string> &segs, std::size_t i, const std:
 			return;
 		}
 		// ** may consume zero folders (match the next segment right here) ...
-		GlobRecurse(segs, i + 1, folder, list, cache, out);
+		GlobRecurse(segs, i + 1, folder, list, cache, out, folders);
 		// ... or one or more (descend into each subfolder with ** still active).
 		for (const auto &c : children) {
 			if (c.is_folder) {
-				GlobRecurse(segs, i, Join(folder, c.name), list, cache, out);
+				GlobRecurse(segs, i, Join(folder, c.name), list, cache, out, folders);
 			}
 		}
 		return;
@@ -308,11 +311,11 @@ void GlobRecurse(const std::vector<std::string> &segs, std::size_t i, const std:
 
 	for (const auto &c : children) {
 		if (is_last) {
-			if (!c.is_folder && MatchSegment(seg, c.name)) {
+			if ((folders || !c.is_folder) && MatchSegment(seg, c.name)) {
 				out.push_back(Join(folder, c.name));
 			}
 		} else if (c.is_folder && MatchSegment(seg, c.name)) {
-			GlobRecurse(segs, i + 1, Join(folder, c.name), list, cache, out);
+			GlobRecurse(segs, i + 1, Join(folder, c.name), list, cache, out, folders);
 		}
 	}
 }
@@ -325,7 +328,17 @@ std::vector<std::string> GlobFiles(const std::vector<std::string> &segments, con
 		return out;
 	}
 	ListCache cache;
-	GlobRecurse(segments, 0, "", list, cache, out);
+	GlobRecurse(segments, 0, "", list, cache, out, /*folders=*/false);
+	return out;
+}
+
+std::vector<std::string> GlobItems(const std::vector<std::string> &segments, const GlobLister &list) {
+	std::vector<std::string> out;
+	if (segments.empty()) {
+		return out;
+	}
+	ListCache cache;
+	GlobRecurse(segments, 0, "", list, cache, out, /*folders=*/true);
 	return out;
 }
 

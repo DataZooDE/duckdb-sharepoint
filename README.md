@@ -203,6 +203,13 @@ Without a token it lists everything under the folder once. An expired token
 says so; start over without one. Each row also says who made the change
 (`modified_by`, `modified_by_email`: a user, or an app by name).
 
+A folder renamed or moved into the folder brings its whole subtree, with the
+new paths: Graph's delta reports only the folder itself. A file or folder
+moved **out** looks, in a drive-wide delta, like a change somewhere else, so
+by default it is not reported; `outside := true` reports it as a path-less
+`delete` (a folder with its subtree) -- what a mirror needs, at the cost of a
+row for changes elsewhere in the drive too.
+
 **Keeping a mirror.** A table of a folder's files, kept current from the
 change feed, with the token stored beside it. Here in DuckLake, so earlier
 states stay queryable:
@@ -218,7 +225,9 @@ CREATE TABLE lake.files AS
 
 -- Each run (e.g. from cron):
 SET VARIABLE t = (SELECT token FROM lake.sync);           -- table functions take no subqueries
-CREATE TEMP TABLE c AS SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := getvariable('t'));
+-- outside := true: a file or folder moved out of Finance must leave the mirror.
+CREATE TEMP TABLE c AS
+    SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := getvariable('t'), outside := true);
 DELETE FROM lake.files WHERE id IN (SELECT id FROM c WHERE _change <> 'checkpoint');
 INSERT INTO lake.files
     SELECT id, path, name, size, modified, modified_by FROM c WHERE _change = 'upsert' AND NOT is_folder;
@@ -226,6 +235,8 @@ UPDATE lake.sync SET token = (SELECT token FROM c WHERE _change = 'checkpoint');
 ```
 
 Running it again is harmless: each run applies what changed since the last.
+The e2e harness runs this recipe through a folder renamed and a folder moved
+out, and checks the mirror against a fresh listing.
 For a list, `sharepoint_list_changes` works the same way; or pull what
 changed since a time with `WHERE modified > TIMESTAMP '…'`, which goes to
 SharePoint as a filter when the list's *Modified* column is indexed.
@@ -242,7 +253,8 @@ SELECT * FROM read_parquet('sharepoint://Finance/actuals.parquet?version=3.0');
 ```
 
 **Who can see it.** `sharepoint_permissions` lists, for a file or folder or
-the files a glob matches, one row per grantee: the `roles`, how it was
+the files **and folders** a glob matches (a folder shared with everyone
+exposes its tree), one row per grantee: the `roles`, how it was
 granted (`direct`, `inherited`, or a sharing `link`), the user, group or app,
 and for a link its type and scope (`anonymous`, `organization`, `users`). For
 audits such as "what is shared with anyone":
@@ -465,7 +477,8 @@ FROM read_sharepoint_files('sharepoint://Finance/**/*.xlsx');
 ```
 
 One row per file the path or glob matches (the same glob syntax as
-`sharepoint://`): `path`, `name`, `size`, `created`, `modified`, `created_by`,
+`sharepoint://`; a folder means the files directly in it, and a path that
+names nothing is an error): `path`, `name`, `size`, `created`, `modified`, `created_by`,
 `modified_by` (and their `_email`), `content_type`, `id`, `web_url` and `checked_out_by` (and its `_email`; NULL unless checked out), then
 the library's own metadata columns, typed as `read_sharepoint_list` types a
 list's.

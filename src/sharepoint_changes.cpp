@@ -7,6 +7,8 @@
 #include "sharepoint_banner.hpp"
 #include "sharepoint_client.hpp"
 #include "sharepoint_delta.hpp"
+
+#include <functional>
 #include "sharepoint_list.hpp"
 #include "sharepoint_uri.hpp"
 
@@ -72,6 +74,18 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context, TableFunctionBindIn
 		GraphClient client(auth);
 		const string what = "the changes under '" + path + "'";
 
+		// outside := true also reports what is no longer under the folder (moved
+		// out, with its subtree) as path-less deletes. Graph's delta is per
+		// drive: a move out is an upsert elsewhere, which the path filter below
+		// dropped -- a mirror then kept the file forever (found in duckdb-gdrive,
+		// 2026-11-07, verified here). Opt-in, because it also reports every
+		// change made anywhere else in the drive.
+		bool outside = false;
+		if (auto o = duckdb_compat::FindNamedParameter(input.named_parameters, "outside")) {
+			if (!o->IsNull()) {
+				outside = BooleanValue::Get(*o);
+			}
+		}
 		string next = "/v1.0/drives/" + auth.drive_id +
 		              "/root/delta?$select=id,name,size,file,folder,deleted,root,parentReference,lastModifiedDateTime,"
 		              "lastModifiedBy" +
@@ -79,6 +93,99 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context, TableFunctionBindIn
 		string next_token;
 		auto data = make_uniq<ChangesBindData>();
 		std::unordered_map<string, idx_t> row_of; // an item seen twice: its last state wins
+		auto put = [&](const string &id, vector<Value> row) {
+			auto seen = row_of.find(id);
+			if (seen != row_of.end()) {
+				data->rows[seen->second] = std::move(row);
+			} else {
+				row_of[id] = data->rows.size();
+				data->rows.push_back(std::move(row));
+			}
+		};
+		// One output row from a driveItem: an upsert at `rel`, or a delete
+		// (path NULL when `rel` is empty).
+		auto make_row = [&](const picojson::object &item, const string &rel, bool deleted) {
+			int64_t micros;
+			auto size = item.find("size");
+			// Who (#99): the user -- or, for an app's write, the application.
+			Value by(LogicalType::VARCHAR), by_email(LogicalType::VARCHAR);
+			auto modified_by = item.find("lastModifiedBy");
+			if (!deleted && modified_by != item.end() && modified_by->second.is<picojson::object>()) {
+				const auto &who_of = modified_by->second.get<picojson::object>();
+				const picojson::object *who = nullptr;
+				for (const char *kind : {"user", "application"}) {
+					auto it = who_of.find(kind);
+					if (!who && it != who_of.end() && it->second.is<picojson::object>()) {
+						who = &it->second.get<picojson::object>();
+					}
+				}
+				if (who && !Str(*who, "displayName").empty()) {
+					by = Value(Str(*who, "displayName"));
+				}
+				if (who && !Str(*who, "email").empty()) {
+					by_email = Value(Str(*who, "email"));
+				}
+			}
+			const auto name = Str(item, "name");
+			return vector<Value> {
+			    Value(deleted ? "delete" : "upsert"),
+			    rel.empty() ? Value(LogicalType::VARCHAR) : Value(string(SHAREPOINT_SCHEME) + rel),
+			    Value(Str(item, "id")),
+			    name.empty() ? Value(LogicalType::VARCHAR) : Value(name),
+			    Value::BOOLEAN(item.find("folder") != item.end()),
+			    !deleted && size != item.end() && size->second.is<int64_t>() ? Value::BIGINT(size->second.get<int64_t>())
+			                                                                  : Value(LogicalType::BIGINT),
+			    ParseIsoTimestamp(Str(item, "lastModifiedDateTime"), micros)
+			        ? Value::TIMESTAMP(timestamp_t(micros))
+			        : Value(LogicalType::TIMESTAMP),
+			    by,
+			    by_email,
+			    Value(LogicalType::VARCHAR)};
+		};
+		// Graph's delta reports a FOLDER that was renamed or moved, not its
+		// children (verified live, 2026-11-07), so their paths go stale in a
+		// mirror. Everything under folder `rel` (now), as upserts with their
+		// new paths -- or, for a folder moved out, as deletes.
+		// By the folder's ID, not its path: the delta can describe a folder at a
+		// path it has since left (a later move in the same window), and the
+		// path then 404s (seen live). A folder gone since has nothing to report.
+		std::function<void(const string &, const string &, bool)> walk;
+		walk = [&](const string &folder_id, const string &rel, bool as_delete) {
+			string page_path = "/v1.0/drives/" + auth.drive_id + "/items/" + folder_id +
+			                   "/children?$select=id,name,size,file,folder,lastModifiedDateTime,lastModifiedBy&$top=200";
+			for (int pages = 0; !page_path.empty(); pages++) {
+				if (pages >= kMaxDeltaPages) {
+					throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxDeltaPages);
+				}
+				picojson::value listing;
+				int status = 0;
+				const auto body = client.GraphGet(page_path, what, &status);
+				if (status == 404) {
+					return;
+				}
+				if (!picojson::parse(listing, body).empty() || !listing.is<picojson::object>()) {
+					throw IOException("sharepoint: unexpected response reading %s", what);
+				}
+				const auto &page = listing.get<picojson::object>();
+				auto children = page.find("value");
+				if (children != page.end() && children->second.is<picojson::array>()) {
+					for (auto &c : children->second.get<picojson::array>()) {
+						if (!c.is<picojson::object>()) {
+							continue;
+						}
+						const auto &child = c.get<picojson::object>();
+						const auto child_rel = rel + "/" + Str(child, "name");
+						put(Str(child, "id"), make_row(child, as_delete ? string() : child_rel, as_delete));
+						if (child.find("folder") != child.end()) {
+							walk(Str(child, "id"), child_rel, as_delete);
+						}
+					}
+				}
+				auto link = page.find("@odata.nextLink");
+				page_path = (link != page.end() && link->second.is<string>()) ? GraphPathOfLink(link->second.get<string>())
+				                                                               : string();
+			}
+		};
 		for (int pages = 0; !next.empty(); pages++) {
 			if (pages >= kMaxDeltaPages) {
 				throw IOException("sharepoint: reading %s exceeded %d pages", what, kMaxDeltaPages);
@@ -116,55 +223,34 @@ unique_ptr<FunctionData> ChangesBind(ClientContext &context, TableFunctionBindIn
 					}
 					const auto name = Str(item, "name");
 					const auto rel = DeltaItemPath(parent_path, name);
+					const auto id = Str(item, "id");
+					const bool is_folder = item.find("folder") != item.end();
 					// A delete often comes without a path: reported wherever it was.
 					if (!rel.empty() && !PathUnder(rel, folder)) {
+						// An ANCESTOR of the watched folder (its children changed) never
+						// left it -- and walking it would delete the folder's own files.
+						if (PathUnder(folder, rel)) {
+							continue;
+						}
+						if (outside && !deleted) {
+							// No longer under the folder: possibly moved out.
+							put(id, make_row(item, string(), true));
+							if (is_folder) {
+								walk(id, rel, /*as_delete=*/true); // its subtree left with it
+							}
+						}
 						continue;
 					}
 					if (rel.empty() && !deleted) {
 						continue;
 					}
-					int64_t micros;
-					auto size = item.find("size");
-					// Who (#99): the user -- or, for an app's write, the application.
-					Value by(LogicalType::VARCHAR), by_email(LogicalType::VARCHAR);
-					auto modified_by = item.find("lastModifiedBy");
-					if (!deleted && modified_by != item.end() && modified_by->second.is<picojson::object>()) {
-						const auto &who_of = modified_by->second.get<picojson::object>();
-						const picojson::object *who = nullptr;
-						for (const char *kind : {"user", "application"}) {
-							auto it = who_of.find(kind);
-							if (!who && it != who_of.end() && it->second.is<picojson::object>()) {
-								who = &it->second.get<picojson::object>();
-							}
-						}
-						if (who && !Str(*who, "displayName").empty()) {
-							by = Value(Str(*who, "displayName"));
-						}
-						if (who && !Str(*who, "email").empty()) {
-							by_email = Value(Str(*who, "email"));
-						}
-					}
-					vector<Value> row = {
-					    Value(deleted ? "delete" : "upsert"),
-					    rel.empty() ? Value(LogicalType::VARCHAR) : Value(string(SHAREPOINT_SCHEME) + rel),
-					    Value(Str(item, "id")),
-					    name.empty() ? Value(LogicalType::VARCHAR) : Value(name),
-					    Value::BOOLEAN(item.find("folder") != item.end()),
-					    !deleted && size != item.end() && size->second.is<int64_t>()
-					        ? Value::BIGINT(size->second.get<int64_t>())
-					        : Value(LogicalType::BIGINT),
-					    ParseIsoTimestamp(Str(item, "lastModifiedDateTime"), micros) ? Value::TIMESTAMP(timestamp_t(micros))
-					                                                                 : Value(LogicalType::TIMESTAMP),
-					    by,
-					    by_email,
-					    Value(LogicalType::VARCHAR)};
-					const auto id = Str(item, "id");
-					auto seen = row_of.find(id);
-					if (seen != row_of.end()) {
-						data->rows[seen->second] = std::move(row);
-					} else {
-						row_of[id] = data->rows.size();
-						data->rows.push_back(std::move(row));
+					put(id, make_row(item, rel, deleted));
+					// A folder renamed or moved in: its subtree's paths changed, and
+					// the delta reports only the folder. Not for a full listing (the
+					// delta from no token lists everything anyway), and not for the
+					// watched folder itself (its subtree is the whole answer).
+					if (is_folder && !deleted && !token.empty() && rel != folder) {
+						walk(id, rel, /*as_delete=*/false);
 					}
 				}
 			}
@@ -225,13 +311,15 @@ void RegisterChangeFunctions(ExtensionLoader &loader) {
 	TableFunction fn("sharepoint_changes", {LogicalType::VARCHAR}, ChangesScan, ChangesBind, CursorInit);
 	duckdb_compat::NameParameters(fn, {"path"});
 	duckdb_compat::AddNamedParameter(fn, "token", LogicalType::VARCHAR);
+	duckdb_compat::AddNamedParameter(fn, "outside", LogicalType::BOOLEAN);
 	CreateTableFunctionInfo info(fn);
 	FunctionDescription desc;
 	desc.description =
 	    "What changed under a sharepoint:// folder since a token (Graph's delta query): one row per file or folder "
 	    "added or changed (_change 'upsert') or deleted ('delete'), then one 'checkpoint' row whose token column is "
 	    "the token for next time. Without a token: everything (a full listing); token := 'latest': nothing, just a "
-	    "token from now on.";
+	    "token from now on. A folder renamed or moved in brings its subtree. outside := true also reports what left "
+	    "the folder (moved out, with its subtree) as path-less deletes -- what a mirror needs.";
 	desc.examples = {"SELECT * FROM sharepoint_changes('sharepoint://Finance/')",
 	                 "SELECT * FROM sharepoint_changes('sharepoint://Finance/', token := 'aTE09...')"};
 	desc.categories = {"sharepoint"};

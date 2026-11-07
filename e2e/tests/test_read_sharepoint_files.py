@@ -74,3 +74,33 @@ def test_checked_out_by(graph, scratch, sql, secret_sql):
         assert out[-1] == "free.csv=false,locked.csv=true", out
     finally:
         graph._req("POST", f"{GRAPH}/drives/{graph.drive_id}/items/{item}/discardCheckout")
+
+
+def test_a_missing_path_is_an_error_not_zero_rows(scratch, sql, secret_sql):
+    """A literal path that names nothing: an error, as in sharepoint_permissions
+    -- zero rows read as "no such files exist" (found in duckdb-gdrive)."""
+    out = sql(f"""{secret_sql}
+        SELECT * FROM read_sharepoint_files('sharepoint://{scratch}/missing.csv');""", expect_error=True)
+    assert "no such file or folder" in out, out
+    # A glob that matches nothing stays zero rows.
+    out = sql(f"""{secret_sql}
+        SELECT count(*) FROM read_sharepoint_files('sharepoint://{scratch}/*.nothing');""")
+    assert out.splitlines()[-1] == "0", out
+
+
+def test_a_version_path_is_refused(graph, scratch, sql, secret_sql):
+    """read_sharepoint_files under a ?version= path reported the CURRENT
+    file's metadata (found in duckdb-gdrive, same code shape here)."""
+    graph.upload(f"{scratch}/v.csv", b"n\n1\n")
+    graph.upload(f"{scratch}/v.csv", b"n\n2\n")
+    out = sql(f"""{secret_sql}
+        SELECT * FROM read_sharepoint_files('sharepoint://{scratch}/v.csv?version=1.0');""", expect_error=True)
+    assert "not one of its versions" in out, out
+
+
+def test_a_user_mistake_carries_no_report_it_hint(sql, secret_sql):
+    """datazoo-banner adds 'Unexpected? Please report it' only to unexpected
+    errors since DataZooDE/duckdb-extension-banner#7."""
+    out = sql(f"""{secret_sql}
+        SELECT * FROM read_sharepoint_files(NULL);""", expect_error=True)
+    assert "must not be NULL" in out and "Unexpected?" not in out, out

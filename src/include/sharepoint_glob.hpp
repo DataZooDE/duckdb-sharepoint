@@ -70,5 +70,11 @@ using GlobLister = std::function<std::vector<GlobEntry>(const std::string &folde
 //! no leading slash); the caller prepends the scheme.
 std::vector<std::string> GlobFiles(const std::vector<std::string> &segments, const GlobLister &list);
 
+//! GlobFiles plus the FOLDERS the pattern matches (a last segment matching a
+//! folder's name; under a trailing `**`, every folder beneath). For
+//! sharepoint_permissions: a folder shared with everyone exposes its tree, so
+//! an audit must see it, not only its files.
+std::vector<std::string> GlobItems(const std::vector<std::string> &segments, const GlobLister &list);
+
 } // namespace sharepoint
 } // namespace duckdb

@@ -5,17 +5,30 @@
 
 require sharepoint
 
-# A user-facing filesystem error carries a link to where it can be reported...
-statement error
-SELECT * FROM read_csv('sharepoint://nonexistent/file.csv');
-----
-https://github.com/DataZooDE/duckdb-sharepoint/issues
-
-# ...and keeps its actual message.
+# The user's own mistake says what to fix -- and, since datazoo-banner
+# 57efeb5, carries no "Unexpected? Please report it" (it read as "a bug").
 statement error
 SELECT * FROM read_csv('sharepoint://nonexistent/file.csv');
 ----
 no `sharepoint` secret configured for
+
+# An unexpected failure carries the link to where it can be reported, after
+# its actual message. Graph rejecting a token is one, and needs no tenant.
+statement ok
+CREATE SECRET bad_token (TYPE sharepoint, PROVIDER config, ACCESS_TOKEN 'not-a-token', DRIVE_ID 'b!notadrive');
+
+statement error
+SELECT * FROM read_csv('sharepoint://x/file.csv');
+----
+https://github.com/DataZooDE/duckdb-sharepoint/issues
+
+statement error
+SELECT * FROM read_csv('sharepoint://x/file.csv');
+----
+HTTP 401
+
+statement ok
+DROP SECRET bad_token;
 
 statement ok
 SET datazoo_banner = false;
