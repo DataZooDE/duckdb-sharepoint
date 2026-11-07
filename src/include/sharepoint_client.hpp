@@ -52,6 +52,10 @@ void SleepBeforeRetry(int failed_attempt, int retry_after_seconds);
 //! (bound to one host; Graph keeps the host across pages).
 string GraphPathOfLink(const string &link);
 
+//! Percent-encode a root-relative path for Graph's `root:/{path}` form ('/'
+//! stays the separator).
+string EncodeGraphPath(const string &path);
+
 //! Percent-encode one path segment of a workbook resource (a table or
 //! worksheet name, a range address): everything but unreserved characters,
 //! '/' included.
