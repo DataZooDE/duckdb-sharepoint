@@ -1,0 +1,22 @@
+# name: test/sql/mail_offline.test
+# description: read_outlook_messages (#126) without a tenant: registered, its
+#              parameters typed, and it needs a secret like everything else.
+# group: [sharepoint]
+
+require sharepoint
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'read_outlook_messages';
+----
+1
+
+statement error
+SELECT * FROM read_outlook_messages(folder := 'inbox', since := 'not a time');
+----
+invalid timestamp
+
+statement error
+SELECT * FROM read_outlook_messages(user := 'invoices@contoso.com', folder := 'inbox',
+                                    since := TIMESTAMP '2026-11-01', body := true);
+----
+no `sharepoint` secret configured

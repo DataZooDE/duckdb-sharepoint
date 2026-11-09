@@ -548,6 +548,37 @@ SELECT * FROM read_todo_tasks(user := 'anna@contoso.com', list := 'Tasks');     
 These need Graph's `Tasks.Read.All` (application) or `Tasks.Read`
 (delegated: add it to `GRAPH_SCOPE`), with admin consent.
 
+## Outlook mail
+
+```sql
+SELECT received, from_email, subject, body_preview
+FROM read_outlook_messages(folder := 'inbox', since := TIMESTAMP '2026-11-01');     -- as yourself
+SELECT received, subject, to_emails, has_attachments
+FROM read_outlook_messages(user := 'invoices@contoso.com', folder := 'Invoices')    -- app-only
+ORDER BY received DESC LIMIT 100;
+SELECT subject, body FROM read_outlook_messages(folder := 'sentitems', body := true) LIMIT 10;
+```
+
+The messages of a mailbox come newest first, with these columns: `id`,
+`received`, `sent`, `subject`, `from_name`, `from_email`, `to_emails`,
+`cc_emails`, `is_read`, `is_draft`, `has_attachments`, `importance`,
+`categories`, `conversation_id`, `internet_message_id`, `body_preview` and
+`web_url`. `body := true` adds the body as plain text.
+
+- **Folders.** `folder :=` takes a well-known name (`inbox`, `sentitems`,
+  `drafts`, `archive`, `deleteditems`, `junkemail`, ...) or the display name
+  of a top-level folder. Without it, every message of the mailbox is read.
+- **Paging.** `since :=` is sent to Graph as a filter. Pages are fetched
+  while the scan runs, so a `LIMIT` stops the reading.
+- **Permissions.** Reading mail needs `Mail.Read`.
+  - Signed-in user: add `Mail.Read` to `GRAPH_SCOPE` and the user's own
+    mailbox is read.
+  - App: grant `Mail.Read` as an application permission with admin consent,
+    and pass `user :=`, because an app has no mailbox of its own.
+  - An application permission lets the app read **every** mailbox in the
+    tenant. An Exchange admin should limit it to the mailboxes it needs, with
+    an application access policy or RBAC for Applications.
+
 ## A site as a database: `ATTACH`
 
 ```sql

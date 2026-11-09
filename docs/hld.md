@@ -1097,3 +1097,27 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
 - **What the API does not offer.** Graph v1.0 cannot delete a notebook or a
   section, only a page. So the e2e test writes into one fixed section,
   `duckdb-e2e`, and creates one page per run.
+
+## 21. Outlook mail: `read_outlook_messages` (#126)
+
+- **Request.** `GET {/me | /users/{upn}}[/mailFolders/{f}]/messages`, with
+  the columns read in `$select`, `$orderby=receivedDateTime desc` and
+  `$top=100` (`MailMessagesPath`, pure). `since :=` is sent as
+  `$filter=receivedDateTime ge <UTC>`, which Graph accepts together with an
+  `$orderby` on the same property. `body := true` adds `body` and sends
+  `Prefer: outlook.body-content-type="text"`, so the body comes as text.
+- **Folders.** A well-known name (`inbox`, `sentitems`, ...) is used as it
+  is. Any other name is looked up among the top-level `mailFolders` by
+  display name (or id); child folders are not searched.
+- **Streaming.** Unlike the list, task and OneNote readers, this one does
+  not read everything at bind. The scan fetches one page at a time and
+  follows `@odata.nextLink`, because a mailbox can be large and a `LIMIT`
+  should stop the requests.
+- **Refusals.**
+  - `/me` with an app-only token ("only valid with delegated") becomes "name
+    one with user :=".
+  - `MailboxNotEnabledForRESTAPI` becomes "the user has no Exchange Online
+    mailbox".
+  - A 401 or 403 names `Mail.Read`, and the application access policy that
+    may leave this mailbox out.
+- **Not yet.** `messages/delta`, attachments and sending mail.

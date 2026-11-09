@@ -10,7 +10,8 @@ description: >
   COPY ... TO '<list>' (FORMAT sharepoint_list): create, update by id, or upsert
   by KEY '<column>' (sync from another system). Use
   when reading a SharePoint list into SQL, filtering a large list, joining
-  lists, or creating and updating list items.
+  lists, or creating and updating list items. Also other Microsoft 365 data:
+  Outlook mail (read_outlook_messages), OneNote pages, Planner / To Do tasks.
 version: 2026.11.03
 user-invocable: false
 ---
@@ -97,6 +98,19 @@ SELECT list, title, status, due FROM read_todo_tasks() WHERE status <> 'complete
 SELECT * FROM read_todo_tasks(user := 'anna@contoso.com', list := 'Tasks');             -- app-only
 ```
 Needs `Tasks.Read.All` (application) or `Tasks.Read` (delegated: add it to `GRAPH_SCOPE`).
+
+## Outlook mail
+```sql
+SELECT received, from_email, subject FROM read_outlook_messages(folder := 'inbox', since := TIMESTAMP '2026-11-01');
+SELECT * FROM read_outlook_messages(user := 'invoices@contoso.com', folder := 'Invoices') LIMIT 100;   -- app-only
+SELECT subject, body FROM read_outlook_messages(folder := 'sentitems', body := true) LIMIT 10;        -- body as text
+```
+Newest first; columns id, received, sent, subject, from_name, from_email, to_emails, cc_emails (VARCHAR[]),
+is_read, is_draft, has_attachments, importance, categories, conversation_id, internet_message_id,
+body_preview, web_url. `folder :=` well-known (inbox, sentitems, drafts, archive, ...) or a top-level
+folder's name; `since :=` is pushed to Graph; pages stream, so LIMIT stops reading. Read-only.
+Needs `Mail.Read`: delegated (in GRAPH_SCOPE) or application (then `user :=` is required; an Exchange
+application access policy should limit the app's mailboxes).
 
 ## A site as a database: ATTACH
 ```sql

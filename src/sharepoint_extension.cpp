@@ -9,6 +9,7 @@
 #include "sharepoint_permissions_functions.hpp"
 #include "sharepoint_discovery.hpp"
 #include "sharepoint_onenote.hpp"
+#include "sharepoint_mail_functions.hpp"
 #include "sharepoint_attachments_functions.hpp"
 #include "sharepoint_docx_functions.hpp"
 #include "sharepoint_catalog.hpp"
@@ -195,6 +196,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	sharepoint::RegisterDiscoveryFunctions(loader);
 	// read_onenote_pages(): OneNote pages with change times (#102).
 	sharepoint::RegisterOneNoteFunctions(loader);
+	// read_outlook_messages(): a mailbox's Outlook messages (#126).
+	sharepoint::RegisterMailFunctions(loader);
 	// read_docx() / read_docx_table(): Word documents as rows (#103).
 	sharepoint::RegisterDocxFunctions(loader);
 	sharepoint::RegisterAttachmentFunctions(loader);
