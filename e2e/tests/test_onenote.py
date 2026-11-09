@@ -45,8 +45,12 @@ def _user_secret(notes_scope: str) -> str:
 
 
 def _skip_without_consent(ok: bool, out: str, scope: str) -> None:
-    if not ok and ("AADSTS65001" in out or "consent" in out.lower() or "invalid_scope" in out):
-        pytest.skip(f"the delegated app may not ask for {scope} (no consent)")
+    # Only Entra's own "not consented" replies: "consent" alone also matches
+    # other hints (a Graph 403's "with admin consent"), which then hid the real
+    # error behind this skip (2026-11-09).
+    if not ok and ("AADSTS65001" in out or "have not been consented" in out or "invalid_scope" in out):
+        # The reply (scrubbed by the sql fixture) says which app and scope.
+        pytest.skip(f"the delegated app may not ask for {scope} (no consent): {out[-400:]}")
 
 
 def test_signed_in_user(sql):

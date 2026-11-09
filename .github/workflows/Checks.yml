@@ -352,7 +352,7 @@ jobs:
           SHAREPOINT_UNGRANTED_SITE: ${{ secrets.SHAREPOINT_UNGRANTED_SITE }}
           SHAREPOINT_REQUIRE_SELECTED: '1'
           DATAZOO_DISABLE_TELEMETRY: '1'
-        run: cd e2e && uv run --locked pytest -v
+        run: cd e2e && uv run --locked pytest -v -rs
 
   # Crashed runs leak /_duckdb_sharepoint_e2e/run-* folders into a REAL
   # document library. Not `make sweep_orphans`: the Makefile includes the
