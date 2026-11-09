@@ -64,7 +64,7 @@ def test_signed_in_user_reads_their_inbox(sql):
     ok, out = _run(sql, f"{secret} SELECT 'inbox', count(*) >= 0, count(*) FILTER (WHERE id IS NULL) "
                         "FROM (SELECT * FROM read_outlook_messages(folder := 'inbox') LIMIT 20);")
     if not ok and ("AADSTS65001" in out or "have not been consented" in out or "invalid_scope" in out):
-        pytest.skip("the delegated app may not ask for Mail.Read (no consent)")
+        pytest.skip(f"the delegated app may not ask for Mail.Read (no consent): {out[-400:]}")
     if not ok and "no Exchange Online mailbox" in out:
         pytest.skip("the test user has no mailbox")
     assert ok, out
