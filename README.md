@@ -513,9 +513,28 @@ SELECT title FROM read_onenote_pages(notebook := 'Projects', section := 'Q4') WH
 The filesystem sees a notebook as a folder and each section as one `.one`
 file, so it can tell which section changed but not which page; this lists
 pages. OneNote has no delta: track with `WHERE modified > <last run>`.
+`content := true` adds each page's HTML, which takes one request per page.
+
+Write pages with `COPY`. A row creates a page from its `title` and `content`
+(the page body as HTML). A row that has a page `id` appends its `content` to
+the end of that page instead:
+
+```sql
+COPY (SELECT 'Status ' || today() AS title, '<p>All green</p>' AS content)
+  TO 'Projects/Q4' (FORMAT onenote);                     -- '<notebook>/<section>'
+COPY (SELECT id, '<p>' || note || '</p>' AS content
+      FROM read_onenote_pages(notebook := 'Projects', section := 'Q4') WHERE title = 'Log')
+  TO 'Projects/Q4' (FORMAT onenote, SITE 'Sales');
+```
+
+The notebook must exist. A missing section is created. If the content is
+already a whole HTML document (`<!DOCTYPE html>...`), it is sent unchanged
+and carries its own `<title>`. OneNote rewrites the HTML it stores, so the
+content you read back is not byte for byte what you wrote.
+
 Microsoft restricts app-only access to the OneNote API, so sign in as a user
-(`device_code` / `authorization_code`) and add `Notes.Read` to `GRAPH_SCOPE`;
-an app-only refusal says so.
+(`device_code` / `authorization_code`). Add `Notes.Read` to `GRAPH_SCOPE`, or
+`Notes.ReadWrite` to write. An app-only refusal says so.
 
 ## Planner and To Do tasks
 

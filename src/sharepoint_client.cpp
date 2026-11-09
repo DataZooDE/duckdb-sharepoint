@@ -1031,15 +1031,15 @@ string GraphClient::GraphGet(const string &path, const string &what, int *status
 }
 
 string GraphClient::GraphSend(const string &method, const string &path, const string &json_body, const string &what,
-                              bool idempotent) {
+                              bool idempotent, const string &content_type) {
 	IncrementCounter(Counter::SHAREPOINT_LIST);
 	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.tokens->Token()}};
 	auto res = SendWithRetry(
 	    *auth.tokens, h,
 	    [&] {
-		    return method == "PATCH" ? cli.Patch(path.c_str(), h, json_body, "application/json")
-		                             : cli.Post(path.c_str(), h, json_body, "application/json");
+		    return method == "PATCH" ? cli.Patch(path.c_str(), h, json_body, content_type.c_str())
+		                             : cli.Post(path.c_str(), h, json_body, content_type.c_str());
 	    },
 	    idempotent);
 	if (!res) {
