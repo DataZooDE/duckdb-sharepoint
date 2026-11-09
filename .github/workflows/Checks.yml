@@ -333,6 +333,9 @@ jobs:
           # OneNote writes (#105): an existing notebook on the test site; the
           # delegated app needs Notes.ReadWrite. Unset or no consent: skipped.
           SHAREPOINT_ONENOTE_NOTEBOOK: ${{ secrets.SHAREPOINT_ONENOTE_NOTEBOOK }}
+          # Outlook mail (#126): a mailbox the CI app may read (Mail.Read,
+          # application). Unset: the reading test is skipped.
+          SHAREPOINT_MAIL_USER: ${{ secrets.SHAREPOINT_MAIL_USER }}
           # Certificate auth (#71): the CI app ("duckdb-sharepoint ci") also
           # has a certificate (CN=duckdb-sharepoint-ci, until 2027-11-03);
           # its PEM (cert + key) is the secret. REQUIRE: missing fails the job.

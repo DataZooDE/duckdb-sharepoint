@@ -150,7 +150,9 @@ public:
 	//! GET any Graph path ("/v1.0/sites/..."; a nextLink via GraphPathOfLink)
 	//! and return its JSON body. With `status` given, a 404 is returned
 	//! in-band (empty body); every other non-2xx throws, naming `what`.
-	string GraphGet(const string &path, const string &what, int *status = nullptr);
+	//! `prefer`, when not empty, is sent as the Prefer header (e.g. Outlook's
+	//! outlook.body-content-type="text").
+	string GraphGet(const string &path, const string &what, int *status = nullptr, const string &prefer = string());
 
 	//! POST or PATCH a body (JSON unless `content_type` says otherwise, e.g.
 	//! a OneNote page's text/html) to any Graph path and return the reply's

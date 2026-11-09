@@ -1003,10 +1003,13 @@ string GraphPathOfLink(const string &link) {
 	return slash == string::npos ? string() : link.substr(slash);
 }
 
-string GraphClient::GraphGet(const string &path, const string &what, int *status) {
+string GraphClient::GraphGet(const string &path, const string &what, int *status, const string &prefer) {
 	IncrementCounter(Counter::SHAREPOINT_LIST);
 	auto &cli = GraphConnection(auth.graph_endpoint);
 	duckdb_httplib_openssl::Headers h = {{"Authorization", "Bearer " + auth.tokens->Token()}};
+	if (!prefer.empty()) {
+		h.emplace("Prefer", prefer);
+	}
 	auto res = SendWithRetry(*auth.tokens, h, [&] { return cli.Get(path.c_str(), h); });
 	if (!res) {
 		throw IOException("sharepoint: reading %s failed at the transport layer", what.c_str());
