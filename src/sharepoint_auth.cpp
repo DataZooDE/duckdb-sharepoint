@@ -258,9 +258,9 @@ string MintToken(const MintRequest &req) {
 		if (IsDelegatedCredential(req.provider, !req.client_secret.empty())) {
 			// A delegated token: say what fixes a delegated failure (consent,
 			// public client flows, sign in again), not the app-only checklist.
-			const string name = req.secret_name, provider = req.provider;
-			on_error = [name, provider](int status, const string &body) {
-				return DelegatedErrorMessage(ParseTokenReply(status, body), name, provider);
+			const string name = req.secret_name, provider = req.provider, scope = req.scope;
+			on_error = [name, provider, scope](int status, const string &body) {
+				return DelegatedErrorMessage(ParseTokenReply(status, body), name, provider, scope);
 			};
 		}
 	} else if (!req.certificate_pem.empty()) {
