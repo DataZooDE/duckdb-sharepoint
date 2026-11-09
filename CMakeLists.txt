@@ -100,6 +100,7 @@ file(GLOB PURE_SOURCES CONFIGURE_DEPENDS
     src/sharepoint_search.cpp
     src/sharepoint_permissions.cpp
     src/sharepoint_weburl.cpp
+    src/sharepoint_onenote_page.cpp
     src/sharepoint_docx.cpp
     src/sharepoint_attachments.cpp
 )

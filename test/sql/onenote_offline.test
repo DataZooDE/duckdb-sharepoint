@@ -1,0 +1,49 @@
+# name: test/sql/onenote_offline.test
+# description: OneNote (#102, #105) without a tenant: read_onenote_pages'
+#              content := is accepted, and COPY ... (FORMAT onenote) checks
+#              its target and columns before any Graph call.
+# group: [sharepoint]
+
+require sharepoint
+
+statement error
+SELECT * FROM read_onenote_pages(notebook := 'Projects', content := true);
+----
+no `sharepoint` secret configured
+
+# Rewritten in place like the list and workbook writers; the internal writer
+# is reachable only through it.
+statement error
+COPY (SELECT 'x' AS content) TO 'Projects/Q4' (FORMAT onenote, USE_TMP_FILE true);
+----
+USE_TMP_FILE is not supported for OneNote section writes
+
+statement error
+COPY (SELECT 'x' AS content) TO 'Projects/Q4' (FORMAT __sharepoint_onenote);
+----
+write OneNote pages with FORMAT onenote
+
+statement error
+COPY (SELECT 'x' AS content) TO 'Projects/Q4' (FORMAT onenote, OVERWRITE);
+----
+OVERWRITE is not supported for OneNote section writes
+
+statement error
+COPY (SELECT 'x' AS content) TO 'Projects' (FORMAT onenote);
+----
+a OneNote target is '<notebook>/<section>'
+
+statement error
+COPY (SELECT 'T' AS title) TO 'Projects/Q4' (FORMAT onenote);
+----
+needs a content column
+
+statement error
+COPY (SELECT 'T' AS title, 'x' AS content, 'y' AS body) TO 'Projects/Q4' (FORMAT onenote);
+----
+not "body"
+
+statement error
+COPY (SELECT 'T' AS title, '<p>x</p>' AS content) TO 'Projects/Q4' (FORMAT onenote, SITE 'Sales');
+----
+no `sharepoint` secret configured

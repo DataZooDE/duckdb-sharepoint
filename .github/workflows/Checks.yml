@@ -330,6 +330,9 @@ jobs:
           SHAREPOINT_DELEGATED_CLIENT_ID: ${{ secrets.SHAREPOINT_DELEGATED_CLIENT_ID }}
           SHAREPOINT_USER_REFRESH_TOKEN: ${{ secrets.SHAREPOINT_USER_REFRESH_TOKEN }}
           SHAREPOINT_REQUIRE_DELEGATED: '1'
+          # OneNote writes (#105): an existing notebook on the test site; the
+          # delegated app needs Notes.ReadWrite. Unset or no consent: skipped.
+          SHAREPOINT_ONENOTE_NOTEBOOK: ${{ secrets.SHAREPOINT_ONENOTE_NOTEBOOK }}
           # Certificate auth (#71): the CI app ("duckdb-sharepoint ci") also
           # has a certificate (CN=duckdb-sharepoint-ci, until 2027-11-03);
           # its PEM (cert + key) is the secret. REQUIRE: missing fails the job.

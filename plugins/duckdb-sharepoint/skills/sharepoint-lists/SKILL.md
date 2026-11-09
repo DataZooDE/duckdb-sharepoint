@@ -78,8 +78,16 @@ Sites.Read.All (application) or Sites.Selected with a grant, besides Graph's per
 ```sql
 SELECT notebook, section, title, created, modified, web_url FROM read_onenote_pages(notebook := 'Projects');
 ```
-`site :=` (default the secret's site), `notebook :=`, `section :=`. No delta: `WHERE modified > ts`.
-Delegated sign-in with Notes.Read in GRAPH_SCOPE (app-only OneNote access is restricted).
+`site :=` (default the secret's site), `notebook :=`, `section :=`, `content := true` (page HTML, one
+request per page). No delta: `WHERE modified > ts`.
+```sql
+COPY (SELECT 'Status' AS title, '<p>All green</p>' AS content) TO 'Projects/Q4' (FORMAT onenote);  -- new page
+COPY (SELECT id, '<p>more</p>' AS content FROM read_onenote_pages(notebook := 'Projects') WHERE title = 'Log')
+  TO 'Projects/Q4' (FORMAT onenote);                                                               -- append
+```
+Target '<notebook>/<section>' (notebook must exist, section is created); columns title, content, id; `SITE`.
+Delegated sign-in only (app-only OneNote access is restricted): Notes.Read in GRAPH_SCOPE to read,
+Notes.ReadWrite to write.
 
 ## Planner and To Do tasks
 ```sql

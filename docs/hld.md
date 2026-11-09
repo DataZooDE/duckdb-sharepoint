@@ -1069,3 +1069,31 @@ TO 'Orders' (FORMAT sharepoint_list);                                           
   resolves like `SITE_ID`, once per credentials + site + library.
 - **Scope.** `read_sharepoint_files` and `sharepoint_changes` keep
   `sharepoint://` only: their output paths are relative to the secret's drive.
+
+## 20. OneNote: `read_onenote_pages` (#102), `COPY ... (FORMAT onenote)` (#105)
+
+- **Reading.** `GET /sites/{id}/onenote/notebooks`, then each notebook's
+  sections, then each section's pages (`$top=100`, paged). Pages are fetched
+  at bind, because a notebook is small next to a list. `content := true` adds
+  `GET …/pages/{id}/content` (HTML), one request per page.
+- **Writing.** `COPY ... TO '<notebook>/<section>' (FORMAT onenote)` uses the
+  in-place rewrite of §9.1, and its target is parsed by `ParseOneNoteTarget`
+  (pure). The columns are `title`, `content` and `id` (`PlanOneNoteWrite`,
+  pure); anything else is refused at bind.
+  - **Create.** A row without an id becomes `POST …/sections/{id}/pages` with
+    an HTML document as `text/html` (`OneNotePageDocument`: the body is
+    wrapped and the title escaped; a whole document is sent unchanged).
+  - **Append.** A row with an id becomes `PATCH …/pages/{id}/content` with
+    `[{target: body, action: append, content}]`.
+  - **Not re-sent.** Neither request is sent again after a lost reply,
+    because a second POST makes a duplicate page. Throttled requests are
+    re-sent.
+  - **Sections.** A missing section is created
+    (`POST …/notebooks/{id}/sections`). A missing notebook is an error that
+    lists the notebooks there are.
+- **Signed-in users only.** Microsoft has removed app-only access to the
+  OneNote API. A 401 or 403 is explained with the scope to add (`Notes.Read`
+  to read, `Notes.ReadWrite` to write).
+- **What the API does not offer.** Graph v1.0 cannot delete a notebook or a
+  section, only a page. So the e2e test writes into one fixed section,
+  `duckdb-e2e`, and creates one page per run.
