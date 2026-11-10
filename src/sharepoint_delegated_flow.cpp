@@ -67,7 +67,7 @@ DelegatedTokens RunDeviceCodeFlow(const DelegatedFlowConfig &cfg, const std::fun
 	const auto res =
 	    PostForm(EntraUrl(cfg.login_endpoint, cfg.tenant, "devicecode"), DeviceCodeRequest(cfg.client_id, cfg.scope));
 	if (res.status != 200) {
-		throw IOException(DelegatedErrorMessage(ParseTokenReply(res.status, res.body), cfg.secret_name, cfg.provider));
+		throw IOException(DelegatedErrorMessage(ParseTokenReply(res.status, res.body), cfg.secret_name, cfg.provider, cfg.scope));
 	}
 	DeviceCodeGrant grant;
 	string parse_error;
@@ -112,7 +112,7 @@ DelegatedTokens RunDeviceCodeFlow(const DelegatedFlowConfig &cfg, const std::fun
 			interval = NextPollIntervalSeconds(interval, reply.kind);
 			continue;
 		default:
-			throw IOException(DelegatedErrorMessage(reply, cfg.secret_name, cfg.provider));
+			throw IOException(DelegatedErrorMessage(reply, cfg.secret_name, cfg.provider, cfg.scope));
 		}
 	}
 }
@@ -186,7 +186,7 @@ DelegatedTokens RunAuthorizationCodeFlow(const DelegatedFlowConfig &cfg) {
 	                                                        cfg.scope));
 	const TokenReply reply = ParseTokenReply(res.status, res.body);
 	if (reply.kind != TokenReplyKind::SUCCESS) {
-		throw IOException(DelegatedErrorMessage(reply, cfg.secret_name, cfg.provider));
+		throw IOException(DelegatedErrorMessage(reply, cfg.secret_name, cfg.provider, cfg.scope));
 	}
 	return ToTokens(reply);
 #endif

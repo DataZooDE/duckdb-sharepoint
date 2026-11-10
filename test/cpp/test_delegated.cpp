@@ -231,6 +231,21 @@ TEST_CASE("delegated error messages teach the fix", "[delegated]") {
 	REQUIRE(has(consent, "consent"));
 	REQUIRE(has(consent, "AADSTS65001"));
 
+	REQUIRE(has(consent, "Files.ReadWrite.All")); // the default scope
+
+	// GRAPH_SCOPE asked for more: the message names what was asked for, not
+	// the default list (it sent people to the wrong permissions, 2026-11-10).
+	TokenReply r;
+	r.kind = TokenReplyKind::CONSENT_REQUIRED;
+	r.error = "invalid_grant";
+	r.aadsts = 65001;
+	const auto notes = DelegatedErrorMessage(
+	    r, "me", "device_code",
+	    "https://graph.microsoft.com/Notes.ReadWrite https://graph.microsoft.com/Files.ReadWrite.All offline_access");
+	REQUIRE(has(notes, "Notes.ReadWrite, Files.ReadWrite.All, offline_access"));
+	REQUIRE_FALSE(has(notes, "https://"));
+	REQUIRE_FALSE(has(notes, "Sites.ReadWrite.All"));
+
 	REQUIRE(has(msg(TokenReplyKind::EXPIRED_TOKEN, "expired_token", 0), "expired"));
 	REQUIRE(has(msg(TokenReplyKind::DECLINED, "authorization_declined", 0), "declined"));
 	REQUIRE(has(msg(TokenReplyKind::PUBLIC_CLIENT_DISABLED, "invalid_client", 7000218), "public client flows"));

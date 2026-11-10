@@ -136,9 +136,11 @@ int64_t NextPollIntervalSeconds(int64_t current, TokenReplyKind kind);
 std::string DeviceCodePrompt(const DeviceCodeGrant &grant);
 
 //! A teaching, credential-free message for a failed delegated sign-in or
-//! refresh: "sharepoint secret '<name>' (PROVIDER <provider>): ...".
+//! refresh: "sharepoint secret '<name>' (PROVIDER <provider>): ...". `scope`
+//! is what was asked for (GRAPH_SCOPE); a consent failure names its
+//! permissions (empty: the default Files/Sites scope).
 std::string DelegatedErrorMessage(const TokenReply &reply, const std::string &secret_name,
-                                  const std::string &provider);
+                                  const std::string &provider, const std::string &scope = std::string());
 
 //! REDIRECT_PORT: empty means 8020 (as gdrive); otherwise 1024..65535.
 bool ParseRedirectPort(const std::string &text, int &port);

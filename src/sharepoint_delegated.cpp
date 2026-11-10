@@ -286,13 +286,42 @@ std::string DeviceCodePrompt(const DeviceCodeGrant &grant) {
 	       " (valid for " + std::to_string(std::max<int64_t>(1, (grant.expires_in + 59) / 60)) + " minutes)";
 }
 
+namespace {
+
+//! "https://graph.microsoft.com/Notes.Read offline_access" -> "Notes.Read, offline_access".
+std::string ScopePermissions(const std::string &scope) {
+	std::string out, word;
+	auto flush = [&]() {
+		if (word.empty()) {
+			return;
+		}
+		const auto slash = word.rfind('/');
+		out += (out.empty() ? "" : ", ") + (slash == std::string::npos ? word : word.substr(slash + 1));
+		word.clear();
+	};
+	for (char c : scope) {
+		if (c == ' ') {
+			flush();
+		} else {
+			word += c;
+		}
+	}
+	flush();
+	return out;
+}
+
+} // namespace
+
 std::string DelegatedErrorMessage(const TokenReply &reply, const std::string &secret_name,
-                                  const std::string &provider) {
+                                  const std::string &provider, const std::string &scope) {
 	std::string what;
+	const auto permissions = ScopePermissions(scope);
 	switch (reply.kind) {
 	case TokenReplyKind::CONSENT_REQUIRED:
-		what = "the app's delegated permissions have not been consented. An admin must grant consent for "
-		       "Files.ReadWrite.All, Sites.ReadWrite.All and offline_access on the app registration "
+		what = "the app's delegated permissions have not been consented. An admin must grant consent for " +
+		       (permissions.empty() ? std::string("Files.ReadWrite.All, Sites.ReadWrite.All and offline_access")
+		                            : permissions) +
+		       " on the app registration "
 		       "(Entra ID > App registrations > API permissions > Grant admin consent), or the user must accept "
 		       "the consent prompt";
 		break;
