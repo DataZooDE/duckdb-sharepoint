@@ -706,6 +706,16 @@ COPY (SELECT ...) TO 'Finance/plan.xlsx' (FORMAT excel_range, RANGE 'Out!B2');  
   the marker (the binder strips `USE_TMP_FILE` itself before `copy_to_bind`),
   and an explicit `USE_TMP_FILE true` is refused. Same hook and option flow on
   1.5.6 and 2.0 (2.0's options are keyed by Identifier).
+- **A failed COPY keeps the workbook.** On v1.5.6 a failed COPY's cleanup
+  (`CopyToFunctionGlobalState`'s destructor) calls `TryRemoveFile` on the
+  target, which for these writers is the user's workbook. The writer's global
+  state registers its target (`InPlaceCopyTarget`), and
+  `SharepointFileSystem::TryRemoveFile` refuses a registered path. The state
+  is a member of the operator's state, so it is still alive while the
+  destructor body runs. A bare target gets `sharepoint://` in the rewrite, so
+  that cleanup is routed here and not to the local filesystem. 2.0's
+  `copy_output_lifecycle.cpp` already keeps targets that existed before the
+  COPY.
 - **excel_range.** The block starts at RANGE's top-left cell (A1 for a bare
   sheet); a missing sheet is created (`worksheets/add`). `HEADER` (default
   true) writes the column names first. Rows go out as `PATCH .../range(...)`

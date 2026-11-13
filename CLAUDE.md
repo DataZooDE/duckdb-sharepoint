@@ -43,6 +43,32 @@ reserves `SCOPE` for the secret's path-prefix list).
   chunk rules, cTag vs eTag), write it down in `docs/hld.md` or a discovered
   note so it is not rediscovered.
 
+## Pitfall: a failed COPY "cleans up" its target (2026-11-13)
+
+On DuckDB v1.5.6 a COPY that fails after its writer initialised calls
+`TryRemoveFile` on every path in `created_files`. The destructor of
+`CopyToFunctionGlobalState` does this, and the COPY's target is always in
+that list. For the in-place writers (excel_range / excel_table, which are
+`USE_TMP_FILE false`) the target is the user's workbook. Measured before the
+fix, on a sharepoint:// path, a browser URL or a sharing link: the DELETE went
+out (`delete = 1` in `sharepoint_stats()`). Only Graph's `423 resourceLocked`
+stopped it, because the failed COPY left its workbook session open. That held
+even after 420 s of idle, but it is luck and not design. With a BARE target
+('Finance/plan.xlsx') the cleanup went to the LOCAL filesystem. A same-named
+file in the working directory was deleted. Fixed: the writer registers its
+target (`InPlaceCopyTarget`), `SharepointFileSystem::TryRemoveFile` skips a
+registered path, and the Excel rewrite adds `sharepoint://` to a bare target.
+`e2e/tests/test_failed_copy.py` asserts `delete = 0` and not just "the
+workbook survived", because the 423 makes the second check pass without the
+fix. Not covered: `sharepoint_list` and OneNote targets ('Orders',
+'Notebook/Section') are not sharepoint paths, so their cleanup still goes to
+the local filesystem. Found first in duckdb-gdrive (FORMAT sheet_range,
+DataZooDE/duckdb-gdrive#56).
+
+A failed Excel COPY also leaves its workbook session open. The workbook stays
+locked (423 on delete) for minutes, so the e2e `scratch` teardown can warn
+and leave its folder for `make sweep_orphans`.
+
 ## Current status
 
 Verified end to end against a real tenant (2026-10-10): `make test`,

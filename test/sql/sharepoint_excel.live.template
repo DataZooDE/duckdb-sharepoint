@@ -159,15 +159,18 @@ COPY (SELECT * FROM (VALUES
       t(name, n, x, d, ts, tm, flag, raw))
 TO '_duckdb_sharepoint_live/excel/run-@RUN_ID@/fixture.xlsx' (FORMAT excel_range, RANGE 'Out!B2');
 
-# One stat; session, sheet lookup, sheet add, one PATCH, close, and the
-# check that the new sheet is visible outside the session -- once, or up to
-# six times while Graph catches up (kMaxCreatedVisibleAttempts; a 7 was seen
-# live on 2026-11-04).
+# Two stats: the binder's FileExists probe of the target (the rewrite adds
+# sharepoint:// to a bare workbook path, so a failed COPY's cleanup is routed
+# to our filesystem and not the local one -- CLAUDE.md, 2026-11-13) and the
+# workbook's own. Then session, sheet lookup, sheet add, one PATCH, close,
+# and the check that the new sheet is visible outside the session -- once, or
+# up to six times while Graph catches up (kMaxCreatedVisibleAttempts; a 7 was
+# seen live on 2026-11-04).
 query II
 SELECT (SELECT value FROM sharepoint_stats() WHERE metric = 'stat'),
        (SELECT value FROM sharepoint_stats() WHERE metric = 'workbook') BETWEEN 6 AND 11;
 ----
-1	true
+2	true
 
 query II
 SELECT column_name, column_type

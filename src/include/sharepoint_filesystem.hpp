@@ -133,6 +133,9 @@ public:
 	void MoveFile(const string &source, const string &target,
 	              optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
+	//! DuckDB's cleanup primitive. Leaves alone a target an in-place COPY
+	//! writer is changing (InPlaceCopyTarget); otherwise the base behaviour.
+	bool TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	vector<OpenFileInfo> Glob(const string &path, FileOpener *opener = nullptr) override;
 
 	void FileSync(FileHandle &handle) override;
@@ -180,6 +183,35 @@ private:
 	bool MetaCacheGet(const string &key, DriveItemMeta &out);
 	void MetaCachePut(const string &key, const DriveItemMeta &meta);
 };
+
+// ---------------------------------------------------------------------------
+// In-place COPY targets.
+//
+// DuckDB v1.5.6 cleans up after a failed COPY by calling TryRemoveFile on
+// every file the COPY "created" (CopyToFunctionGlobalState's destructor). An
+// in-place writer (FORMAT excel_range / excel_table: USE_TMP_FILE false, see
+// sharepoint_copy_rewrite.hpp) created nothing -- its "file" is the user's
+// workbook. The writer's global state holds one of these for its target, and
+// TryRemoveFile refuses to remove a path that is registered. The registration
+// outlives the cleanup: DuckDB destroys the writer's state (a member) only
+// after the destructor body that calls TryRemoveFile has run. remove_file()
+// and RemoveFile are not affected.
+// ---------------------------------------------------------------------------
+
+class InPlaceCopyTarget {
+public:
+	explicit InPlaceCopyTarget(string path);
+	~InPlaceCopyTarget();
+	InPlaceCopyTarget(const InPlaceCopyTarget &) = delete;
+	InPlaceCopyTarget &operator=(const InPlaceCopyTarget &) = delete;
+
+private:
+	string path;
+};
+
+//! True while some in-place COPY writer holds `path` (exact string, as COPY
+//! was given it).
+bool IsInPlaceCopyTarget(const string &path);
 
 } // namespace sharepoint
 } // namespace duckdb

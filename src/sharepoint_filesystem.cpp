@@ -638,6 +638,49 @@ void SharepointFileSystem::RemoveFile(const string &filename, optional_ptr<FileO
 	});
 }
 
+namespace {
+mutex &InPlaceTargetsLock() {
+	static mutex m;
+	return m;
+}
+//! A multiset: two concurrent COPYs may name the same workbook.
+unordered_map<string, idx_t> &InPlaceTargets() {
+	static unordered_map<string, idx_t> targets;
+	return targets;
+}
+} // namespace
+
+InPlaceCopyTarget::InPlaceCopyTarget(string path_p) : path(std::move(path_p)) {
+	lock_guard<mutex> guard(InPlaceTargetsLock());
+	InPlaceTargets()[path]++;
+}
+
+InPlaceCopyTarget::~InPlaceCopyTarget() {
+	lock_guard<mutex> guard(InPlaceTargetsLock());
+	auto &targets = InPlaceTargets();
+	auto entry = targets.find(path);
+	if (entry != targets.end() && --entry->second == 0) {
+		targets.erase(entry);
+	}
+}
+
+bool IsInPlaceCopyTarget(const string &path) {
+	lock_guard<mutex> guard(InPlaceTargetsLock());
+	return InPlaceTargets().count(path) > 0;
+}
+
+bool SharepointFileSystem::TryRemoveFile(const string &filename, optional_ptr<FileOpener> opener) {
+	// A failed COPY's cleanup (v1.5.6) names an in-place writer's target, the
+	// user's workbook: it was never "created". Without this guard the DELETE
+	// went out and only SharePoint's lock on the still-open workbook session
+	// (423 resourceLocked) kept the workbook -- by accident, and not once that
+	// session has expired. See CLAUDE.md, 2026-11-13.
+	if (IsInPlaceCopyTarget(filename)) {
+		return false;
+	}
+	return FileSystem::TryRemoveFile(filename, opener);
+}
+
 vector<OpenFileInfo> SharepointFileSystem::Glob(const string &path, FileOpener *opener) {
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		vector<OpenFileInfo> result;
