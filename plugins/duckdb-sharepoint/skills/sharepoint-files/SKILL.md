@@ -13,7 +13,7 @@ description: >
   Use when reading or writing files in SharePoint/OneDrive from SQL, syncing a
   folder, listing a library, finding a file, reading an old version, or when
   the user pastes a SharePoint link.
-version: 2026.11.03
+version: 2026.11.13
 user-invocable: false
 ---
 

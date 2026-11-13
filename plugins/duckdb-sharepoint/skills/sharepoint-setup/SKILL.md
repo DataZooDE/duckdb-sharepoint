@@ -14,7 +14,7 @@ description: >
   AADSTS7000218, AADSTS50173, HTTP 403 accessDenied). Use when connecting
   DuckDB to SharePoint/OneDrive, writing a CREATE SECRET, or fixing a sign-in
   or permission error.
-version: 2026.11.03
+version: 2026.11.13
 user-invocable: false
 ---
 

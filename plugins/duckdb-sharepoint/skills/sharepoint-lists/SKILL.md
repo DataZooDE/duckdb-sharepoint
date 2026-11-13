@@ -12,7 +12,7 @@ description: >
   when reading a SharePoint list into SQL, filtering a large list, joining
   lists, or creating and updating list items. Also other Microsoft 365 data:
   Outlook mail (read_outlook_messages), OneNote pages, Planner / To Do tasks.
-version: 2026.11.03
+version: 2026.11.13
 user-invocable: false
 ---
 
