@@ -22,10 +22,12 @@ See CLAUDE.md, 2026-11-13.
 from __future__ import annotations
 
 import subprocess
+import time
 
 import pytest
 
 from conftest import scrub
+from helpers.graph import GRAPH
 
 pytestmark = pytest.mark.live
 
@@ -93,3 +95,43 @@ def test_a_failed_copy_keeps_the_workbook(graph, scratch, sql, secret_sql, duckd
     assert local_twin.exists(), "the failed COPY removed a local file of the same name"
     out = sql(f"{secret_sql} SELECT count(*) FROM read_excel_table('{path}', 'T');")
     assert int(out.splitlines()[-1]) >= 3
+
+
+@pytest.mark.parametrize("fmt", ["excel_range, RANGE 'Data!C1'", "excel_table, TABLE 'T'"])
+def test_a_failed_copy_closes_its_workbook_session(graph, scratch, sql, secret_sql, duckdb_cli, isolated_home,
+                                                   tmp_path, fmt):
+    """A COPY that fails mid-stream closes its workbook session.
+
+    The writer opens one persistent workbook session for the whole COPY, and
+    only finalize used to close it. A failed COPY left it open, and an open
+    session keeps the workbook locked: a delete answers 423 resourceLocked for
+    minutes (more than 420 s measured), so the user cannot replace or remove
+    their own file, and the e2e scratch teardown left folders behind. Without
+    the fix this test sees 423 on every attempt.
+    """
+    path = f"{scratch}/keep.xlsx"
+    _upload_workbook(sql, secret_sql, tmp_path, path)
+    statements = f"""{secret_sql}
+        SET threads = 1;
+        COPY ({FAILING_QUERY}) TO 'sharepoint://{path}' (FORMAT {fmt});
+    """
+    proc = subprocess.run([str(duckdb_cli), "-noheader", "-list"], input=statements, capture_output=True,
+                          text=True, timeout=600, env=isolated_home, cwd=tmp_path)
+    out = scrub(proc.stdout + proc.stderr)
+    assert "boom" in out, out
+
+    item = graph.stat(path)
+    assert item is not None, "the failed COPY removed the workbook"
+    url = f"{GRAPH}/drives/{graph.drive_id}/items/{item['id']}/permanentDelete"
+    # closeSession is answered before the lock is released everywhere, so a
+    # short grace period -- far below the minutes an open session holds it.
+    statuses = []
+    deadline = time.monotonic() + 30
+    while True:
+        r = graph._req("POST", url)
+        statuses.append(r.status_code)
+        if r.status_code != 423 or time.monotonic() > deadline:
+            break
+        time.sleep(3)
+    assert r.status_code in (200, 204), f"the workbook stayed locked after the failed COPY: {statuses}"
+    assert graph.stat(path) is None
