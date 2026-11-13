@@ -52,10 +52,19 @@ inline bool IsRewrittenInPlace(const CopyInfo &info) {
 //! names the target in errors. With `supports_overwrite`, COPY's OVERWRITE is
 //! carried as kOverwriteMarker (it never reaches DuckDB's file handling);
 //! without, it is refused. OVERWRITE_OR_IGNORE and APPEND are always refused.
+//! With `bare_path_scheme`, a target without a scheme gets it -- for writers
+//! whose bare path already MEANS that scheme (a workbook: 'Finance/plan.xlsx'
+//! is sharepoint://Finance/plan.xlsx). DuckDB routes a failed COPY's cleanup
+//! (TryRemoveFile on the target, v1.5.6) by the path as written, so a bare
+//! path would reach the LOCAL filesystem and delete a same-named local file.
 inline BoundStatement RewriteCopyInPlace(Binder &binder, CopyStatement &stmt, const char *internal_format,
-                                         const char *what, bool supports_overwrite = false) {
+                                         const char *what, bool supports_overwrite = false,
+                                         const char *bare_path_scheme = nullptr) {
 	auto copy = stmt.Copy();
 	auto &info = *copy->Cast<CopyStatement>().info;
+	if (bare_path_scheme && info.file_path.find("://") == string::npos) {
+		info.file_path = string(bare_path_scheme) + info.file_path;
+	}
 	auto tmp = FindCopyOption(info.options, "use_tmp_file");
 	if (tmp && (tmp->empty() || (*tmp)[0].DefaultCastAs(LogicalType::BOOLEAN).GetValue<bool>())) {
 		throw InvalidInputException("sharepoint: USE_TMP_FILE is not supported for %s writes: they change the %s "

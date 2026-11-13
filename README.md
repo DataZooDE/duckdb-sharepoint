@@ -350,6 +350,9 @@ way a re-run gives the same workbook:
 COPY forecast TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERWRITE);
 ```
 
+A `COPY` that fails part-way leaves the workbook in place. There is no
+rollback: rows already sent before the error stay written.
+
 Dates, timestamps and times are written with a date format, so they read back
 typed. Text stays text: `=1+1` doesn't become a formula, and `00123` doesn't
 become a number.

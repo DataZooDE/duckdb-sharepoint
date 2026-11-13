@@ -10,6 +10,7 @@
 #include "sharepoint_client.hpp"
 #include "sharepoint_copy_rewrite.hpp"
 #include "sharepoint_excel.hpp"
+#include "sharepoint_filesystem.hpp"
 #include "sharepoint_uri.hpp"
 #include "sharepoint_weburl.hpp"
 
@@ -692,6 +693,9 @@ struct ExcelWriteGlobalState : public GlobalFunctionData {
 	idx_t first_data_row = 0; // created table: the header row
 	//! A worksheet this COPY added (EnsureWorksheet), waited for at the end.
 	string created_sheet;
+	//! The COPY's target, the user's workbook: a failed COPY's cleanup must
+	//! not remove it (SharepointFileSystem::TryRemoveFile).
+	unique_ptr<InPlaceCopyTarget> in_place;
 };
 
 string WorksheetResource(const string &sheet) {
@@ -808,6 +812,7 @@ unique_ptr<GlobalFunctionData> ExcelWriteInitGlobal(ClientContext &context, Func
                                                     const string &file_path) {
 	auto &bind = bind_p.Cast<ExcelWriteBindData>();
 	auto g = make_uniq<ExcelWriteGlobalState>();
+	g->in_place = make_uniq<InPlaceCopyTarget>(file_path);
 	DATAZOO_GUARDED_BLOCK(SHAREPOINT_BANNER, {
 		g->wb = OpenWorkbook(context, file_path);
 		GraphClient client(g->wb.auth);
@@ -1045,11 +1050,11 @@ void ExcelRangeCopyOptions(ClientContext &, CopyOptionsInput &input) {
 }
 
 BoundStatement ExcelTableCopyPlan(Binder &binder, CopyStatement &stmt) {
-	return RewriteCopyInPlace(binder, stmt, kTableFormatInternal, "workbook", true);
+	return RewriteCopyInPlace(binder, stmt, kTableFormatInternal, "workbook", true, SHAREPOINT_SCHEME);
 }
 
 BoundStatement ExcelRangeCopyPlan(Binder &binder, CopyStatement &stmt) {
-	return RewriteCopyInPlace(binder, stmt, kRangeFormatInternal, "workbook", true);
+	return RewriteCopyInPlace(binder, stmt, kRangeFormatInternal, "workbook", true, SHAREPOINT_SCHEME);
 }
 
 CopyFunction MakeExcelWriter(const char *name, copy_to_bind_t bind, copy_options_t options) {
