@@ -11,7 +11,7 @@ description: >
   (FORMAT xlsx) for a new workbook). Use when reading an Excel table or range
   from SharePoint into SQL, writing query results (e.g. a forecast) back into
   a workbook, or creating a new .xlsx report.
-version: 2026.11.03
+version: 2026.11.13
 user-invocable: false
 ---
 
