@@ -65,9 +65,15 @@ fix. Not covered: `sharepoint_list` and OneNote targets ('Orders',
 the local filesystem. Found first in duckdb-gdrive (FORMAT sheet_range,
 DataZooDE/duckdb-gdrive#56).
 
-A failed Excel COPY also leaves its workbook session open. The workbook stays
-locked (423 on delete) for minutes, so the e2e `scratch` teardown can warn
-and leave its folder for `make sweep_orphans`.
+A failed Excel COPY also left its workbook session open: only finalize closed
+it (and a guard during init). The workbook stayed locked (423 on delete) for
+minutes, so the user could not replace their own file and the e2e `scratch`
+teardown left folders for `make sweep_orphans`. Fixed: `~ExcelWriteGlobalState`
+sends `closeSession` when the session is still open, i.e. on any failure. It
+does not flush queued rows, so a failed COPY writes nothing it had not already
+sent. `test_a_failed_copy_closes_its_workbook_session` deletes the workbook
+right after the failed COPY. Keep the `InPlaceCopyTarget` guard: closing the
+session removes the 423 that used to stop the cleanup's DELETE by accident.
 
 ## Current status
 

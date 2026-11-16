@@ -548,7 +548,8 @@ Residuals of streaming writes, accepted and recorded (crew review 2026-10-14):
   "resource ... is locked"). The live suite therefore leaves its run folder to
   the nightly sweep (`LIVE_EXCEL_ROOT`, 24 h). An open session holds the lock
   longer, so a COPY that fails after `createSession` closes the session
-  (`SessionGuard`).
+  (`~ExcelWriteGlobalState`; until 2026-11-13 only a failure during init did,
+  and a COPY that failed mid-stream left the workbook locked for minutes).
 - **`createSession` answers a transient HTTP 504 (`UnknownError`).** It is
   retried like a read; a duplicate session after a lost reply is harmless
   (it expires unused).
