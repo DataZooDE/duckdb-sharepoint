@@ -75,12 +75,23 @@ sent. `test_a_failed_copy_closes_its_workbook_session` deletes the workbook
 right after the failed COPY. Keep the `InPlaceCopyTarget` guard: closing the
 session removes the 423 that used to stop the cleanup's DELETE by accident.
 
+## Pitfall: DuckDB 2.0 builds stamp a commit hash unless told the version (2026-11-21)
+
+DuckDB 2.0's CMake no longer reads `git describe`: without `DUCKDB_VERSION`
+(env) or `OVERRIDE_GIT_DESCRIBE` it builds `v2.0.0-devN` and stamps the
+artifact `8d78114e90` instead of `v2.0.1`, and no stock DuckDB loads it.
+extension-ci-tools sets `DUCKDB_VERSION`; the Makefile now derives it for a
+plain `make` from the `duckdb/` submodule's exact tag. Also, 2.0 renamed its
+CLI release assets (`duckdb-cli-<os>-<arch>.tar.gz`, Windows `.zip`), so
+`scripts/smoke_test.py` picks names by major version. Same in duckdb-gdrive.
+
 ## Current status
 
 Verified end to end against a real tenant (2026-10-10): `make test`,
 `make test_live` and `make e2e` (out-of-band changes, restarts, 16-thread
-scans, DuckLake, ATTACH, two drives) are green on DuckDB v1.5.6; CI also
-builds the DuckDB 2.0 line (1.4.x LTS is no longer supported). Structurally aligned with duckdb-gdrive (CI/pin gates,
+scans, DuckLake, ATTACH, two drives) are green on DuckDB v1.5.6. Since
+2026-11-21 the local target is v2.0.1 (`scripts/duckdb_version.env`); CI builds,
+smoke-tests and deploys both v2.0.1 and v1.5.6 (1.4.x LTS is no longer supported). Structurally aligned with duckdb-gdrive (CI/pin gates,
 stats, banner/telemetry, glob syntax, shared VFS functions, e2e harness).
 Writes stream in bounded memory (one chunk, `deferCommit` upload session;
 2026-10-14, hld §7 item 6a). `docs/hld.md` §7/§7a has the remaining work and the Graph behaviours found

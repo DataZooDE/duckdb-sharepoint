@@ -28,7 +28,7 @@ COPY results TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERW
 | **SharePoint lists** | `read_sharepoint_list` | `COPY … (FORMAT sharepoint_list)`: create, update by `id`, or upsert by `KEY` |
 
 One install, one secret, and app-only or user sign-in. Built for DuckDB
-**v1.5.6** and **2.0**, by [DataZoo](https://data-zoo.de), and the sibling of
+**v2.0.1** and **v1.5.6**, by [DataZoo](https://data-zoo.de), and the sibling of
 [duckdb-gdrive](https://github.com/DataZooDE/duckdb-gdrive) for Google Drive.
 
 > **🤖 Built for AI pair-programming.** The repository ships a
@@ -630,8 +630,9 @@ INSTALL sharepoint FROM community;
 LOAD sharepoint;
 ```
 
-The community repository serves DuckDB 2.0. Until its DuckDB v1.5.6 build is
-published, v1.5.6 users can install from erpl.io. That binary is unsigned, so
+The community repository serves DuckDB v2.0.x and v1.5.6. If its build for
+your DuckDB lags a release, you can install from erpl.io, which carries both
+v2.0.1 and v1.5.6. That binary is unsigned, so
 start DuckDB with `-unsigned` (or set `allow_unsigned_extensions`):
 
 ```sql

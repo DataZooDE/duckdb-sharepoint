@@ -82,8 +82,16 @@ jobs:
           submodules: false
       - name: Fetch the bundled DuckDB and duckdb-compat headers
         run: git submodule update --init --depth 1 duckdb duckdb-compat
-      - name: Compile the compat headers with stray headers on the include path
+      - name: Compile the compat headers with stray headers on the include path (bundled v2.0.1)
         run: scripts/check_compat_stray_headers.sh
+      # The hazard is a bundled DuckDB that LACKS a header another line has --
+      # since the bundled tree moved to 2.0.1 that is the v1.5.6 build, which
+      # we and community-extensions still ship. Check that tree too.
+      - name: Same, against the v1.5.6 headers (the 1.x line we also ship)
+        run: |
+          git -C duckdb fetch -q --depth 1 origin tag v1.5.6
+          git -C duckdb checkout -q v1.5.6
+          scripts/check_compat_stray_headers.sh
   # write_blob/remove_file/move_file/file_size are registered by this extension
   # AND duckdb-gdrive with IGNORE_ON_CONFLICT; whichever loads first wins, so
   # the two copies must stay identical. Compares against the sibling's main.
@@ -219,12 +227,12 @@ jobs:
         run: make check_stamp
       # A stock CLI of the EXACT target version, so smoke_loadable really runs;
       # under CI a skip there is fatal.
-      - name: Install stock duckdb v1.5.6
+      - name: Install stock duckdb v2.0.1
         run: |
-          curl -sSLo /tmp/duckdb.zip \
-            https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
-          echo "6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f  /tmp/duckdb.zip" | sha256sum -c -
-          unzip -q -o /tmp/duckdb.zip -d /tmp/duckdb-cli
+          curl -sSLo /tmp/duckdb.tar.gz \
+            https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-cli-linux-amd64.tar.gz
+          echo "b676268be4d39e4e41a904442c9796c9914e645cc085c7505f048f2c992b5eca  /tmp/duckdb.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/duckdb-cli && tar -xzf /tmp/duckdb.tar.gz -C /tmp/duckdb-cli
           sudo install -m 0755 /tmp/duckdb-cli/duckdb /usr/local/bin/duckdb
           duckdb -noheader -list -c "SELECT version();"
       - name: Shipped artifact loads in a stock duckdb
@@ -289,16 +297,16 @@ jobs:
           SHAREPOINT_USER_REFRESH_TOKEN: ${{ secrets.SHAREPOINT_USER_REFRESH_TOKEN }}
           SHAREPOINT_REQUIRE_DELEGATED: '1'
         run: make test_live
-      - name: Install stock duckdb v1.5.6
+      - name: Install stock duckdb v2.0.1
         # Run even when an earlier live step failed (e.g. the delegated suite
         # on an expired refresh token, #47): each step reports on its own, and
         # the job still fails. Skipped only when the build did not succeed.
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
-          curl -sSLo /tmp/duckdb.zip \
-            https://github.com/duckdb/duckdb/releases/download/v1.5.6/duckdb_cli-linux-amd64.zip
-          echo "6e89deac1ebbc36eed0291caf8b567b030c7b86ac35998f71854e22b3c5d5e2f  /tmp/duckdb.zip" | sha256sum -c -
-          unzip -q -o /tmp/duckdb.zip -d /tmp/duckdb-cli
+          curl -sSLo /tmp/duckdb.tar.gz \
+            https://github.com/duckdb/duckdb/releases/download/v2.0.1/duckdb-cli-linux-amd64.tar.gz
+          echo "b676268be4d39e4e41a904442c9796c9914e645cc085c7505f048f2c992b5eca  /tmp/duckdb.tar.gz" | sha256sum -c -
+          mkdir -p /tmp/duckdb-cli && tar -xzf /tmp/duckdb.tar.gz -C /tmp/duckdb-cli
           sudo install -m 0755 /tmp/duckdb-cli/duckdb /usr/local/bin/duckdb
       - name: Shipped artifact reaches real Graph from a stock duckdb
         # Run even when an earlier live step failed (e.g. the delegated suite
