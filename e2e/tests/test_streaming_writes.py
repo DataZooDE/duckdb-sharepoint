@@ -47,6 +47,13 @@ def test_large_copy_streams_in_bounded_memory(graph, scratch, duckdb_cli, isolat
     rows = 3_600_000
     uri = f"sharepoint://{scratch}/big.csv"
     code, out, rss = _run_measured(duckdb_cli, isolated_home, f"""{secret_sql}
+        -- DuckDB 2.0's async COPY writer queues output faster than an upload
+        -- drains it, so with async I/O on, peak RSS grows with the file
+        -- whatever this extension does (README: "Memory on DuckDB 2.0").
+        -- async_threads = 0 is the documented workaround and isolates what
+        -- this test is about: the extension holds one chunk, not the file.
+        -- (2.0 only: e2e runs the bundled shell, which is 2.0.1.)
+        SET async_threads = 0;
         CALL sharepoint_reset_stats();
         COPY (SELECT i, repeat('x', 100) AS pad FROM range({rows}) t(i)) TO '{uri}' (HEADER);
         SELECT metric || '=' || value FROM sharepoint_stats()

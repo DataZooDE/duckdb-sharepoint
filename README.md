@@ -28,7 +28,7 @@ COPY results TO 'Finance/plan.xlsx' (FORMAT excel_table, TABLE 'Forecast', OVERW
 | **SharePoint lists** | `read_sharepoint_list` | `COPY … (FORMAT sharepoint_list)`: create, update by `id`, or upsert by `KEY` |
 
 One install, one secret, and app-only or user sign-in. Built for DuckDB
-**v1.5.6** and **2.0**, by [DataZoo](https://data-zoo.de), and the sibling of
+**v2.0.1** and **v1.5.6**, by [DataZoo](https://data-zoo.de), and the sibling of
 [duckdb-gdrive](https://github.com/DataZooDE/duckdb-gdrive) for Google Drive.
 
 > **🤖 Built for AI pair-programming.** The repository ships a
@@ -630,8 +630,9 @@ INSTALL sharepoint FROM community;
 LOAD sharepoint;
 ```
 
-The community repository serves DuckDB 2.0. Until its DuckDB v1.5.6 build is
-published, v1.5.6 users can install from erpl.io. That binary is unsigned, so
+The community repository serves DuckDB v2.0.x and v1.5.6. If its build for
+your DuckDB lags a release, you can install from erpl.io, which carries both
+v2.0.1 and v1.5.6. That binary is unsigned, so
 start DuckDB with `-unsigned` (or set `allow_unsigned_extensions`):
 
 ```sql
@@ -853,6 +854,19 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
   a 373 MiB `COPY` peaks at about 120 MiB RSS. The file is published only when
   it is closed: an overwritten file keeps its old content until then, and a
   write that fails part-way publishes nothing.
+- **Memory on DuckDB 2.0.** The 120 MiB figure is for DuckDB v1.5.6. DuckDB 2.0
+  writes `COPY` output through a new asynchronous writer that queues data faster
+  than an upload drains it, so peak memory grows with the file: a 124 MiB `COPY`
+  to `sharepoint://` peaks at ~240 MiB, a 373 MiB one at ~470-840 MiB. The extension
+  itself still holds one chunk; the queue is in DuckDB. To stream in bounded
+  memory on 2.0, turn the asynchronous writer off for the session:
+
+  ```sql
+  SET async_threads = 0;   -- DuckDB 2.0: bounded-memory COPY to sharepoint:// (~70 MiB)
+  ```
+
+  It affects asynchronous I/O for every query in that session, so set it where
+  large uploads run rather than globally.
 - **Names.** SharePoint forbids `" * : < > ? \ |` in file and folder names;
   such writes are refused up front.
 - **ATTACH is read-only.** A DuckDB database file can't be updated in place.
