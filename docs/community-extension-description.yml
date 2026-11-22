@@ -8,7 +8,7 @@
 
 extension:
   name: sharepoint
-  version: 2026.11.21
+  version: 2026.11.22
   description: SharePoint and OneDrive in SQL -- files (sharepoint://), Excel workbooks, SharePoint lists, search and change feeds
   language: C++
   build: cmake

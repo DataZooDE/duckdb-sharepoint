@@ -85,6 +85,24 @@ plain `make` from the `duckdb/` submodule's exact tag. Also, 2.0 renamed its
 CLI release assets (`duckdb-cli-<os>-<arch>.tar.gz`, Windows `.zip`), so
 `scripts/smoke_test.py` picks names by major version. Same in duckdb-gdrive.
 
+## Pitfall: DuckDB 2.0 COPY memory to a remote sink (2026-11-21)
+
+2.0 routes COPY output through `AsyncFileWriter`
+(`async_threads`, default 128). Against Graph, where a write is an HTTP
+round trip, peak RSS grows with the file: 124 MiB -> ~240 MiB, 373 MiB ->
+470-840 MiB, while `upload_buffer_peak_bytes` stays one chunk -- the queue is
+in core. Its backpressure (`ManagedAsyncMemoryGovernor`, nominally 64 MiB per
+thread) did not hold it in measurement; `threads=1`,
+`preserve_insertion_order=false` and `memory_limit='512MB'` changed nothing,
+`SET async_threads = 0` restored ~70 MiB. No 2.0 FileSystem hook opts a
+filesystem out (`GetWriteMode` only chooses SEQUENTIAL/POSITIONAL). Decision:
+document the workaround in the README, run the memory e2e tests with
+`async_threads = 0` (they test the extension, not core), report upstream. A
+consequence for failure-path tests: a COPY that errors early may have handed
+the extension NOTHING yet -- the failing-query test now produces ~108 MB first.
+Not caught for weeks because e2e had only ever run on the 1.5.6 shell.
+Same in duckdb-gdrive.
+
 ## Current status
 
 Verified end to end against a real tenant (2026-10-10): `make test`,

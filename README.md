@@ -854,6 +854,19 @@ nameAlreadyExists): …`. They raise `PermissionException` for a 403 and
   a 373 MiB `COPY` peaks at about 120 MiB RSS. The file is published only when
   it is closed: an overwritten file keeps its old content until then, and a
   write that fails part-way publishes nothing.
+- **Memory on DuckDB 2.0.** The 120 MiB figure is for DuckDB v1.5.6. DuckDB 2.0
+  writes `COPY` output through a new asynchronous writer that queues data faster
+  than an upload drains it, so peak memory grows with the file: a 124 MiB `COPY`
+  to `sharepoint://` peaks at ~240 MiB, a 373 MiB one at ~470-840 MiB. The extension
+  itself still holds one chunk; the queue is in DuckDB. To stream in bounded
+  memory on 2.0, turn the asynchronous writer off for the session:
+
+  ```sql
+  SET async_threads = 0;   -- DuckDB 2.0: bounded-memory COPY to sharepoint:// (~70 MiB)
+  ```
+
+  It affects asynchronous I/O for every query in that session, so set it where
+  large uploads run rather than globally.
 - **Names.** SharePoint forbids `" * : < > ? \ |` in file and folder names;
   such writes are refused up front.
 - **ATTACH is read-only.** A DuckDB database file can't be updated in place.
